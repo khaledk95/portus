@@ -16,6 +16,28 @@ const { fromIni } = require('@aws-sdk/credential-providers');
 
 let mainWindow;
 
+// Last Azure AD SSO profile used for a successful login — enables silent re-auth
+let lastSsoProfile = null;
+
+// IMPORTANT: the AWS SDK caches ~/.aws/config and ~/.aws/credentials in-process
+// (@smithy/shared-ini-file-loader slurpFile keeps a module-level promise hash).
+// aws-azure-login rewrites those files on every login, so without ignoreCache the
+// app keeps using stale/expired credentials until the process restarts.
+function awsCredentials(profileName) {
+  return fromIni({ profile: profileName, ignoreCache: true });
+}
+
+// Errors that mean "the AWS session is no longer valid" (vs. a real API failure)
+function isCredentialsError(error) {
+  if (!error) return false;
+  const name = error.name || '';
+  const code = error.Code || error.code || '';
+  const message = error.message || '';
+  const haystack = `${name} ${code} ${message}`;
+
+  return /ExpiredToken|ExpiredTokenException|TokenRefreshRequired|InvalidClientTokenId|UnrecognizedClientException|RequestExpired|AuthFailure|InvalidAccessKeyId|SignatureDoesNotMatch|CredentialsProviderError|CredentialsError|Could not load credentials|is not authorized|security token included in the request is (expired|invalid)/i.test(haystack);
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
@@ -93,6 +115,97 @@ function isProfileAzureLoginCompatible(profileConfig) {
 
   const azureFields = Object.keys(profileConfig).filter(key => key.toLowerCase().includes('azure'));
   return azureFields.length > 0;
+}
+
+// Run aws-azure-login for a profile. Resolves on success, rejects with { error }.
+function runAzureLogin(profileName, timeoutMs = 25000) {
+  return new Promise((resolve, reject) => {
+    const platform = process.platform;
+    const command = 'aws-azure-login';
+    const args = ['--profile', profileName];
+
+    const spawnOptions = platform === 'win32'
+      ? { stdio: 'pipe', shell: true, windowsHide: true }
+      : {
+          stdio: 'pipe',
+          shell: true,
+          env: { ...process.env, PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin' }
+        };
+
+    const azureAwsLogin = spawn(command, args, spawnOptions);
+
+    let output = '';
+    let errorOutput = '';
+    let hasResponded = false;
+
+    const timeout = setTimeout(() => {
+      if (!hasResponded) {
+        hasResponded = true;
+        azureAwsLogin.kill();
+        reject({ success: false, error: `Authentication process timed out after ${Math.round(timeoutMs / 1000)} seconds` });
+      }
+    }, timeoutMs);
+
+    azureAwsLogin.stdout.on('data', (data) => { output += data.toString(); });
+    azureAwsLogin.stderr.on('data', (data) => { errorOutput += data.toString(); });
+
+    azureAwsLogin.on('close', (code) => {
+      if (!hasResponded) {
+        hasResponded = true;
+        clearTimeout(timeout);
+        if (code === 0) {
+          resolve({ success: true, output });
+        } else {
+          const errorMsg = errorOutput || `Process exited with code ${code}`;
+          reject({ success: false, error: `Authentication failed: ${errorMsg}` });
+        }
+      }
+    });
+
+    azureAwsLogin.on('error', (error) => {
+      if (!hasResponded) {
+        hasResponded = true;
+        clearTimeout(timeout);
+        if (error.code === 'ENOENT') {
+          const installMessage = platform === 'win32'
+            ? 'aws-azure-login command not found. Please ensure it is installed and accessible:\n\nnpm install -g aws-azure-login\n\nThen restart the application.'
+            : 'aws-azure-login command not found. Please ensure it is installed:\n\nnpm install -g aws-azure-login\n\nOr via Homebrew:\nbrew install aws-azure-login';
+          reject({ success: false, error: installMessage });
+        } else {
+          reject({ success: false, error: `Command execution failed: ${error.message}` });
+        }
+      }
+    });
+  });
+}
+
+// Read the session expiry that aws-azure-login writes into ~/.aws/credentials.
+// Only the profiles actually in use are considered, in priority order — scanning
+// every section would pick up stale profiles from old logins whose expiry is long
+// past, which would look like a permanently expired session.
+async function getSessionExpiry(profileNames = []) {
+  try {
+    const credentialsPath = path.join(os.homedir(), '.aws', 'credentials');
+    if (!(await fs.pathExists(credentialsPath))) return null;
+
+    const credentials = ini.parse(await fs.readFile(credentialsPath, 'utf8'));
+    const expiryKeys = ['aws_expiration', 'aws_session_expiration', 'x_security_token_expires'];
+
+    for (const name of profileNames) {
+      const section = name && credentials[name];
+      if (!section || typeof section !== 'object') continue;
+
+      for (const key of expiryKeys) {
+        if (!section[key]) continue;
+        const parsed = new Date(section[key]);
+        if (!isNaN(parsed.getTime())) return parsed;
+      }
+    }
+
+    return null;
+  } catch (error) {
+    return null;
+  }
 }
 
 function setupIpcHandlers() {
@@ -241,73 +354,89 @@ function setupIpcHandlers() {
 
   // Azure AD SSO login via aws-azure-login CLI
   ipcMain.handle('azure-aws-login', async (event, profileName) => {
-    return new Promise((resolve, reject) => {
-      const platform = process.platform;
-      const command = 'aws-azure-login';
-      const args = ['--profile', profileName];
+    const result = await runAzureLogin(profileName);
+    lastSsoProfile = profileName;
+    return result;
+  });
 
-      const spawnOptions = platform === 'win32'
-        ? { stdio: 'pipe', shell: true, windowsHide: true }
-        : {
-            stdio: 'pipe',
-            shell: true,
-            env: { ...process.env, PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin' }
-          };
+  // Report the current session state (used by the renderer to pre-empt expiry).
+  // Checks the operational profile in use first, then the SSO profile that was
+  // actually logged in — never unrelated leftover profiles.
+  ipcMain.handle('get-session-status', async (event, operationalProfile) => {
+    const candidates = [operationalProfile, lastSsoProfile].filter(Boolean);
+    const expiresAt = candidates.length ? await getSessionExpiry(candidates) : null;
 
-      const azureAwsLogin = spawn(command, args, spawnOptions);
+    return {
+      success: true,
+      ssoProfile: lastSsoProfile,
+      expiresAt: expiresAt ? expiresAt.toISOString() : null,
+      expiresInMs: expiresAt ? expiresAt.getTime() - Date.now() : null
+    };
+  });
 
-      let output = '';
-      let errorOutput = '';
-      let hasResponded = false;
-
-      const timeout = setTimeout(() => {
-        if (!hasResponded) {
-          hasResponded = true;
-          azureAwsLogin.kill();
-          reject({ success: false, error: 'Authentication process timed out after 25 seconds' });
-        }
-      }, 25000);
-
-      azureAwsLogin.stdout.on('data', (data) => { output += data.toString(); });
-      azureAwsLogin.stderr.on('data', (data) => { errorOutput += data.toString(); });
-
-      azureAwsLogin.on('close', (code) => {
-        if (!hasResponded) {
-          hasResponded = true;
-          clearTimeout(timeout);
-          if (code === 0) {
-            resolve({ success: true, output });
-          } else {
-            const errorMsg = errorOutput || `Process exited with code ${code}`;
-            reject({ success: false, error: `Authentication failed: ${errorMsg}` });
-          }
-        }
-      });
-
-      azureAwsLogin.on('error', (error) => {
-        if (!hasResponded) {
-          hasResponded = true;
-          clearTimeout(timeout);
-          if (error.code === 'ENOENT') {
-            const installMessage = platform === 'win32'
-              ? 'aws-azure-login command not found. Please ensure it is installed and accessible:\n\nnpm install -g aws-azure-login\n\nThen restart the application.'
-              : 'aws-azure-login command not found. Please ensure it is installed:\n\nnpm install -g aws-azure-login\n\nOr via Homebrew:\nbrew install aws-azure-login';
-            reject({ success: false, error: installMessage });
-          } else {
-            reject({ success: false, error: `Command execution failed: ${error.message}` });
-          }
-        }
-      });
-    });
+  // Re-run SSO login for the last used profile (silent refresh)
+  ipcMain.handle('refresh-session', async (event, profileName) => {
+    const target = profileName || lastSsoProfile;
+    if (!target) {
+      return { success: false, error: 'No SSO profile has been used yet' };
+    }
+    try {
+      await runAzureLogin(target);
+      lastSsoProfile = target;
+      return { success: true, ssoProfile: target };
+    } catch (error) {
+      return { success: false, error: error.error || error.message || 'Re-authentication failed' };
+    }
   });
 
   // EC2 instances - the SSM/RDP target list
+  // On expired credentials, silently re-run SSO login once and retry.
   ipcMain.handle('get-ec2-instances', async (event, profileName) => {
     try {
+      return await describeInstances(profileName);
+    } catch (error) {
+      if (!isCredentialsError(error)) {
+        return { success: false, error: `Failed to get EC2 instances: ${error.message}` };
+      }
+
+      if (!lastSsoProfile) {
+        return {
+          success: false,
+          sessionExpired: true,
+          error: 'Your AWS session has expired. Please sign in again with SSO Connect.'
+        };
+      }
+
+      try {
+        await runAzureLogin(lastSsoProfile);
+      } catch (loginError) {
+        return {
+          success: false,
+          sessionExpired: true,
+          error: `Session expired and automatic re-authentication failed: ${loginError.error || loginError.message}`
+        };
+      }
+
+      try {
+        const result = await describeInstances(profileName);
+        return { ...result, reauthenticated: true };
+      } catch (retryError) {
+        return {
+          success: false,
+          sessionExpired: true,
+          error: `Failed to load instances after re-authentication: ${retryError.message}`
+        };
+      }
+    }
+  });
+
+  // Raw EC2 describe — throws so the caller can decide how to handle failures
+  async function describeInstances(profileName) {
+    {
       const profile = await getProfileConfig(profileName);
 
       const client = new EC2Client({
-        credentials: fromIni({ profile: profileName }),
+        credentials: awsCredentials(profileName),
         region: profile.region
       });
 
@@ -338,10 +467,8 @@ function setupIpcHandlers() {
       }
 
       return { success: true, data: instances };
-    } catch (error) {
-      return { success: false, error: `Failed to get EC2 instances: ${error.message}` };
     }
-  });
+  }
 
   // SSM Session - open a shell in a new terminal window
   ipcMain.handle('connect-ssm', async (event, profileName, instanceId) => {

@@ -67,9 +67,25 @@
             <div class="nav-right">
                 <!-- Profile Selector -->
                 <div class="profile-section">
-                    <select id="profileSelect" class="profile-selector" disabled>
-                        <option value="">Select Operational Profile</option>
-                    </select>
+                    <div class="profile-combo" id="profileCombo">
+                        <button type="button" id="profileComboTrigger" class="profile-combo-trigger"
+                                disabled aria-haspopup="listbox" aria-expanded="false">
+                            <i class="fas fa-user-circle trigger-icon"></i>
+                            <span class="trigger-label" id="profileComboLabel">Select Operational Profile</span>
+                            <i class="fas fa-chevron-down trigger-caret"></i>
+                        </button>
+
+                        <div class="profile-combo-panel" id="profileComboPanel">
+                            <div class="profile-combo-search">
+                                <i class="fas fa-search"></i>
+                                <input type="text" id="profileComboSearch"
+                                       placeholder="Search profiles..." autocomplete="off" spellcheck="false">
+                            </div>
+                            <div class="profile-combo-list" id="profileComboList" role="listbox"
+                                 aria-label="Operational AWS profiles"></div>
+                            <div class="profile-combo-footer" id="profileComboCount"></div>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Connection Status -->

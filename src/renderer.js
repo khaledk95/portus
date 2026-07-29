@@ -6,6 +6,12 @@ class AWSManager {
         this.isLoggedIn = false;
         this.selectedAuthProfile = null;
         this.toastTimeout = null;
+        this.sessionWatcher = null;
+        this.isRefreshingSession = false;
+        this.lastRefreshAt = null;
+        this.profileComboOpen = false;
+        this.filteredProfiles = [];
+        this.activeOptionIndex = 0;
         this.initWithPreloader();
     }
 
@@ -68,12 +74,7 @@ class AWSManager {
     // ==========================================================================
 
     setupEventListeners() {
-        const profileSelect = document.getElementById('profileSelect');
-        if (profileSelect) {
-            profileSelect.addEventListener('change', (e) => {
-                this.selectOperationalProfile(e.target.value);
-            });
-        }
+        this.setupProfileCombo();
 
         const loginBtn = document.getElementById('loginBtn');
         if (loginBtn) {
@@ -102,6 +103,7 @@ class AWSManager {
             if (e.key === 'Escape') {
                 const overlay = document.querySelector('.popup-overlay');
                 if (overlay) overlay.remove();
+                if (this.profileComboOpen) this.closeProfileCombo();
             }
         });
     }
@@ -122,9 +124,7 @@ class AWSManager {
         statusIndicator.className = 'status-indicator offline';
         statusText.textContent = 'Disconnected';
 
-        const select = document.getElementById('profileSelect');
-        select.disabled = true;
-        select.style.opacity = '0.6';
+        this.updateProfileSelectState();
     }
 
     updateConnectionStatus(isConnected, profileName = '') {
@@ -148,9 +148,13 @@ class AWSManager {
     }
 
     updateProfileSelectState() {
-        const select = document.getElementById('profileSelect');
-        select.disabled = !this.isLoggedIn;
-        select.style.opacity = this.isLoggedIn ? '1' : '0.6';
+        const trigger = document.getElementById('profileComboTrigger');
+        if (!trigger) return;
+
+        trigger.disabled = !this.isLoggedIn;
+        if (!this.isLoggedIn) {
+            this.closeProfileCombo();
+        }
     }
 
     // ==========================================================================
@@ -161,35 +165,214 @@ class AWSManager {
         try {
             this.profiles = await window.electronAPI.getAwsProfiles();
             this.operationalProfiles = await window.electronAPI.getOperationalProfiles();
-            this.populateProfileSelect();
+            this.renderProfileOptions('');
         } catch (error) {
             this.showToast('Failed to load AWS profiles: ' + error.message, 'error');
         }
     }
 
-    populateProfileSelect() {
-        const select = document.getElementById('profileSelect');
-        select.innerHTML = '';
+    // ==========================================================================
+    // PROFILE COMBOBOX (searchable dropdown)
+    // ==========================================================================
 
-        const defaultOption = document.createElement('option');
-        defaultOption.value = '';
-        defaultOption.textContent = 'Select Operational Profile';
-        select.appendChild(defaultOption);
+    setupProfileCombo() {
+        const trigger = document.getElementById('profileComboTrigger');
+        const search = document.getElementById('profileComboSearch');
+        const combo = document.getElementById('profileCombo');
 
-        if (this.operationalProfiles && this.operationalProfiles.length > 0) {
-            this.operationalProfiles.forEach(profile => {
-                const option = document.createElement('option');
-                option.value = profile.name;
-                option.textContent = `${profile.name} (${profile.region})`;
-                select.appendChild(option);
-            });
+        if (!trigger || !search || !combo) return;
+
+        trigger.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.toggleProfileCombo();
+        });
+
+        search.addEventListener('input', () => {
+            this.renderProfileOptions(search.value);
+        });
+
+        search.addEventListener('keydown', (e) => {
+            const count = this.filteredProfiles.length;
+
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                if (count) this.setActiveOption((this.activeOptionIndex + 1) % count);
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (count) this.setActiveOption((this.activeOptionIndex - 1 + count) % count);
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                const profile = this.filteredProfiles[this.activeOptionIndex];
+                if (profile) this.chooseProfile(profile.name);
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                this.closeProfileCombo();
+                trigger.focus();
+            }
+        });
+
+        // Click outside closes the panel
+        document.addEventListener('click', (e) => {
+            if (this.profileComboOpen && !combo.contains(e.target)) {
+                this.closeProfileCombo();
+            }
+        });
+
+        this.renderProfileOptions('');
+    }
+
+    toggleProfileCombo() {
+        if (this.profileComboOpen) {
+            this.closeProfileCombo();
         } else {
-            const noProfilesOption = document.createElement('option');
-            noProfilesOption.value = '';
-            noProfilesOption.textContent = 'No operational profiles available';
-            noProfilesOption.disabled = true;
-            select.appendChild(noProfilesOption);
+            this.openProfileCombo();
         }
+    }
+
+    openProfileCombo() {
+        const combo = document.getElementById('profileCombo');
+        const trigger = document.getElementById('profileComboTrigger');
+        const search = document.getElementById('profileComboSearch');
+        if (!combo || !trigger || trigger.disabled) return;
+
+        this.profileComboOpen = true;
+        combo.classList.add('open');
+        trigger.setAttribute('aria-expanded', 'true');
+
+        search.value = '';
+        this.renderProfileOptions('');
+        setTimeout(() => search.focus(), 0);
+    }
+
+    closeProfileCombo() {
+        const combo = document.getElementById('profileCombo');
+        const trigger = document.getElementById('profileComboTrigger');
+        if (!combo) return;
+
+        this.profileComboOpen = false;
+        combo.classList.remove('open');
+        if (trigger) trigger.setAttribute('aria-expanded', 'false');
+    }
+
+    renderProfileOptions(filter = '') {
+        const list = document.getElementById('profileComboList');
+        const countEl = document.getElementById('profileComboCount');
+        if (!list) return;
+
+        const all = this.operationalProfiles || [];
+        const term = filter.trim().toLowerCase();
+
+        this.filteredProfiles = term
+            ? all.filter(p =>
+                p.name.toLowerCase().includes(term) ||
+                (p.region || '').toLowerCase().includes(term))
+            : all.slice();
+
+        list.innerHTML = '';
+
+        if (!all.length) {
+            list.innerHTML = '<div class="profile-combo-empty">No operational profiles found in ~/.aws/config</div>';
+            if (countEl) countEl.textContent = '';
+            return;
+        }
+
+        if (!this.filteredProfiles.length) {
+            list.innerHTML = `<div class="profile-combo-empty">No profiles match "${this.escapeHtml(filter)}"</div>`;
+            if (countEl) countEl.textContent = `0 of ${all.length}`;
+            return;
+        }
+
+        this.filteredProfiles.forEach((profile, index) => {
+            const option = document.createElement('div');
+            option.className = 'profile-combo-option';
+            option.setAttribute('role', 'option');
+            option.dataset.profile = profile.name;
+
+            if (profile.name === this.currentProfile) {
+                option.classList.add('selected');
+                option.setAttribute('aria-selected', 'true');
+            }
+
+            option.innerHTML = `
+                <div class="option-main">
+                    <span class="option-name">${this.highlightMatch(profile.name, term)}</span>
+                    <span class="option-region">${this.escapeHtml(profile.region || '')}</span>
+                </div>
+                <i class="fas fa-check option-check"></i>
+            `;
+
+            option.addEventListener('click', () => this.chooseProfile(profile.name));
+            option.addEventListener('mousemove', () => this.setActiveOption(index));
+
+            list.appendChild(option);
+        });
+
+        if (countEl) {
+            countEl.textContent = term
+                ? `${this.filteredProfiles.length} of ${all.length} profiles`
+                : `${all.length} profiles`;
+        }
+
+        // Pre-highlight the selected profile, otherwise the first result
+        const selectedIndex = this.filteredProfiles.findIndex(p => p.name === this.currentProfile);
+        this.setActiveOption(selectedIndex >= 0 ? selectedIndex : 0);
+    }
+
+    setActiveOption(index) {
+        const list = document.getElementById('profileComboList');
+        if (!list) return;
+
+        const options = list.querySelectorAll('.profile-combo-option');
+        if (!options.length) return;
+
+        this.activeOptionIndex = index;
+        options.forEach((el, i) => el.classList.toggle('active', i === index));
+
+        const active = options[index];
+        if (active) active.scrollIntoView({ block: 'nearest' });
+    }
+
+    chooseProfile(profileName) {
+        this.closeProfileCombo();
+        this.setProfileLabel(profileName);
+        this.selectOperationalProfile(profileName);
+    }
+
+    setProfileLabel(profileName) {
+        const label = document.getElementById('profileComboLabel');
+        if (!label) return;
+
+        if (!profileName) {
+            label.textContent = 'Select Operational Profile';
+            label.classList.remove('has-value');
+            return;
+        }
+
+        const profile = (this.operationalProfiles || []).find(p => p.name === profileName);
+        label.textContent = profile && profile.region
+            ? `${profile.name} · ${profile.region}`
+            : profileName;
+        label.classList.add('has-value');
+    }
+
+    escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text == null ? '' : String(text);
+        return div.innerHTML;
+    }
+
+    // Escape first, then wrap the matched span — avoids injecting raw profile text
+    highlightMatch(text, term) {
+        const safe = this.escapeHtml(text);
+        if (!term) return safe;
+
+        const safeTerm = this.escapeHtml(term);
+        const index = safe.toLowerCase().indexOf(safeTerm.toLowerCase());
+        if (index === -1) return safe;
+
+        return safe.slice(0, index) +
+            '<mark>' + safe.slice(index, index + safeTerm.length) + '</mark>' +
+            safe.slice(index + safeTerm.length);
     }
 
     showProfileSelectionPopup() {
@@ -278,6 +461,7 @@ class AWSManager {
             this.showToast('Successfully authenticated with Azure', 'success');
             this.updateConnectionStatus(true, profileName);
             this.updateProfileSelectState();
+            this.startSessionWatcher();
         } catch (error) {
             this.showToast(`Authentication failed: ${error.error || error.message}`, 'error');
             this.handleAuthenticationFailure();
@@ -291,8 +475,76 @@ class AWSManager {
     handleAuthenticationFailure() {
         this.isLoggedIn = false;
         this.selectedAuthProfile = null;
+        this.stopSessionWatcher();
         this.updateConnectionStatus(false);
         this.updateProfileSelectState();
+    }
+
+    // ==========================================================================
+    // SESSION LIFECYCLE
+    // ==========================================================================
+
+    // Poll the credential expiry written by aws-azure-login and renew before it
+    // lapses, so the user never hits an expired-session error mid-task.
+    startSessionWatcher() {
+        this.stopSessionWatcher();
+        this.sessionWatcher = setInterval(() => this.checkSession(), 60000);
+        this.checkSession();
+    }
+
+    stopSessionWatcher() {
+        if (this.sessionWatcher) {
+            clearInterval(this.sessionWatcher);
+            this.sessionWatcher = null;
+        }
+    }
+
+    async checkSession() {
+        if (!this.isLoggedIn || this.isRefreshingSession) return;
+
+        // Don't attempt a renewal more than once every 5 minutes. Without this a
+        // profile whose expiry can't be advanced would trigger a login on every tick.
+        const COOLDOWN_MS = 5 * 60 * 1000;
+        if (this.lastRefreshAt && Date.now() - this.lastRefreshAt < COOLDOWN_MS) return;
+
+        try {
+            const status = await window.electronAPI.getSessionStatus(this.currentProfile);
+
+            // No known expiry for the profiles in use — leave it to the reactive
+            // retry path rather than guessing.
+            if (!status || !status.success || status.expiresInMs === null) return;
+
+            // Renew only when we're within 3 minutes of the real expiry
+            const REFRESH_THRESHOLD_MS = 3 * 60 * 1000;
+            if (status.expiresInMs > REFRESH_THRESHOLD_MS) return;
+
+            this.isRefreshingSession = true;
+            this.lastRefreshAt = Date.now();
+            const result = await window.electronAPI.refreshSession();
+
+            if (result && result.success) {
+                // Silent by design: this is routine upkeep, not something the
+                // user needs to be interrupted for.
+                this.updateConnectionStatus(true, result.ssoProfile || this.selectedAuthProfile || '');
+            } else {
+                this.handleSessionExpired(result && result.error);
+            }
+        } catch (error) {
+            // Non-fatal: the reactive retry in loadInstances still covers expiry
+        } finally {
+            this.isRefreshingSession = false;
+        }
+    }
+
+    handleSessionExpired(message) {
+        this.isLoggedIn = false;
+        this.stopSessionWatcher();
+        this.updateConnectionStatus(false);
+        this.updateProfileSelectState();
+
+        const text = message || 'Your AWS session has expired. Please sign in again with SSO Connect.';
+        this.displayErrorState(text);
+        this.showToast(text, 'warning');
     }
 
     selectOperationalProfile(profileName) {
@@ -349,11 +601,25 @@ class AWSManager {
             const result = await window.electronAPI.getEc2Instances(this.currentProfile);
 
             if (result && result.success) {
+                // Main process may have silently re-authenticated to serve this call
+                if (result.reauthenticated) {
+                    this.isLoggedIn = true;
+                    this.updateConnectionStatus(true, this.selectedAuthProfile || '');
+                    this.startSessionWatcher();
+                }
+
                 this.displayInstances(result.data);
-                this.showToast(`Loaded ${result.data.length} instance(s)`, 'success');
-            } else {
-                throw new Error(result?.error || 'No data returned');
+                const renewed = result.reauthenticated ? ' — session renewed' : '';
+                this.showToast(`Loaded ${result.data.length} instance(s)${renewed}`, 'success');
+                return;
             }
+
+            if (result && result.sessionExpired) {
+                this.handleSessionExpired(result.error);
+                return;
+            }
+
+            throw new Error(result?.error || 'No data returned');
         } catch (error) {
             const message = error.message || error.error || 'Unknown error occurred';
             this.showToast(`Failed to load instances: ${message}`, 'error');
