@@ -1,6 +1,9 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
+  // App metadata
+  getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+
   // AWS Profile Management
   getAwsProfiles: () => ipcRenderer.invoke('get-aws-profiles'),
   getOperationalProfiles: () => ipcRenderer.invoke('get-operational-profiles'),

@@ -645,7 +645,9 @@ body::after {
 .breadcrumb-separator { font-size: 9px; opacity: 0.6; }
 .header-actions { display: flex; gap: var(--space-2); }
 
-.service-data-container { flex: 1; min-height: 0; }
+/* The table is wide enough that narrow windows need to scroll it sideways
+   rather than squeezing the columns. */
+.service-data-container { flex: 1; min-height: 0; overflow-x: auto; }
 .service-data { display: flex; flex-direction: column; gap: var(--space-4); }
 
 /* Search */
@@ -730,7 +732,35 @@ body::after {
 .status-running { color: var(--ok); background: var(--ok-bg); border-color: rgba(52, 211, 153, 0.3); }
 .status-stopped { color: var(--danger); background: var(--danger-bg); border-color: rgba(251, 113, 133, 0.3); }
 .status-stopping, .status-pending, .status-starting, .status-shutting-down { color: var(--warn); background: var(--warn-bg); border-color: rgba(251, 191, 36, 0.3); }
-.status-terminated { color: var(--text-tertiary); background: rgba(142, 139, 181, 0.15); }
+
+/* SSM agent readiness badge */
+.ssm-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 11px;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  white-space: nowrap;
+  cursor: default;
+}
+.ssm-badge::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+.ssm-online     { color: var(--ok);            background: var(--ok-bg);                 border-color: rgba(52, 211, 153, 0.3); }
+.ssm-lost       { color: var(--warn);          background: var(--warn-bg);               border-color: rgba(251, 191, 36, 0.3); }
+.ssm-inactive   { color: var(--warn);          background: var(--warn-bg);               border-color: rgba(251, 191, 36, 0.3); }
+.ssm-unmanaged  { color: var(--text-tertiary); background: rgba(126, 138, 153, 0.15);    border-color: rgba(126, 138, 153, 0.25); }
+.ssm-unknown    { color: var(--text-tertiary); background: rgba(126, 138, 153, 0.15);    border-color: rgba(126, 138, 153, 0.25); }
+.ssm-na         { color: var(--text-tertiary); background: transparent; border: none; padding-left: 4px; }
+.ssm-na::before { display: none; }
 
 /* Connect buttons */
 .actions-cell .action-buttons { display: flex; gap: var(--space-2); }
@@ -882,7 +912,7 @@ body::after {
 
 .popup-content {
   width: 100%;
-  max-width: 480px;
+  max-width: 520px;
   background: rgba(26, 23, 51, 0.85);
   backdrop-filter: blur(30px);
   -webkit-backdrop-filter: blur(30px);
@@ -917,7 +947,18 @@ body::after {
 .popup-body { padding: var(--space-5); }
 .popup-body > p { color: var(--text-secondary); font-size: 14px; margin-bottom: var(--space-4); }
 
-.profile-list { display: flex; flex-direction: column; gap: var(--space-2); max-height: 360px; overflow-y: auto; }
+/* overflow-y:auto makes the browser compute overflow-x to auto as well, so the
+   3px hover/focus nudge below would otherwise raise a horizontal scrollbar.
+   The padding gives that nudge room; overflow-x:hidden is the belt-and-braces. */
+.profile-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 360px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 2px 5px 2px 2px;
+}
 .profile-item {
   display: flex;
   align-items: center;
@@ -936,11 +977,20 @@ body::after {
   transform: translateX(3px);
   outline: none;
 }
-.profile-info { display: flex; flex-direction: column; gap: 3px; }
+/* min-width:0 lets the flex child shrink so long names/app IDs can ellipsize
+   instead of forcing the row wider than the dialog. */
+.profile-info { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.profile-info strong,
+.profile-region,
+.profile-azure {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .profile-info strong { font-size: 15px; color: var(--text-primary); }
 .profile-region { font-size: 12px; color: var(--text-tertiary); }
-.profile-azure { font-size: 11px; color: var(--accent-1); }
-.profile-item > i { color: var(--text-tertiary); transition: transform 0.2s ease, color 0.2s ease; }
+.profile-azure { font-size: 11px; color: var(--accent-1); font-family: var(--font-mono); }
+.profile-item > i { color: var(--text-tertiary); flex-shrink: 0; transition: transform 0.2s ease, color 0.2s ease; }
 .profile-item:hover > i { color: var(--accent-1); transform: translateX(3px); }
 .popup-footer-note { margin-top: var(--space-4); text-align: center; color: var(--text-tertiary); }
 
@@ -951,7 +1001,8 @@ body::after {
 @media (max-width: 980px) {
   .welcome-features { grid-template-columns: 1fr; }
   .nav-right { flex-wrap: wrap; gap: var(--space-2); }
-  .profile-selector { min-width: 160px; }
+  .profile-combo-trigger { min-width: 170px; }
+  .profile-combo-panel { width: min(340px, calc(100vw - 48px)); }
   .app-tagline { display: none; }
 }
 

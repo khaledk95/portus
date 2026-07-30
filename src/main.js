@@ -12,6 +12,7 @@ const os = require('os');
 
 // AWS SDK imports (EC2 only - needed to list SSM/RDP targets)
 const { EC2Client, DescribeInstancesCommand } = require('@aws-sdk/client-ec2');
+const { SSMClient, DescribeInstanceInformationCommand } = require('@aws-sdk/client-ssm');
 const { fromIni } = require('@aws-sdk/credential-providers');
 
 let mainWindow;
@@ -208,7 +209,62 @@ async function getSessionExpiry(profileNames = []) {
   }
 }
 
+// Fetch the SSM-managed instance inventory for a region, keyed by instance id.
+// Only instances that appear here can actually accept a Session Manager
+// connection, so this is what decides whether Connect is offered.
+async function getSsmManagedInstances(profileName, region) {
+  const client = new SSMClient({
+    credentials: awsCredentials(profileName),
+    region,
+    maxAttempts: 3
+  });
+
+  const managed = new Map();
+  let nextToken;
+  let page = 0;
+  const MAX_PAGES = 40; // safety valve against an unbounded pagination loop
+
+  do {
+    const response = await client.send(new DescribeInstanceInformationCommand({
+      MaxResults: 50,
+      NextToken: nextToken
+    }));
+
+    (response.InstanceInformationList || []).forEach(info => {
+      managed.set(info.InstanceId, {
+        pingStatus: info.PingStatus,
+        lastPingDateTime: info.LastPingDateTime,
+        agentVersion: info.AgentVersion,
+        isLatestVersion: info.IsLatestVersion,
+        platformName: info.PlatformName,
+        platformVersion: info.PlatformVersion
+      });
+    });
+
+    nextToken = response.NextToken;
+    page += 1;
+  } while (nextToken && page < MAX_PAGES);
+
+  return managed;
+}
+
+// Map an SSM PingStatus onto the states the UI cares about
+function toSsmStatus(info) {
+  if (!info) return 'unmanaged';
+
+  switch ((info.pingStatus || '').toLowerCase()) {
+    case 'online': return 'online';
+    case 'connectionlost': return 'connection_lost';
+    case 'inactive': return 'inactive';
+    default: return 'unknown';
+  }
+}
+
 function setupIpcHandlers() {
+  // Single source of truth for the version shown in the UI: package.json, via
+  // Electron. Hardcoding it in the markup means it silently goes stale.
+  ipcMain.handle('get-app-version', () => app.getVersion());
+
   // Get Azure AD SSO profiles (for aws-azure-login)
   ipcMain.handle('get-aws-profiles', async () => {
     try {
@@ -432,42 +488,85 @@ function setupIpcHandlers() {
 
   // Raw EC2 describe — throws so the caller can decide how to handle failures
   async function describeInstances(profileName) {
-    {
-      const profile = await getProfileConfig(profileName);
+    const profile = await getProfileConfig(profileName);
 
-      const client = new EC2Client({
-        credentials: awsCredentials(profileName),
-        region: profile.region
-      });
+    const client = new EC2Client({
+      credentials: awsCredentials(profileName),
+      region: profile.region
+    });
 
-      const response = await client.send(new DescribeInstancesCommand({}));
+    // DescribeInstances is paginated. Reading only the first page would silently
+    // hide instances in large accounts, which looks like the instance simply does
+    // not exist, so every page is walked.
+    //
+    // The state filter is applied server-side: AWS keeps returning terminated
+    // instances for roughly an hour after they are gone, and they can never
+    // accept a connection.
+    const reservations = [];
+    let nextToken;
+    let page = 0;
+    const MAX_PAGES = 40; // safety valve against an unbounded pagination loop
 
-      const instances = [];
+    do {
+      const response = await client.send(new DescribeInstancesCommand({
+        Filters: [{
+          Name: 'instance-state-name',
+          Values: ['pending', 'running', 'shutting-down', 'stopping', 'stopped']
+        }],
+        MaxResults: 1000,
+        NextToken: nextToken
+      }));
+
       if (response.Reservations) {
-        response.Reservations.forEach(reservation => {
-          reservation.Instances.forEach(instance => {
-            let instanceName = '';
-            if (instance.Tags) {
-              const nameTag = instance.Tags.find(tag => tag.Key === 'Name');
-              instanceName = nameTag ? nameTag.Value : '';
-            }
-
-            instances.push({
-              instanceName: instanceName,
-              instanceId: instance.InstanceId,
-              instanceType: instance.InstanceType,
-              state: instance.State.Name,
-              publicIp: instance.PublicIpAddress,
-              privateIp: instance.PrivateIpAddress,
-              launchTime: instance.LaunchTime,
-              platform: instance.Platform || 'Linux'
-            });
-          });
-        });
+        reservations.push(...response.Reservations);
       }
 
-      return { success: true, data: instances };
+      nextToken = response.NextToken;
+      page += 1;
+    } while (nextToken && page < MAX_PAGES);
+
+    // SSM inventory is supplementary: a missing ssm:DescribeInstanceInformation
+    // permission must not break the instance listing. On failure every instance
+    // is reported as 'unknown' and the connect buttons stay enabled, so a
+    // read-only permission gap never blocks an otherwise valid connection.
+    let ssmManaged = new Map();
+    let ssmLookupFailed = false;
+    try {
+      ssmManaged = await getSsmManagedInstances(profileName, profile.region);
+    } catch (ssmError) {
+      // Credential problems belong to the caller's re-auth path, not here
+      if (isCredentialsError(ssmError)) throw ssmError;
+      ssmLookupFailed = true;
     }
+
+    const instances = [];
+    reservations.forEach(reservation => {
+      (reservation.Instances || []).forEach(instance => {
+        let instanceName = '';
+        if (instance.Tags) {
+          const nameTag = instance.Tags.find(tag => tag.Key === 'Name');
+          instanceName = nameTag ? nameTag.Value : '';
+        }
+
+        const ssmInfo = ssmManaged.get(instance.InstanceId);
+
+        instances.push({
+          instanceName: instanceName,
+          instanceId: instance.InstanceId,
+          instanceType: instance.InstanceType,
+          state: instance.State.Name,
+          publicIp: instance.PublicIpAddress,
+          privateIp: instance.PrivateIpAddress,
+          platform: instance.Platform || 'Linux',
+          ssmStatus: ssmLookupFailed ? 'unknown' : toSsmStatus(ssmInfo),
+          ssmLastPing: ssmInfo ? ssmInfo.lastPingDateTime : null,
+          ssmAgentVersion: ssmInfo ? ssmInfo.agentVersion : null,
+          ssmPlatformName: ssmInfo ? ssmInfo.platformName : null
+        });
+      });
+    });
+
+    return { success: true, data: instances, ssmLookupFailed };
   }
 
   // SSM Session - open a shell in a new terminal window

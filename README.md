@@ -35,6 +35,7 @@ bastion hosts, and no manual CLI commands.
 
 - **Azure AD SSO login** via `aws-azure-login`
 - **EC2 instance browser** — live list per profile/region, searchable
+- **SSM readiness at a glance** — per-instance agent status (Online / Connection lost / Not managed), so you never click Connect on an instance that can't accept a session
 - **One-click SSM shell** — opens `aws ssm start-session` in a new terminal window
 - **RDP over SSM** — auto port-forward tunnel + launches your RDP client (Windows-only instances)
 - Smart buttons: SSM on any running instance, RDP only on running Windows instances
@@ -84,6 +85,17 @@ one is missing.
 - Instance has an **IAM role** with SSM permissions (`AmazonSSMManagedInstanceCore`)
 - Instance can reach SSM endpoints (NAT/VPC endpoints)
 - For **RDP**: the instance is **Windows** and running
+
+### IAM permissions your own credentials need
+
+| Action | Used for |
+|--------|----------|
+| `ec2:DescribeInstances` | Listing instances |
+| `ssm:DescribeInstanceInformation` | The **SSM Agent** column (connection readiness) |
+| `ssm:StartSession` | Opening SSM shells and RDP tunnels |
+
+`ssm:DescribeInstanceInformation` is optional — without it the SSM Agent column
+shows *Unknown* and the connect buttons stay enabled, so nothing is blocked.
 
 ---
 

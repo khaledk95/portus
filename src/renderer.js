@@ -64,9 +64,25 @@ class AWSManager {
 
     async init() {
         this.setupEventListeners();
+        await this.applyAppVersion();
         await this.loadProfiles();
         this.updateInitialUI();
         window.awsManager = this;
+    }
+
+    // Stamp the real packaged version over the placeholders in the markup, so the
+    // displayed version always matches package.json.
+    async applyAppVersion() {
+        try {
+            const version = await window.electronAPI.getAppVersion();
+            if (!version) return;
+
+            document.querySelectorAll('.js-app-version').forEach(el => {
+                el.textContent = `v${version}`;
+            });
+        } catch (error) {
+            // Keep whatever the markup already shows
+        }
     }
 
     // ==========================================================================
@@ -609,8 +625,16 @@ class AWSManager {
                 }
 
                 this.displayInstances(result.data);
-                const renewed = result.reauthenticated ? ' — session renewed' : '';
-                this.showToast(`Loaded ${result.data.length} instance(s)${renewed}`, 'success');
+
+                if (result.ssmLookupFailed) {
+                    this.showToast(
+                        `Loaded ${result.data.length} instance(s) — SSM status unavailable, so connect buttons stay enabled`,
+                        'warning'
+                    );
+                } else {
+                    const renewed = result.reauthenticated ? ' — session renewed' : '';
+                    this.showToast(`Loaded ${result.data.length} instance(s)${renewed}`, 'success');
+                }
                 return;
             }
 
@@ -701,7 +725,7 @@ class AWSManager {
         const table = document.createElement('table');
         table.className = 'data-table';
 
-        const headers = ['Instance Name', 'Instance ID', 'Type', 'State', 'Public IP', 'Private IP', 'Platform', 'Launch Time', 'Actions'];
+        const headers = ['Instance Name', 'Instance ID', 'Type', 'State', 'SSM Agent', 'Public IP', 'Private IP', 'Platform', 'Actions'];
         const thead = document.createElement('thead');
         const headerRow = document.createElement('tr');
         headers.forEach(header => {
@@ -725,31 +749,43 @@ class AWSManager {
         const isWindows = item.platform && item.platform.toLowerCase().includes('windows');
         const safeName = (item.instanceName || 'No Name').replace(/'/g, "\\'");
 
-        // SSM button - any running instance
-        const ssmButton = isRunning
-            ? `<button class="ssm-connect-btn" onclick="window.awsManager.connectToInstance('${item.instanceId}', '${safeName}')">
-                    <i class="fas fa-terminal"></i> SSM
-               </button>`
-            : `<button class="ssm-connect-btn" disabled>
+        // A Session Manager connection only works if the instance is registered and
+        // reachable. 'unknown' means the status could not be read (e.g. missing
+        // permission), so connecting is still allowed rather than wrongly blocked.
+        const ssmStatus = item.ssmStatus || 'unknown';
+        const ssmConnectable = isRunning && (ssmStatus === 'online' || ssmStatus === 'unknown');
+
+        let ssmButton;
+        if (!isRunning) {
+            ssmButton = `<button class="ssm-connect-btn" disabled title="Instance is not running">
                     <i class="fas fa-power-off"></i> Stopped
                </button>`;
+        } else if (ssmConnectable) {
+            ssmButton = `<button class="ssm-connect-btn" onclick="window.awsManager.connectToInstance('${item.instanceId}', '${safeName}')">
+                    <i class="fas fa-terminal"></i> SSM
+               </button>`;
+        } else {
+            ssmButton = `<button class="ssm-connect-btn" disabled title="${this.escapeHtml(this.getSsmBlockReason(ssmStatus))}">
+                    <i class="fas fa-unlink"></i> No SSM
+               </button>`;
+        }
 
-        // RDP button - running Windows instances only
-        const rdpButton = (isRunning && isWindows)
+        // RDP additionally requires a Windows instance
+        const rdpButton = (ssmConnectable && isWindows)
             ? `<button class="rdp-connect-btn" onclick="window.awsManager.connectToInstanceRDP('${item.instanceId}', '${safeName}')">
                     <i class="fas fa-desktop"></i> RDP
                </button>`
             : '';
 
         row.innerHTML = `
-            <td>${item.instanceName || 'No Name'}</td>
+            <td>${this.escapeHtml(item.instanceName || 'No Name')}</td>
             <td>${item.instanceId}</td>
             <td>${item.instanceType}</td>
             <td><span class="status-badge status-${item.state}">${item.state}</span></td>
+            <td>${this.createSsmCell(item)}</td>
             <td>${item.publicIp || '-'}</td>
             <td>${item.privateIp || '-'}</td>
-            <td>${item.platform}</td>
-            <td>${new Date(item.launchTime).toLocaleString()}</td>
+            <td>${this.escapeHtml(item.platform)}</td>
             <td class="actions-cell">
                 <div class="action-buttons">
                     ${ssmButton}
@@ -759,6 +795,55 @@ class AWSManager {
         `;
 
         return row;
+    }
+
+    // Badge showing whether Systems Manager can reach this instance
+    createSsmCell(item) {
+        // SSM state is meaningless for an instance that isn't running
+        if (item.state !== 'running') {
+            return '<span class="ssm-badge ssm-na">—</span>';
+        }
+
+        const meta = {
+            online:          { label: 'Online',          cls: 'ssm-online' },
+            connection_lost: { label: 'Connection lost', cls: 'ssm-lost' },
+            inactive:        { label: 'Inactive',        cls: 'ssm-inactive' },
+            unmanaged:       { label: 'Not managed',     cls: 'ssm-unmanaged' },
+            unknown:         { label: 'Unknown',         cls: 'ssm-unknown' }
+        };
+
+        const status = item.ssmStatus || 'unknown';
+        const badge = meta[status] || meta.unknown;
+
+        const details = [];
+        if (item.ssmLastPing) {
+            details.push(`Last ping: ${new Date(item.ssmLastPing).toLocaleString()}`);
+        }
+        if (item.ssmAgentVersion) {
+            details.push(`Agent ${item.ssmAgentVersion}`);
+        }
+        if (status === 'unmanaged') {
+            details.push('Not registered with Systems Manager — check the SSM agent and the instance IAM role.');
+        }
+        if (status === 'unknown') {
+            details.push('SSM status could not be read (ssm:DescribeInstanceInformation permission may be missing).');
+        }
+
+        const title = this.escapeHtml(details.length ? details.join(' · ') : badge.label);
+        return `<span class="ssm-badge ${badge.cls}" title="${title}">${badge.label}</span>`;
+    }
+
+    getSsmBlockReason(status) {
+        switch (status) {
+            case 'unmanaged':
+                return 'This instance is not registered with Systems Manager. Install/start the SSM agent and attach an IAM role with AmazonSSMManagedInstanceCore.';
+            case 'connection_lost':
+                return 'The SSM agent is registered but has stopped responding, so a session cannot be started.';
+            case 'inactive':
+                return 'The SSM agent is inactive on this instance.';
+            default:
+                return 'Systems Manager cannot reach this instance.';
+        }
     }
 
     displayErrorState(errorMessage) {
