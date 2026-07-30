@@ -38,7 +38,8 @@ bastion hosts, and no manual CLI commands.
 - **SSM readiness at a glance** — per-instance agent status (Online / Connection lost / Not managed), so you never click Connect on an instance that can't accept a session
 - **One-click SSM shell** — opens `aws ssm start-session` in a new terminal window
 - **RDP over SSM** — auto port-forward tunnel + launches your RDP client (Windows-only instances)
-- **Active tunnel management** — see every open RDP tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
+- **Port forwarding over SSM** — tunnel any TCP port to `localhost`, either on the instance itself or on a host it can reach (an RDS endpoint, for example), so you can use your own database or web client without a bastion or an inbound rule
+- **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
 - **Startup preflight** — missing external tools (AWS CLI, Session Manager plugin, aws-azure-login) are reported up front with install instructions, instead of failing later mid-connect
 - Smart buttons: SSM on any running instance, RDP only on running Windows instances
 - Cross-platform: Windows, macOS, Linux

@@ -7,7 +7,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Preflight for the external tools Portus shells out to
   checkRequiredTools: () => ipcRenderer.invoke('check-required-tools'),
 
-  // Active RDP tunnels
+  // Generic port forwarding over SSM
+  startPortForward: (profileName, instanceId, instanceName, options) =>
+    ipcRenderer.invoke('start-port-forward', profileName, instanceId, instanceName, options),
+
+  // Active tunnels
   listTunnels: () => ipcRenderer.invoke('list-tunnels'),
   closeTunnel: (tunnelId) => ipcRenderer.invoke('close-tunnel', tunnelId),
   onTunnelsChanged: (callback) => {

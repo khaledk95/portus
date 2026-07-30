@@ -393,7 +393,7 @@ body::after {
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
-  width: 320px;
+  width: 380px;
   z-index: 500;
   display: none;
   flex-direction: column;
@@ -426,6 +426,30 @@ body::after {
 }
 .session-row:hover { background: rgba(255, 255, 255, 0.06); }
 .session-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.session-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.session-type {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: var(--radius-pill);
+  flex-shrink: 0;
+}
+.session-type.rdp { color: var(--accent-1); background: rgba(96, 165, 250, 0.16); }
+.session-type.port { color: var(--ok); background: var(--ok-bg); }
+.session-copy {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--glass-border);
+  color: var(--text-tertiary);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 11px;
+  transition: all 0.18s ease;
+}
+.session-copy:hover { color: var(--text-primary); border-color: var(--glass-border-strong); }
 .session-name {
   font-size: 13px;
   color: var(--text-primary);
@@ -924,6 +948,178 @@ body::after {
   border-color: rgba(96, 165, 250, 0.35);
 }
 .rdp-connect-btn:hover { background: rgba(96, 165, 250, 0.22); transform: translateY(-1px); }
+
+/* Port forwarding is the secondary action, so it stays visually quieter than SSM/RDP */
+.port-forward-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 7px 14px;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--glass-border);
+  transition: all 0.18s ease;
+}
+.port-forward-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text-primary);
+  transform: translateY(-1px);
+}
+.port-forward-btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+
+/* ==========================================================================
+   PORT FORWARDING DIALOG
+   ========================================================================== */
+
+.popup-content.pf-dialog { max-width: 540px; }
+
+.pf-context {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-tertiary);
+  margin-bottom: var(--space-5);
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--glass-border);
+}
+.pf-context strong { color: var(--text-secondary); font-weight: 600; }
+
+.pf-field { margin-bottom: var(--space-5); }
+.pf-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  margin-bottom: var(--space-2);
+}
+
+.pf-segment {
+  display: flex;
+  gap: 4px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-pill);
+  padding: 4px;
+}
+.pf-segment button {
+  flex: 1;
+  font-family: var(--font);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 8px 10px;
+  border-radius: var(--radius-pill);
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+.pf-segment button.active {
+  background: var(--accent-grad);
+  color: #fff;
+  box-shadow: 0 3px 10px var(--accent-glow);
+}
+
+.pf-input {
+  width: 100%;
+  font-family: var(--font);
+  font-size: 13.5px;
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  padding: 11px 14px;
+  outline: none;
+  transition: all 0.18s ease;
+}
+.pf-input::placeholder { color: var(--text-tertiary); }
+.pf-input:focus { border-color: var(--accent-1); box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.2); }
+.pf-input.mono { font-family: var(--font-mono); font-size: 12.5px; }
+
+.pf-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.pf-chip {
+  font-family: var(--font);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--glass-border);
+  color: var(--text-secondary);
+  transition: all 0.18s ease;
+}
+.pf-chip:hover { background: rgba(255, 255, 255, 0.12); color: var(--text-primary); }
+.pf-chip.active {
+  background: rgba(96, 165, 250, 0.18);
+  border-color: var(--accent-1);
+  color: var(--accent-1);
+}
+
+.pf-ports { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+
+.pf-hint {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-top: var(--space-5);
+  font-size: 12px;
+  color: var(--text-tertiary);
+  line-height: 1.45;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  padding: 11px 13px;
+}
+.pf-hint i { color: var(--ok); margin-top: 2px; }
+
+.pf-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  margin-top: var(--space-5);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--glass-border);
+}
+.pf-cancel {
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 10px 18px;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--glass-border);
+  color: var(--text-secondary);
+  transition: all 0.18s ease;
+}
+.pf-cancel:hover { background: rgba(255, 255, 255, 0.07); color: var(--text-primary); }
+.pf-start {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 10px 20px;
+  border-radius: var(--radius-pill);
+  border: none;
+  cursor: pointer;
+  color: #fff;
+  background: var(--accent-grad);
+  box-shadow: 0 5px 16px var(--accent-glow);
+  transition: filter 0.18s ease;
+}
+.pf-start:hover:not(:disabled) { filter: brightness(1.08); }
+.pf-start:disabled { opacity: 0.7; cursor: default; }
 
 /* Empty / error states */
 .empty-state {

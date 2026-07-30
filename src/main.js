@@ -153,12 +153,127 @@ let tunnelSequence = 0;
 function listTunnels() {
   return Array.from(activeTunnels.values()).map(tunnel => ({
     id: tunnel.id,
+    kind: tunnel.kind || 'rdp',
     instanceId: tunnel.instanceId,
     instanceName: tunnel.instanceName,
     profileName: tunnel.profileName,
     port: tunnel.port,
+    remoteHost: tunnel.remoteHost || null,
+    remotePort: tunnel.remotePort || null,
     startedAt: tunnel.startedAt
   }));
+}
+
+// Bind port 0 to let the OS hand back a free port
+function findFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = require('net').createServer();
+    server.unref();
+    server.on('error', reject);
+    server.listen(0, () => {
+      const port = server.address().port;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+// Fail early with a clear message rather than letting the CLI die obscurely
+function ensurePortFree(port) {
+  return new Promise((resolve, reject) => {
+    const server = require('net').createServer();
+    server.unref();
+    server.on('error', err => reject(new Error(
+      err.code === 'EADDRINUSE'
+        ? `Local port ${port} is already in use. Leave it blank to pick one automatically.`
+        : `Local port ${port} is unavailable: ${err.message}`
+    )));
+    server.listen(port, () => server.close(() => resolve(port)));
+  });
+}
+
+function describeTunnelFailure(stderrText) {
+  if (/TargetNotConnected/i.test(stderrText)) {
+    return 'The instance is not connected to Systems Manager, so no session could be started.';
+  }
+  if (/InvalidInstanceId/i.test(stderrText)) {
+    return 'Systems Manager does not recognise this instance id.';
+  }
+  if (/AccessDenied|not authorized/i.test(stderrText)) {
+    return 'Access denied starting the session. Your role needs ssm:StartSession for this instance and document.';
+  }
+  const trimmed = (stderrText || '').trim();
+  return trimmed ? `Failed to start the tunnel: ${trimmed.split('\n')[0]}` : 'Failed to start the tunnel.';
+}
+
+// Shared tunnel launcher for port forwarding. Resolves once the CLI reports the
+// listener is up, or with an error; never rejects, so the message survives IPC.
+function startSsmTunnel({ ssmCommand, kind, instanceId, instanceName, profileName, localPort, remoteHost, remotePort }) {
+  return new Promise(resolve => {
+    const platform = process.platform;
+    let established = false;
+    let tunnelId = null;
+    let stderrText = '';
+
+    // shell:true on Windows is required: it is what makes Node pass the command
+    // line through verbatim, so the quotes around --parameters survive.
+    const proc = platform === 'win32'
+      ? spawn('cmd', ['/c', ssmCommand], { stdio: 'pipe', shell: true, windowsHide: true })
+      : spawn('bash', ['-c', `exec ${ssmCommand}`], {
+          stdio: 'pipe',
+          env: { ...process.env, PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin' }
+        });
+
+    proc.stdout.on('data', data => {
+      const output = data.toString();
+      if (established) return;
+      if (!output.includes('Port forwarding started') && !output.includes('Waiting for connections')) return;
+
+      established = true;
+      tunnelId = `tunnel-${++tunnelSequence}`;
+      activeTunnels.set(tunnelId, {
+        id: tunnelId,
+        kind,
+        instanceId,
+        instanceName: instanceName || instanceId,
+        profileName,
+        port: localPort,
+        remoteHost: remoteHost || null,
+        remotePort,
+        ssmProcess: proc,
+        rdpProcess: null,
+        startedAt: Date.now()
+      });
+      broadcastTunnels();
+
+      resolve({ success: true, tunnelId, port: localPort });
+    });
+
+    proc.stderr.on('data', data => { stderrText += data.toString(); });
+
+    proc.on('close', () => {
+      if (tunnelId && activeTunnels.has(tunnelId)) closeTunnel(tunnelId);
+      if (!established) resolve({ success: false, error: describeTunnelFailure(stderrText) });
+    });
+
+    proc.on('error', error => {
+      if (established) return;
+      resolve({
+        success: false,
+        error: error.code === 'ENOENT'
+          ? 'AWS CLI not found. Please ensure the AWS CLI is installed and on your PATH.'
+          : `SSM tunnel error: ${error.message}`
+      });
+    });
+
+    setTimeout(() => {
+      if (established) return;
+      killProcessTree(proc);
+      resolve({
+        success: false,
+        error: 'Timed out waiting for the tunnel to start. Check that the instance is reachable through Systems Manager.'
+      });
+    }, 30000);
+  });
 }
 
 function broadcastTunnels() {
@@ -414,7 +529,89 @@ function setupIpcHandlers() {
     }
   });
 
-  // Active RDP tunnels
+  // Generic port forwarding over SSM. With a remote host this tunnels *through*
+  // the instance to something else in the VPC (an RDS endpoint, for example),
+  // which is otherwise unreachable because RDS cannot run an SSM agent.
+  ipcMain.handle('start-port-forward', async (event, profileName, instanceId, instanceName, options) => {
+    const { remoteHost, remotePort, localPort } = options || {};
+
+    const targetPort = parseInt(remotePort, 10);
+    if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
+      return { success: false, error: 'Remote port must be a number between 1 and 65535.' };
+    }
+
+    let requestedLocalPort = null;
+    if (localPort !== undefined && localPort !== null && String(localPort).trim() !== '') {
+      requestedLocalPort = parseInt(localPort, 10);
+      if (!Number.isInteger(requestedLocalPort) || requestedLocalPort < 1 || requestedLocalPort > 65535) {
+        return { success: false, error: 'Local port must be a number between 1 and 65535, or left blank.' };
+      }
+    }
+
+    const targetHost = (remoteHost || '').trim();
+
+    // Same instance, same target, same port means the existing tunnel already
+    // does the job; different services on one instance still coexist.
+    const existing = Array.from(activeTunnels.values()).find(tunnel =>
+      tunnel.instanceId === instanceId &&
+      tunnel.profileName === profileName &&
+      tunnel.remotePort === targetPort &&
+      (tunnel.remoteHost || '') === targetHost
+    );
+
+    if (existing) {
+      return {
+        success: true,
+        reused: true,
+        port: existing.port,
+        message: `Already forwarding on localhost:${existing.port}`
+      };
+    }
+
+    let resolvedLocalPort;
+    try {
+      resolvedLocalPort = requestedLocalPort
+        ? await ensurePortFree(requestedLocalPort)
+        : await findFreePort();
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+
+    const profileConfig = await getProfileConfig(profileName);
+
+    const documentName = targetHost
+      ? 'AWS-StartPortForwardingSessionToRemoteHost'
+      : 'AWS-StartPortForwardingSession';
+
+    const parameters = targetHost
+      ? `host=${targetHost},portNumber=${targetPort},localPortNumber=${resolvedLocalPort}`
+      : `portNumber=${targetPort},localPortNumber=${resolvedLocalPort}`;
+
+    const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name ${documentName} --parameters "${parameters}" --profile ${profileName} --region ${profileConfig.region}`;
+
+    const result = await startSsmTunnel({
+      ssmCommand,
+      kind: 'port',
+      instanceId,
+      instanceName,
+      profileName,
+      localPort: resolvedLocalPort,
+      remoteHost: targetHost,
+      remotePort: targetPort
+    });
+
+    if (!result.success) return result;
+
+    return {
+      success: true,
+      port: resolvedLocalPort,
+      remoteHost: targetHost || null,
+      remotePort: targetPort,
+      message: `Forwarding localhost:${resolvedLocalPort} to ${targetHost || 'this instance'}:${targetPort}`
+    };
+  });
+
+  // Active tunnels
   ipcMain.handle('list-tunnels', () => listTunnels());
   ipcMain.handle('close-tunnel', (event, tunnelId) => ({ success: closeTunnel(tunnelId) }));
 
@@ -854,10 +1051,12 @@ function setupIpcHandlers() {
             tunnelId = `tunnel-${++tunnelSequence}`;
             activeTunnels.set(tunnelId, {
               id: tunnelId,
+              kind: 'rdp',
               instanceId,
               instanceName: instanceName || instanceId,
               profileName,
               port: availablePort,
+              remotePort: 3389,
               ssmProcess,
               rdpProcess: null,
               startedAt: Date.now()

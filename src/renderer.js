@@ -130,7 +130,189 @@ class AWSManager {
     }
 
     // ==========================================================================
-    // ACTIVE RDP TUNNELS
+    // PORT FORWARDING
+    // ==========================================================================
+
+    openPortForwardDialog(instanceId, instanceName) {
+        if (!this.currentProfile) {
+            this.showToast('No profile selected', 'error');
+            return;
+        }
+
+        const presets = [
+            { label: 'Oracle', port: 1521 },
+            { label: 'SQL Server', port: 1433 },
+            { label: 'PostgreSQL', port: 5432 },
+            { label: 'MySQL', port: 3306 },
+            { label: 'Redis', port: 6379 }
+        ];
+
+        const overlay = document.createElement('div');
+        overlay.className = 'popup-overlay';
+
+        const popup = document.createElement('div');
+        popup.className = 'popup-content pf-dialog';
+        popup.innerHTML = `
+            <div class="popup-header">
+                <h3>Forward a port</h3>
+                <button class="popup-close" id="pfClose"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="popup-body">
+                <div class="pf-context">
+                    <i class="fas fa-server"></i>
+                    <span>Tunnelling through <strong>${this.escapeHtml(instanceName)}</strong> · ${this.escapeHtml(instanceId)}</span>
+                </div>
+
+                <div class="pf-field">
+                    <label class="pf-label">Target</label>
+                    <div class="pf-segment">
+                        <button type="button" class="active" data-target="local">This instance</button>
+                        <button type="button" data-target="remote">A host reachable from it</button>
+                    </div>
+                </div>
+
+                <div class="pf-field" id="pfHostField" style="display: none;">
+                    <label class="pf-label">Remote host</label>
+                    <input class="pf-input mono" id="pfHost" spellcheck="false" autocomplete="off"
+                           placeholder="my-db.abc123.eu-central-1.rds.amazonaws.com">
+                </div>
+
+                <div class="pf-field">
+                    <label class="pf-label">Service</label>
+                    <div class="pf-chips" id="pfChips">
+                        ${presets.map(p => `<button type="button" class="pf-chip" data-port="${p.port}">${p.label}</button>`).join('')}
+                    </div>
+                </div>
+
+                <div class="pf-ports">
+                    <div class="pf-field" style="margin-bottom: 0;">
+                        <label class="pf-label">Remote port</label>
+                        <input class="pf-input mono" id="pfRemotePort" inputmode="numeric" placeholder="e.g. 1521">
+                    </div>
+                    <div class="pf-field" style="margin-bottom: 0;">
+                        <label class="pf-label">Local port</label>
+                        <input class="pf-input mono" id="pfLocalPort" inputmode="numeric" placeholder="Auto (free port)">
+                    </div>
+                </div>
+
+                <div class="pf-hint">
+                    <i class="fas fa-shield-halved"></i>
+                    <span>Traffic goes out through the SSM agent. No inbound security-group rule, no public IP, and the session is recorded in CloudTrail.</span>
+                </div>
+
+                <div class="pf-footer">
+                    <button type="button" class="pf-cancel" id="pfCancel">Cancel</button>
+                    <button type="button" class="pf-start" id="pfStart">
+                        <i class="fas fa-right-left"></i> Start forwarding
+                    </button>
+                </div>
+            </div>
+        `;
+
+        overlay.appendChild(popup);
+        document.body.appendChild(overlay);
+
+        const hostField = popup.querySelector('#pfHostField');
+        const hostInput = popup.querySelector('#pfHost');
+        const remotePortInput = popup.querySelector('#pfRemotePort');
+        const localPortInput = popup.querySelector('#pfLocalPort');
+        const startBtn = popup.querySelector('#pfStart');
+        const close = () => overlay.remove();
+
+        popup.querySelector('#pfClose').addEventListener('click', close);
+        popup.querySelector('#pfCancel').addEventListener('click', close);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+        // Target toggle shows/hides the remote host field
+        popup.querySelectorAll('.pf-segment button').forEach(btn => {
+            btn.addEventListener('click', () => {
+                popup.querySelectorAll('.pf-segment button').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                const isRemote = btn.dataset.target === 'remote';
+                hostField.style.display = isRemote ? 'block' : 'none';
+                if (isRemote) hostInput.focus();
+            });
+        });
+
+        // Chips just fill the remote port; it stays editable
+        popup.querySelectorAll('.pf-chip').forEach(chip => {
+            chip.addEventListener('click', () => {
+                popup.querySelectorAll('.pf-chip').forEach(c => c.classList.remove('active'));
+                chip.classList.add('active');
+                remotePortInput.value = chip.dataset.port;
+            });
+        });
+
+        // Typing a port by hand clears any chip selection
+        remotePortInput.addEventListener('input', () => {
+            popup.querySelectorAll('.pf-chip').forEach(chip => {
+                chip.classList.toggle('active', chip.dataset.port === remotePortInput.value.trim());
+            });
+        });
+
+        startBtn.addEventListener('click', async () => {
+            const isRemote = popup.querySelector('.pf-segment button.active').dataset.target === 'remote';
+            const remoteHost = isRemote ? hostInput.value.trim() : '';
+
+            if (isRemote && !remoteHost) {
+                this.showToast('Enter the remote host to forward to', 'warning');
+                hostInput.focus();
+                return;
+            }
+            if (!remotePortInput.value.trim()) {
+                this.showToast('Enter the remote port to forward', 'warning');
+                remotePortInput.focus();
+                return;
+            }
+
+            startBtn.disabled = true;
+            startBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starting…';
+
+            const result = await this.startPortForward(instanceId, instanceName, {
+                remoteHost,
+                remotePort: remotePortInput.value.trim(),
+                localPort: localPortInput.value.trim()
+            });
+
+            if (result && result.success) {
+                close();
+            } else {
+                startBtn.disabled = false;
+                startBtn.innerHTML = '<i class="fas fa-right-left"></i> Start forwarding';
+            }
+        });
+
+        setTimeout(() => remotePortInput.focus(), 100);
+    }
+
+    async startPortForward(instanceId, instanceName, options) {
+        this.showLoading(true);
+        try {
+            const result = await window.electronAPI.startPortForward(
+                this.currentProfile, instanceId, instanceName, options
+            );
+
+            if (result && result.success) {
+                this.showToast(
+                    result.reused
+                        ? `Already forwarding on localhost:${result.port}`
+                        : `Forwarding localhost:${result.port} → ${options.remoteHost || instanceName}:${options.remotePort}`,
+                    result.reused ? 'info' : 'success'
+                );
+            } else {
+                this.showToast(result?.error || 'Could not start port forwarding', 'error');
+            }
+            return result;
+        } catch (error) {
+            this.showToast(`Port forwarding failed: ${error.message}`, 'error');
+            return { success: false };
+        } finally {
+            this.showLoading(false);
+        }
+    }
+
+    // ==========================================================================
+    // ACTIVE TUNNELS
     // ==========================================================================
 
     setupSessionsPanel() {
@@ -187,15 +369,29 @@ class AWSManager {
 
         list.innerHTML = '';
         this.activeTunnels.forEach(tunnel => {
+            const kind = tunnel.kind === 'port' ? 'port' : 'rdp';
+            const target = tunnel.remoteHost
+                ? `${this.shortenHost(tunnel.remoteHost)}:${tunnel.remotePort}`
+                : `:${tunnel.remotePort || 3389}`;
+
             const row = document.createElement('div');
             row.className = 'session-row';
             row.innerHTML = `
                 <div class="session-info">
-                    <span class="session-name">${this.escapeHtml(tunnel.instanceName || tunnel.instanceId)}</span>
-                    <span class="session-meta">localhost:${tunnel.port} · ${this.formatUptime(tunnel.startedAt)}</span>
+                    <div class="session-top">
+                        <span class="session-type ${kind}">${kind.toUpperCase()}</span>
+                        <span class="session-name">${this.escapeHtml(tunnel.instanceName || tunnel.instanceId)}</span>
+                    </div>
+                    <span class="session-meta">localhost:${tunnel.port} &rarr; ${this.escapeHtml(target)} · ${this.formatUptime(tunnel.startedAt)}</span>
                 </div>
+                <button type="button" class="session-copy" title="Copy localhost:${tunnel.port}">
+                    <i class="fas fa-copy"></i>
+                </button>
                 <button type="button" class="session-disconnect">Disconnect</button>
             `;
+
+            row.querySelector('.session-copy')
+                .addEventListener('click', () => this.copyToClipboard(`localhost:${tunnel.port}`));
             row.querySelector('.session-disconnect')
                 .addEventListener('click', () => this.disconnectTunnel(tunnel));
             list.appendChild(row);
@@ -208,6 +404,21 @@ class AWSManager {
             this.showToast(`Disconnected ${tunnel.instanceName || tunnel.instanceId}`, 'info');
         } catch (error) {
             this.showToast('Could not close the tunnel', 'error');
+        }
+    }
+
+    // RDS endpoints are long; keep the ends, which is what identifies them
+    shortenHost(host) {
+        if (!host || host.length <= 28) return host;
+        return `${host.slice(0, 14)}…${host.slice(-12)}`;
+    }
+
+    async copyToClipboard(text) {
+        try {
+            await navigator.clipboard.writeText(text);
+            this.showToast(`Copied ${text}`, 'info');
+        } catch (error) {
+            this.showToast('Could not copy to clipboard', 'error');
         }
     }
 
@@ -913,6 +1124,15 @@ class AWSManager {
                </button>`
             : '';
 
+        // Port forwarding rides the same SSM session, so it needs the same reachability
+        const portButton = ssmConnectable
+            ? `<button class="port-forward-btn" onclick="window.awsManager.openPortForwardDialog('${item.instanceId}', '${safeName}')">
+                    <i class="fas fa-right-left"></i> Port
+               </button>`
+            : `<button class="port-forward-btn" disabled title="${this.escapeHtml(this.getSsmBlockReason(ssmStatus))}">
+                    <i class="fas fa-right-left"></i> Port
+               </button>`;
+
         row.innerHTML = `
             <td>${this.escapeHtml(item.instanceName || 'No Name')}</td>
             <td>${item.instanceId}</td>
@@ -926,6 +1146,7 @@ class AWSManager {
                 <div class="action-buttons">
                     ${ssmButton}
                     ${rdpButton}
+                    ${portButton}
                 </div>
             </td>
         `;
