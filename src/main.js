@@ -5,7 +5,7 @@ if (!process.env.NODE_ENV) {
 
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs-extra');
 const ini = require('ini');
 const os = require('os');
@@ -67,6 +67,146 @@ function createWindow() {
 
   if (process.env.NODE_ENV === 'development' || process.argv.includes('--dev')) {
     mainWindow.webContents.openDevTools();
+  }
+}
+
+// ============================================================================
+// EXTERNAL TOOL PREFLIGHT
+// ============================================================================
+
+// Portus shells out to these. Without them the failure only surfaces later, in a
+// terminal window that closes immediately, so they are checked up front.
+const REQUIRED_TOOLS = [
+  {
+    id: 'aws-cli',
+    name: 'AWS CLI',
+    command: 'aws',
+    purpose: 'Opens the SSM sessions behind Connect and RDP',
+    install: 'https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html'
+  },
+  {
+    id: 'session-manager-plugin',
+    name: 'Session Manager plugin',
+    command: 'session-manager-plugin',
+    purpose: 'Required by the AWS CLI to start a session',
+    install: 'https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html'
+  },
+  {
+    id: 'aws-azure-login',
+    name: 'aws-azure-login',
+    command: 'aws-azure-login',
+    purpose: 'Performs the Azure AD SSO sign-in',
+    install: 'npm install -g aws-azure-login'
+  }
+];
+
+// Resolve a command on PATH. Presence is checked rather than `--version`, because
+// not every tool implements a version flag consistently and a non-zero exit there
+// would be reported as a missing tool.
+function isCommandAvailable(command) {
+  return new Promise(resolve => {
+    const isWindows = process.platform === 'win32';
+
+    const probe = isWindows
+      ? spawn('where', [command], { windowsHide: true })
+      : spawn('sh', ['-c', `command -v ${command}`], {
+          env: { ...process.env, PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin' }
+        });
+
+    let settled = false;
+    const finish = (found) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(found);
+    };
+
+    const timer = setTimeout(() => {
+      try { probe.kill(); } catch (e) { /* already gone */ }
+      finish(false);
+    }, 5000);
+
+    probe.on('close', code => finish(code === 0));
+    probe.on('error', () => finish(false));
+  });
+}
+
+async function checkRequiredTools() {
+  return Promise.all(REQUIRED_TOOLS.map(async tool => ({
+    id: tool.id,
+    name: tool.name,
+    purpose: tool.purpose,
+    install: tool.install,
+    found: await isCommandAvailable(tool.command)
+  })));
+}
+
+// ============================================================================
+// RDP TUNNEL REGISTRY
+// ============================================================================
+
+// Tunnels are tracked centrally so they can be listed in the UI and, critically,
+// terminated when the app exits instead of being left running.
+const activeTunnels = new Map();
+let tunnelSequence = 0;
+
+function listTunnels() {
+  return Array.from(activeTunnels.values()).map(tunnel => ({
+    id: tunnel.id,
+    instanceId: tunnel.instanceId,
+    instanceName: tunnel.instanceName,
+    profileName: tunnel.profileName,
+    port: tunnel.port,
+    startedAt: tunnel.startedAt
+  }));
+}
+
+function broadcastTunnels() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('tunnels-changed', listTunnels());
+  }
+}
+
+// `aws ssm start-session` runs underneath a shell, and on Windows spawns the
+// session-manager-plugin below that. child.kill() ends only the shell it was
+// handed, leaving the session alive and holding its local port, so the whole
+// process tree has to be terminated explicitly.
+function killProcessTree(proc) {
+  if (!proc || !proc.pid) return;
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+
+  if (process.platform === 'win32') {
+    // Synchronous on purpose: this also runs from the process 'exit' handler,
+    // where an async spawn would never get the chance to execute.
+    try {
+      spawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true
+      });
+    } catch (error) {
+      try { proc.kill(); } catch (e) { /* nothing else to try */ }
+    }
+  } else {
+    // The shell exec's into aws, so this pid is the session itself
+    try { proc.kill('SIGTERM'); } catch (e) { /* already gone */ }
+  }
+}
+
+function closeTunnel(tunnelId, { silent = false } = {}) {
+  const tunnel = activeTunnels.get(tunnelId);
+  if (!tunnel) return false;
+
+  activeTunnels.delete(tunnelId);
+  killProcessTree(tunnel.ssmProcess);
+  if (tunnel.rdpProcess) killProcessTree(tunnel.rdpProcess);
+
+  if (!silent) broadcastTunnels();
+  return true;
+}
+
+function closeAllTunnels() {
+  for (const tunnelId of Array.from(activeTunnels.keys())) {
+    closeTunnel(tunnelId, { silent: true });
   }
 }
 
@@ -265,6 +405,19 @@ function setupIpcHandlers() {
   // Electron. Hardcoding it in the markup means it silently goes stale.
   ipcMain.handle('get-app-version', () => app.getVersion());
 
+  // Preflight: which external tools are present on this machine
+  ipcMain.handle('check-required-tools', async () => {
+    try {
+      return { success: true, tools: await checkRequiredTools() };
+    } catch (error) {
+      return { success: false, error: error.message, tools: [] };
+    }
+  });
+
+  // Active RDP tunnels
+  ipcMain.handle('list-tunnels', () => listTunnels());
+  ipcMain.handle('close-tunnel', (event, tunnelId) => ({ success: closeTunnel(tunnelId) }));
+
   // Get Azure AD SSO profiles (for aws-azure-login)
   ipcMain.handle('get-aws-profiles', async () => {
     try {
@@ -410,9 +563,15 @@ function setupIpcHandlers() {
 
   // Azure AD SSO login via aws-azure-login CLI
   ipcMain.handle('azure-aws-login', async (event, profileName) => {
-    const result = await runAzureLogin(profileName);
-    lastSsoProfile = profileName;
-    return result;
+    try {
+      const result = await runAzureLogin(profileName);
+      lastSsoProfile = profileName;
+      return result;
+    } catch (error) {
+      // Rejecting with a plain object crosses IPC as "[object Object]"; an Error
+      // carries its message through intact.
+      throw new Error(error.error || error.message || 'Authentication failed');
+    }
   });
 
   // Report the current session state (used by the renderer to pre-empt expiry).
@@ -603,7 +762,7 @@ function setupIpcHandlers() {
             }
           }
           if (!terminalFound) {
-            reject({ success: false, error: 'No suitable terminal emulator found. Please install gnome-terminal, konsole, or xterm.' });
+            resolve({ success: false, error: 'No suitable terminal emulator found. Please install gnome-terminal, konsole, or xterm.' });
             return;
           }
         }
@@ -618,151 +777,187 @@ function setupIpcHandlers() {
         terminalProcess.on('error', (error) => {
           if (error.code === 'ENOENT') {
             if (platform === 'win32') {
-              reject({ success: false, error: 'Could not open Command Prompt. Please ensure cmd.exe is available.' });
+              resolve({ success: false, error: 'Could not open Command Prompt. Please ensure cmd.exe is available.' });
             } else if (platform === 'darwin') {
-              reject({ success: false, error: 'Could not open Terminal. Please ensure Terminal.app is available.' });
+              resolve({ success: false, error: 'Could not open Terminal. Please ensure Terminal.app is available.' });
             } else {
-              reject({ success: false, error: 'Could not open terminal. Please install a terminal emulator.' });
+              resolve({ success: false, error: 'Could not open terminal. Please install a terminal emulator.' });
             }
           } else {
-            reject({ success: false, error: `Failed to open terminal: ${error.message}` });
+            resolve({ success: false, error: `Failed to open terminal: ${error.message}` });
           }
         });
       }).catch(error => {
-        reject({ success: false, error: `Failed to get profile config: ${error.message}` });
+        resolve({ success: false, error: `Failed to get profile config: ${error.message}` });
       });
     });
   });
 
   // RDP over SSM - port-forward tunnel + launch RDP client
+  // RDP over SSM - port-forward tunnel + launch RDP client.
+  // The tunnel is registered so it can be listed in the UI and terminated on exit.
   ipcMain.handle('connect-rdp-ssm', async (event, profileName, instanceId, instanceName) => {
+    // Reuse an existing tunnel rather than stacking a second one on another port
+    const existing = Array.from(activeTunnels.values())
+      .find(t => t.instanceId === instanceId && t.profileName === profileName);
+
+    if (existing) {
+      return {
+        success: true,
+        reused: true,
+        port: existing.port,
+        message: `Already connected to ${instanceName} on port ${existing.port}`
+      };
+    }
+
+    const profileConfig = await getProfileConfig(profileName);
+
     return new Promise((resolve, reject) => {
-      getProfileConfig(profileName).then(profileConfig => {
-        const platform = process.platform;
-        const net = require('net');
+      const platform = process.platform;
+      const net = require('net');
 
-        const findAvailablePort = () => new Promise((portResolve, portReject) => {
-          const server = net.createServer();
-          server.listen(0, (err) => {
-            if (err) { portReject(err); return; }
-            const port = server.address().port;
-            server.close(() => portResolve(port));
-          });
+      const findAvailablePort = () => new Promise((portResolve, portReject) => {
+        const server = net.createServer();
+        server.listen(0, (err) => {
+          if (err) { portReject(err); return; }
+          const port = server.address().port;
+          server.close(() => portResolve(port));
         });
+      });
 
-        findAvailablePort().then(availablePort => {
-          const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=3389,localPortNumber=${availablePort}" --profile ${profileName} --region ${profileConfig.region}`;
+      findAvailablePort().then(availablePort => {
+        const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=3389,localPortNumber=${availablePort}" --profile ${profileName} --region ${profileConfig.region}`;
 
-          let ssmProcess;
-          let rdpProcess;
-          let tunnelEstablished = false;
+        let rdpProcess;
+        let tunnelEstablished = false;
+        let tunnelId = null;
 
-          if (platform === 'win32') {
-            ssmProcess = spawn('cmd', ['/c', ssmCommand], { stdio: 'pipe', shell: true });
-          } else {
-            ssmProcess = spawn('bash', ['-c', ssmCommand], {
+        // Windows needs shell:true here. Node only passes the command line through
+        // verbatim for cmd.exe under a shell; without it the embedded quotes in
+        // --parameters are escaped as \" which cmd.exe does not understand, so the
+        // AWS CLI never starts forwarding. Depth of the process tree does not
+        // matter for cleanup because taskkill /T terminates all descendants.
+        // POSIX: exec replaces the shell with aws, making this pid the session.
+        const ssmProcess = platform === 'win32'
+          ? spawn('cmd', ['/c', ssmCommand], { stdio: 'pipe', shell: true, windowsHide: true })
+          : spawn('bash', ['-c', `exec ${ssmCommand}`], {
               stdio: 'pipe',
               env: { ...process.env, PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin' }
             });
-          }
 
-          ssmProcess.stdout.on('data', (data) => {
-            const output = data.toString();
+        ssmProcess.stdout.on('data', (data) => {
+          const output = data.toString();
 
-            if ((output.includes('Port forwarding started') || output.includes('Waiting for connections')) && !tunnelEstablished) {
-              tunnelEstablished = true;
+          if ((output.includes('Port forwarding started') || output.includes('Waiting for connections')) && !tunnelEstablished) {
+            tunnelEstablished = true;
 
-              setTimeout(() => {
-                if (platform === 'win32') {
-                  rdpProcess = spawn('mstsc', [`/v:localhost:${availablePort}`], { detached: false });
-                } else if (platform === 'darwin') {
-                  rdpProcess = spawn('open', ['-a', 'Microsoft Remote Desktop', `rdp://localhost:${availablePort}`], { detached: false });
-                  rdpProcess.on('error', (error) => {
-                    if (error.code === 'ENOENT') {
-                      rdpProcess = spawn('open', [`rdp://localhost:${availablePort}`], { detached: false });
-                    }
-                  });
-                } else {
-                  const rdpClients = ['remmina', 'xfreerdp', 'rdesktop'];
-                  let clientFound = false;
-                  for (const client of rdpClients) {
-                    try {
-                      if (client === 'xfreerdp') {
-                        rdpProcess = spawn('xfreerdp', [`/v:localhost:${availablePort}`, '/cert-ignore'], { detached: false });
-                      } else if (client === 'rdesktop') {
-                        rdpProcess = spawn('rdesktop', [`localhost:${availablePort}`], { detached: false });
-                      } else {
-                        rdpProcess = spawn(client, ['--connect', `rdp://localhost:${availablePort}`], { detached: false });
-                      }
-                      clientFound = true;
-                      break;
-                    } catch (e) {
-                      continue;
-                    }
+            tunnelId = `tunnel-${++tunnelSequence}`;
+            activeTunnels.set(tunnelId, {
+              id: tunnelId,
+              instanceId,
+              instanceName: instanceName || instanceId,
+              profileName,
+              port: availablePort,
+              ssmProcess,
+              rdpProcess: null,
+              startedAt: Date.now()
+            });
+            broadcastTunnels();
+
+            setTimeout(() => {
+              if (platform === 'win32') {
+                rdpProcess = spawn('mstsc', [`/v:localhost:${availablePort}`], { detached: false });
+              } else if (platform === 'darwin') {
+                rdpProcess = spawn('open', ['-a', 'Microsoft Remote Desktop', `rdp://localhost:${availablePort}`], { detached: false });
+                rdpProcess.on('error', (error) => {
+                  if (error.code === 'ENOENT') {
+                    rdpProcess = spawn('open', [`rdp://localhost:${availablePort}`], { detached: false });
                   }
-                  if (!clientFound) {
-                    if (ssmProcess && !ssmProcess.killed) ssmProcess.kill();
-                    reject({ success: false, error: 'No RDP client found. Please install remmina, xfreerdp, or rdesktop.' });
-                    return;
-                  }
-                }
-
-                if (rdpProcess) {
-                  rdpProcess.on('close', () => {
-                    if (ssmProcess && !ssmProcess.killed) ssmProcess.kill();
-                  });
-
-                  rdpProcess.on('error', (error) => {
-                    if (ssmProcess && !ssmProcess.killed) ssmProcess.kill();
-                    if (platform === 'win32' && error.code === 'ENOENT') {
-                      reject({ success: false, error: 'Remote Desktop client not found. Please ensure mstsc is available.' });
-                    } else if (platform === 'darwin') {
-                      reject({ success: false, error: 'RDP client not found. Please install Microsoft Remote Desktop from the Mac App Store, or try: brew install --cask microsoft-remote-desktop' });
-                    } else {
-                      reject({ success: false, error: `RDP client error: ${error.message}` });
-                    }
-                  });
-                }
-
-                resolve({
-                  success: true,
-                  message: `RDP tunnel established for ${instanceName} on port ${availablePort}.`,
-                  port: availablePort
                 });
-              }, 2000);
-            }
-          });
+              } else {
+                const rdpClients = ['remmina', 'xfreerdp', 'rdesktop'];
+                let clientFound = false;
+                for (const client of rdpClients) {
+                  try {
+                    if (client === 'xfreerdp') {
+                      rdpProcess = spawn('xfreerdp', [`/v:localhost:${availablePort}`, '/cert-ignore'], { detached: false });
+                    } else if (client === 'rdesktop') {
+                      rdpProcess = spawn('rdesktop', [`localhost:${availablePort}`], { detached: false });
+                    } else {
+                      rdpProcess = spawn(client, ['--connect', `rdp://localhost:${availablePort}`], { detached: false });
+                    }
+                    clientFound = true;
+                    break;
+                  } catch (e) {
+                    continue;
+                  }
+                }
+                if (!clientFound) {
+                  closeTunnel(tunnelId);
+                  resolve({ success: false, error: 'No RDP client found. Please install remmina, xfreerdp, or rdesktop.' });
+                  return;
+                }
+              }
 
-          ssmProcess.stderr.on('data', (data) => {
-            const errorOutput = data.toString();
-            if (errorOutput.includes('TargetNotConnected') || errorOutput.includes('InvalidInstanceId')) {
-              reject({ success: false, error: 'Instance not available for SSM connection. Ensure SSM agent is running and the instance is a Windows instance.' });
-            }
-          });
+              if (rdpProcess) {
+                const tunnel = activeTunnels.get(tunnelId);
+                if (tunnel) tunnel.rdpProcess = rdpProcess;
 
-          ssmProcess.on('close', () => {
-            if (rdpProcess && !rdpProcess.killed) rdpProcess.kill();
-          });
+                // Closing the RDP window tears the tunnel down with it
+                rdpProcess.on('close', () => closeTunnel(tunnelId));
 
-          ssmProcess.on('error', (error) => {
-            if (error.code === 'ENOENT') {
-              reject({ success: false, error: 'AWS CLI not found. Please ensure AWS CLI is installed and in your PATH.' });
-            } else {
-              reject({ success: false, error: `SSM tunnel error: ${error.message}` });
-            }
-          });
+                rdpProcess.on('error', (error) => {
+                  closeTunnel(tunnelId);
+                  if (platform === 'win32' && error.code === 'ENOENT') {
+                    resolve({ success: false, error: 'Remote Desktop client not found. Please ensure mstsc is available.' });
+                  } else if (platform === 'darwin') {
+                    resolve({ success: false, error: 'RDP client not found. Please install Microsoft Remote Desktop from the Mac App Store, or try: brew install --cask microsoft-remote-desktop' });
+                  } else {
+                    resolve({ success: false, error: `RDP client error: ${error.message}` });
+                  }
+                });
+              }
 
-          setTimeout(() => {
-            if (!tunnelEstablished) {
-              ssmProcess.kill();
-              reject({ success: false, error: 'Timeout waiting for SSM tunnel to establish. Please check instance connectivity and ensure it\'s a Windows instance with SSM agent running.' });
-            }
-          }, 30000);
-        }).catch(portError => {
-          reject({ success: false, error: `Could not find available port: ${portError.message}` });
+              resolve({
+                success: true,
+                message: `RDP tunnel established for ${instanceName} on port ${availablePort}.`,
+                port: availablePort
+              });
+            }, 2000);
+          }
         });
-      }).catch(error => {
-        reject({ success: false, error: `Failed to get profile config: ${error.message}` });
+
+        ssmProcess.stderr.on('data', (data) => {
+          const errorOutput = data.toString();
+          if (errorOutput.includes('TargetNotConnected') || errorOutput.includes('InvalidInstanceId')) {
+            resolve({ success: false, error: 'Instance not available for SSM connection. Ensure SSM agent is running and the instance is a Windows instance.' });
+          }
+        });
+
+        // Keeps the registry honest if the session dies on its own
+        ssmProcess.on('close', () => {
+          if (tunnelId && activeTunnels.has(tunnelId)) {
+            closeTunnel(tunnelId);
+          }
+        });
+
+        ssmProcess.on('error', (error) => {
+          if (tunnelId) closeTunnel(tunnelId);
+          if (error.code === 'ENOENT') {
+            resolve({ success: false, error: 'AWS CLI not found. Please ensure AWS CLI is installed and in your PATH.' });
+          } else {
+            resolve({ success: false, error: `SSM tunnel error: ${error.message}` });
+          }
+        });
+
+        setTimeout(() => {
+          if (!tunnelEstablished) {
+            killProcessTree(ssmProcess);
+            resolve({ success: false, error: 'Timeout waiting for SSM tunnel to establish. Please check instance connectivity and ensure it is a Windows instance with SSM agent running.' });
+          }
+        }, 30000);
+      }).catch(portError => {
+        resolve({ success: false, error: `Could not find available port: ${portError.message}` });
       });
     });
   });
@@ -772,6 +967,12 @@ app.whenReady().then(() => {
   createWindow();
   setupIpcHandlers();
 });
+
+// Tunnels are child processes that outlive the app unless they are terminated
+// explicitly, so every exit path closes them.
+app.on('before-quit', closeAllTunnels);
+app.on('will-quit', closeAllTunnels);
+process.on('exit', closeAllTunnels);
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

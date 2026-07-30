@@ -4,6 +4,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // App metadata
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
 
+  // Preflight for the external tools Portus shells out to
+  checkRequiredTools: () => ipcRenderer.invoke('check-required-tools'),
+
+  // Active RDP tunnels
+  listTunnels: () => ipcRenderer.invoke('list-tunnels'),
+  closeTunnel: (tunnelId) => ipcRenderer.invoke('close-tunnel', tunnelId),
+  onTunnelsChanged: (callback) => {
+    // Only the payload is forwarded; the IpcRendererEvent stays in preload
+    const listener = (_event, tunnels) => callback(tunnels);
+    ipcRenderer.on('tunnels-changed', listener);
+    return () => ipcRenderer.removeListener('tunnels-changed', listener);
+  },
+
   // AWS Profile Management
   getAwsProfiles: () => ipcRenderer.invoke('get-aws-profiles'),
   getOperationalProfiles: () => ipcRenderer.invoke('get-operational-profiles'),

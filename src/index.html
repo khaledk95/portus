@@ -45,7 +45,7 @@
             <p>Secure SSM &amp; RDP access for AWS instances</p>
             <div class="company-info">
                 <span>Open Source · MIT License</span>
-                <span class="version js-app-version">v1.1.0</span>
+                <span class="version js-app-version">v1.2.0</span>
             </div>
         </div>
     </div>
@@ -65,6 +65,19 @@
             </div>
 
             <div class="nav-right">
+                <!-- Active RDP tunnels (hidden until at least one exists) -->
+                <div class="sessions-wrap" id="sessionsWrap" style="display: none;">
+                    <button type="button" id="sessionsTrigger" class="sessions-trigger"
+                            aria-haspopup="dialog" aria-expanded="false" title="Active RDP tunnels">
+                        <i class="fas fa-plug"></i>
+                        <span id="sessionsCount">0</span>
+                    </button>
+                    <div class="sessions-panel" id="sessionsPanel">
+                        <div class="sessions-panel-header">Active RDP tunnels</div>
+                        <div class="sessions-list" id="sessionsList"></div>
+                    </div>
+                </div>
+
                 <!-- Profile Selector -->
                 <div class="profile-section">
                     <div class="profile-combo" id="profileCombo">
@@ -104,6 +117,19 @@
             </div>
         </header>
 
+        <!-- Missing external tool warning -->
+        <div id="depBanner" class="dep-banner" style="display: none;">
+            <i class="fas fa-triangle-exclamation dep-banner-icon"></i>
+            <div class="dep-banner-body">
+                <strong class="dep-banner-title">Some required tools are missing</strong>
+                <p class="dep-banner-sub">Connecting to instances will fail until these are installed and on your PATH.</p>
+                <ul class="dep-banner-list" id="depBannerList"></ul>
+            </div>
+            <button type="button" id="depBannerClose" class="dep-banner-close" title="Dismiss">
+                <i class="fas fa-times"></i>
+            </button>
+        </div>
+
         <!-- Main Layout -->
         <div class="main-layout">
             <main class="main-content">
@@ -118,7 +144,7 @@
                                         <h1 class="about-title">PORTUS</h1>
                                         <p class="app-slogan-large">Your secure gateway to every instance</p>
                                         <div class="version-info">
-                                            <span class="version-badge js-app-version">v1.1.0</span>
+                                            <span class="version-badge js-app-version">v1.2.0</span>
                                         </div>
                                     </div>
                                 </div>

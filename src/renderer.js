@@ -12,6 +12,7 @@ class AWSManager {
         this.profileComboOpen = false;
         this.filteredProfiles = [];
         this.activeOptionIndex = 0;
+        this.activeTunnels = [];
         this.initWithPreloader();
     }
 
@@ -65,6 +66,8 @@ class AWSManager {
     async init() {
         this.setupEventListeners();
         await this.applyAppVersion();
+        this.setupSessionsPanel();
+        this.checkRequiredTools();
         await this.loadProfiles();
         this.updateInitialUI();
         window.awsManager = this;
@@ -83,6 +86,139 @@ class AWSManager {
         } catch (error) {
             // Keep whatever the markup already shows
         }
+    }
+
+    // ==========================================================================
+    // EXTERNAL TOOL PREFLIGHT
+    // ==========================================================================
+
+    // Surface missing CLI dependencies at startup rather than letting them fail
+    // later inside a terminal window that closes immediately.
+    async checkRequiredTools() {
+        const banner = document.getElementById('depBanner');
+        const list = document.getElementById('depBannerList');
+        const closeBtn = document.getElementById('depBannerClose');
+        if (!banner || !list) return;
+
+        if (closeBtn && !closeBtn.dataset.bound) {
+            closeBtn.dataset.bound = '1';
+            closeBtn.addEventListener('click', () => { banner.style.display = 'none'; });
+        }
+
+        try {
+            const result = await window.electronAPI.checkRequiredTools();
+            if (!result || !result.success) return;
+
+            const missing = (result.tools || []).filter(tool => !tool.found);
+            if (!missing.length) {
+                banner.style.display = 'none';
+                return;
+            }
+
+            list.innerHTML = missing.map(tool => `
+                <li>
+                    <span class="dep-name">${this.escapeHtml(tool.name)}</span>
+                    <span class="dep-purpose">${this.escapeHtml(tool.purpose)}</span>
+                    <code class="dep-install">${this.escapeHtml(tool.install)}</code>
+                </li>
+            `).join('');
+
+            banner.style.display = 'flex';
+        } catch (error) {
+            // A failed preflight must not block the app
+        }
+    }
+
+    // ==========================================================================
+    // ACTIVE RDP TUNNELS
+    // ==========================================================================
+
+    setupSessionsPanel() {
+        const trigger = document.getElementById('sessionsTrigger');
+        const wrap = document.getElementById('sessionsWrap');
+        if (!trigger || !wrap) return;
+
+        trigger.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const open = wrap.classList.toggle('open');
+            trigger.setAttribute('aria-expanded', String(open));
+        });
+
+        document.addEventListener('click', (e) => {
+            if (!wrap.contains(e.target)) {
+                wrap.classList.remove('open');
+                trigger.setAttribute('aria-expanded', 'false');
+            }
+        });
+
+        // Live updates pushed from the main process
+        window.electronAPI.onTunnelsChanged(tunnels => this.renderTunnels(tunnels));
+
+        // Keep the uptime column moving without re-fetching
+        setInterval(() => {
+            if (this.activeTunnels && this.activeTunnels.length) {
+                this.renderTunnels(this.activeTunnels);
+            }
+        }, 30000);
+
+        window.electronAPI.listTunnels()
+            .then(tunnels => this.renderTunnels(tunnels))
+            .catch(() => { /* nothing to show yet */ });
+    }
+
+    renderTunnels(tunnels) {
+        this.activeTunnels = tunnels || [];
+
+        const wrap = document.getElementById('sessionsWrap');
+        const count = document.getElementById('sessionsCount');
+        const list = document.getElementById('sessionsList');
+        const trigger = document.getElementById('sessionsTrigger');
+        if (!wrap || !count || !list) return;
+
+        if (!this.activeTunnels.length) {
+            wrap.style.display = 'none';
+            wrap.classList.remove('open');
+            if (trigger) trigger.setAttribute('aria-expanded', 'false');
+            return;
+        }
+
+        wrap.style.display = 'block';
+        count.textContent = this.activeTunnels.length;
+
+        list.innerHTML = '';
+        this.activeTunnels.forEach(tunnel => {
+            const row = document.createElement('div');
+            row.className = 'session-row';
+            row.innerHTML = `
+                <div class="session-info">
+                    <span class="session-name">${this.escapeHtml(tunnel.instanceName || tunnel.instanceId)}</span>
+                    <span class="session-meta">localhost:${tunnel.port} · ${this.formatUptime(tunnel.startedAt)}</span>
+                </div>
+                <button type="button" class="session-disconnect">Disconnect</button>
+            `;
+            row.querySelector('.session-disconnect')
+                .addEventListener('click', () => this.disconnectTunnel(tunnel));
+            list.appendChild(row);
+        });
+    }
+
+    async disconnectTunnel(tunnel) {
+        try {
+            await window.electronAPI.closeTunnel(tunnel.id);
+            this.showToast(`Disconnected ${tunnel.instanceName || tunnel.instanceId}`, 'info');
+        } catch (error) {
+            this.showToast('Could not close the tunnel', 'error');
+        }
+    }
+
+    formatUptime(startedAt) {
+        const seconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+        if (seconds < 60) return `${seconds}s`;
+
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return `${minutes}m`;
+
+        return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
     }
 
     // ==========================================================================
@@ -898,7 +1034,12 @@ class AWSManager {
         try {
             const result = await window.electronAPI.connectRDPSSM(this.currentProfile, instanceId, instanceName);
             if (result && result.success) {
-                this.showToast(`RDP tunnel established for ${displayName} on port ${result.port}`, 'success');
+                this.showToast(
+                    result.reused
+                        ? `${displayName} is already tunnelled on port ${result.port}`
+                        : `RDP tunnel established for ${displayName} on port ${result.port}`,
+                    result.reused ? 'info' : 'success'
+                );
             } else {
                 throw new Error(result?.error || 'Failed to establish RDP tunnel');
             }

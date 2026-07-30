@@ -1,6 +1,6 @@
 {
   "name": "portus",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Cross-platform AWS SSM & RDP-over-SSM access tool",
   "main": "src/main.js",
   "scripts": {
@@ -206,7 +206,7 @@
     "removePackageScripts": true,
     "removePackageKeywords": true,
     "electronVersion": "37.1.0",
-    "buildVersion": "1.1.0"
+    "buildVersion": "1.2.0"
   },
   "repository": {
     "type": "git",
