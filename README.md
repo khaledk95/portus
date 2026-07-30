@@ -177,11 +177,22 @@ All builds output to the `dist/` folder (git-ignored).
 | `npm run dist` | Build without publishing |
 
 **Notes**
-- Build each OS on its own platform where possible. macOS `.dmg` and `.icns`
-  generation require running on macOS.
-- macOS builds are produced **unsigned** (no Apple Developer cert configured).
-- A GitHub Actions workflow (`.github/workflows/build-macos.yml`) builds the macOS
-  app on demand (`workflow_dispatch`).
+- Build each OS on its own platform. macOS `.dmg` and `.icns` generation require
+  running on macOS; Windows `.exe` targets require Windows.
+- No installers are published from CI. To get a macOS (or Linux) build, clone the
+  repo on that platform and run the matching script above — for example:
+
+  ```bash
+  git clone https://github.com/khaledk95/portus.git
+  cd portus
+  npm install
+  npm run build:mac      # output lands in dist/
+  ```
+
+- macOS builds are produced **unsigned** (no Apple Developer certificate is
+  configured). On first launch macOS will block the app: right-click it in
+  Finder and choose **Open**, or allow it under
+  *System Settings → Privacy & Security*.
 
 ---
 
@@ -200,8 +211,6 @@ All builds output to the `dist/` folder (git-ignored).
 ├── build/
 │   ├── portus.png       # Source icon (macOS/Linux; electron-builder generates sizes)
 │   └── portus.ico       # Multi-size Windows icon (16–256 px)
-├── .github/workflows/
-│   └── build-macos.yml  # CI: on-demand macOS build
 ├── package.json         # Scripts + electron-builder config
 └── README.md
 ```
