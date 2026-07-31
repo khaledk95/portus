@@ -57,8 +57,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The `--` matters: without it npm consumes --publish itself and passes a
+      # bare "always" through, which electron-builder rejects as an unknown
+      # argument before any build starts.
       - name: Build and upload
-        run: ${{ matrix.build }} --publish always
+        run: ${{ matrix.build }} -- --publish always
         env:
           # electron-builder reads GH_TOKEN; the token Actions injects is enough
           # to create and upload to a release in this repository.
