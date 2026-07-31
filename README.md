@@ -17,17 +17,37 @@ bastion hosts, and no manual CLI commands.
 
 ## Table of Contents
 
-1. [Features](#features)
-2. [How it works](#how-it-works)
-3. [Prerequisites](#prerequisites)
-4. [AWS profile configuration](#aws-profile-configuration)
-5. [Installation](#installation)
-6. [Running the app (development)](#running-the-app-development)
-7. [Building installers](#building-installers)
-8. [Project structure](#project-structure)
-9. [Branding / icons](#branding--icons)
-10. [Troubleshooting](#troubleshooting)
-11. [Tech stack](#tech-stack)
+1. [Download](#download)
+2. [Features](#features)
+3. [How it works](#how-it-works)
+4. [Prerequisites](#prerequisites)
+5. [AWS profile configuration](#aws-profile-configuration)
+6. [Installing a release](#installing-a-release)
+7. [Running from source](#running-from-source)
+8. [Building installers](#building-installers)
+9. [Project structure](#project-structure)
+10. [Branding / icons](#branding--icons)
+11. [Troubleshooting](#troubleshooting)
+12. [Tech stack](#tech-stack)
+
+---
+
+## Download
+
+Grab the latest installer for your platform from the
+[**Releases page**](https://github.com/khaledk95/portus/releases).
+
+| Platform | File |
+|----------|------|
+| Windows | `Portus-<version>-x64.exe` (installer) or `Portus-Portable-<version>-x64.exe` |
+| macOS | `Portus-<version>-x64.dmg` (Intel) or `Portus-<version>-arm64.dmg` (Apple Silicon) |
+| Linux | `Portus-<version>-x64.AppImage`, `.deb`, or `.rpm` |
+
+Portus still needs the [external tools](#prerequisites) below — the app checks
+for them on startup and tells you what is missing.
+
+> Releases are **unsigned**, so the OS will warn on first launch. See
+> [Installing a release](#installing-a-release) for how to get past it.
 
 ---
 
@@ -132,7 +152,35 @@ region = me-central-1
 
 ---
 
-## Installation
+## Installing a release
+
+Releases are built without a code-signing certificate, so each OS shows a
+warning the first time. The steps below are how you get past it.
+
+**Windows** — SmartScreen shows *"Windows protected your PC"*.
+Click **More info** → **Run anyway**.
+
+**macOS** — Gatekeeper says the app *"cannot be opened because the developer
+cannot be verified"*. Right-click the app in Finder and choose **Open**, or
+allow it under *System Settings → Privacy & Security*. If it is quarantined:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Portus.app
+```
+
+**Linux** — make the AppImage executable, or install the package:
+
+```bash
+chmod +x Portus-*-x64.AppImage && ./Portus-*-x64.AppImage
+# or
+sudo dpkg -i Portus-*-x64.deb
+```
+
+Signing would remove these prompts but needs a paid certificate per platform.
+
+---
+
+## Running from source
 
 ```bash
 # 1. Clone
@@ -143,11 +191,7 @@ cd portus
 npm install
 ```
 
-That's it — no `.env` or extra config files are required to run the app.
-
----
-
-## Running the app (development)
+No `.env` or extra config files are required.
 
 ```bash
 # Normal launch
@@ -182,20 +226,10 @@ All builds output to the `dist/` folder (git-ignored).
 **Notes**
 - Build each OS on its own platform. macOS `.dmg` and `.icns` generation require
   running on macOS; Windows `.exe` targets require Windows.
-- No installers are published from CI. To get a macOS (or Linux) build, clone the
-  repo on that platform and run the matching script above — for example:
-
-  ```bash
-  git clone https://github.com/khaledk95/portus.git
-  cd portus
-  npm install
-  npm run build:mac      # output lands in dist/
-  ```
-
-- macOS builds are produced **unsigned** (no Apple Developer certificate is
-  configured). On first launch macOS will block the app: right-click it in
-  Finder and choose **Open**, or allow it under
-  *System Settings → Privacy & Security*.
+- Pushing a `v*` tag runs the release workflow, which builds on Windows, macOS
+  and Linux runners and attaches every installer to a **draft** GitHub Release.
+  Review it on the Releases page, then publish.
+- Builds are **unsigned** — see [Installing a release](#installing-a-release).
 
 ---
 
@@ -214,6 +248,8 @@ All builds output to the `dist/` folder (git-ignored).
 ├── build/
 │   ├── portus.png       # Source icon (macOS/Linux; electron-builder generates sizes)
 │   └── portus.ico       # Multi-size Windows icon (16–256 px)
+├── .github/workflows/
+│   └── release.yml      # Builds Windows/macOS/Linux on a v* tag, attaches to a draft release
 ├── package.json         # Scripts + electron-builder config
 └── README.md
 ```

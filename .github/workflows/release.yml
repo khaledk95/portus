@@ -1,0 +1,62 @@
+name: Release
+
+# macOS artifacts can only be produced on macOS, so building all three
+# platforms means one runner each. Pushing a v* tag builds and attaches the
+# installers to a draft release; workflow_dispatch allows a manual re-run.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      # One platform failing should not discard the artifacts from the others
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+            build: npm run build:win64
+          - os: macos-latest
+            name: macOS
+            build: npm run build:mac
+          - os: ubuntu-latest
+            name: Linux
+            build: npm run build:linux
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # dmg-license builds through node-gyp, which needs Python
+      - name: Setup Python (macOS only)
+        if: matrix.os == 'macos-latest'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and publish
+        run: ${{ matrix.build }} --publish always
+        env:
+          # electron-builder reads GH_TOKEN; the token Actions injects is enough
+          # to create and upload to a release in this repository.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No Apple Developer certificate is configured, so builds stay unsigned
+          CSC_IDENTITY_AUTO_DISCOVERY: false
