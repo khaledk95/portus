@@ -179,6 +179,7 @@
       "icon": "build/portus.png",
       "category": "Development",
       "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "maintainer": "khaledk95 <khaledk95@users.noreply.github.com>",
       "desktop": {
         "Name": "Portus",
         "Comment": "Secure SSM & RDP-over-SSM access for AWS instances",
