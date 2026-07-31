@@ -43,9 +43,9 @@ Grab the latest installer for your platform from the
 | Windows | `Portus-Portable-<version>-x64.exe` | Single file, no install |
 | macOS | `Portus-<version>-x64.dmg` | Intel |
 | macOS | `Portus-<version>-arm64.dmg` | Apple Silicon |
-| Linux | `Portus-<version>-x64.AppImage` | Runs anywhere, no install |
-| Linux | `Portus-<version>-x64.deb` | Debian / Ubuntu |
-| Linux | `Portus-<version>-x64.rpm` | Fedora / RHEL |
+| Linux | `Portus-<version>-x86_64.AppImage` | Runs anywhere, no install |
+| Linux | `Portus-<version>-amd64.deb` | Debian / Ubuntu |
+| Linux | `Portus-<version>-x86_64.rpm` | Fedora / RHEL |
 | Linux | `Portus-<version>-x64.tar.gz` | Plain archive |
 
 Ignore the `.blockmap` and `latest*.yml` files — build metadata, not downloads.
@@ -178,9 +178,11 @@ xattr -dr com.apple.quarantine /Applications/Portus.app
 **Linux** — make the AppImage executable, or install the package:
 
 ```bash
-chmod +x Portus-*-x64.AppImage && ./Portus-*-x64.AppImage
+chmod +x Portus-*.AppImage && ./Portus-*.AppImage
 # or
-sudo dpkg -i Portus-*-x64.deb
+sudo dpkg -i Portus-*-amd64.deb
+# or
+sudo rpm -i Portus-*-x86_64.rpm
 ```
 
 Signing would remove these prompts but needs a paid certificate per platform.
