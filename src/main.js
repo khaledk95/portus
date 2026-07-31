@@ -205,6 +205,66 @@ function describeTunnelFailure(stderrText) {
   return trimmed ? `Failed to start the tunnel: ${trimmed.split('\n')[0]}` : 'Failed to start the tunnel.';
 }
 
+// Launch the platform's RDP client against an established tunnel.
+async function launchRdpClient(tunnelId, localPort) {
+  const platform = process.platform;
+
+  // Bind the client to the tunnel so closing the RDP window closes the tunnel
+  const attach = (proc) => {
+    const tunnel = activeTunnels.get(tunnelId);
+    if (tunnel) tunnel.rdpProcess = proc;
+    proc.on('close', () => closeTunnel(tunnelId));
+    proc.on('error', () => closeTunnel(tunnelId));
+    return proc;
+  };
+
+  if (platform === 'win32') {
+    attach(spawn('mstsc', [`/v:localhost:${localPort}`], { detached: false }));
+    return { success: true };
+  }
+
+  if (platform === 'darwin') {
+    // `open` hands off to the RDP app and exits straight away, so its lifetime
+    // says nothing about the session. Tying the tunnel to it would tear the
+    // tunnel down the instant the client launched, so the tunnel is left to the
+    // Disconnect button or app exit instead.
+    const primary = spawn('open', ['-a', 'Microsoft Remote Desktop', `rdp://localhost:${localPort}`], { detached: false });
+
+    primary.on('error', (error) => {
+      if (error.code === 'ENOENT') {
+        spawn('open', [`rdp://localhost:${localPort}`], { detached: false });
+      } else {
+        closeTunnel(tunnelId);
+      }
+    });
+
+    const tunnel = activeTunnels.get(tunnelId);
+    if (tunnel) tunnel.rdpProcess = null;
+    return { success: true };
+  }
+
+  // Linux: spawn does not fail synchronously for a missing binary, so the old
+  // loop always "succeeded" on the first entry and never really fell back.
+  // Resolving each command on PATH first makes the fallback real.
+  const clients = [
+    { command: 'remmina', args: ['--connect', `rdp://localhost:${localPort}`] },
+    { command: 'xfreerdp', args: [`/v:localhost:${localPort}`, '/cert-ignore'] },
+    { command: 'rdesktop', args: [`localhost:${localPort}`] }
+  ];
+
+  for (const client of clients) {
+    if (await isCommandAvailable(client.command)) {
+      attach(spawn(client.command, client.args, { detached: false }));
+      return { success: true };
+    }
+  }
+
+  return {
+    success: false,
+    error: 'No RDP client found. Please install remmina, xfreerdp, or rdesktop.'
+  };
+}
+
 // Shared tunnel launcher for port forwarding. Resolves once the CLI reports the
 // listener is up, or with an error; never rejects, so the message survives IPC.
 function startSsmTunnel({ ssmCommand, kind, instanceId, instanceName, profileName, localPort, remoteHost, remotePort }) {
@@ -993,10 +1053,15 @@ function setupIpcHandlers() {
   // RDP over SSM - port-forward tunnel + launch RDP client
   // RDP over SSM - port-forward tunnel + launch RDP client.
   // The tunnel is registered so it can be listed in the UI and terminated on exit.
+  // RDP over SSM: a 3389 port forward plus the platform's RDP client.
   ipcMain.handle('connect-rdp-ssm', async (event, profileName, instanceId, instanceName) => {
-    // Reuse an existing tunnel rather than stacking a second one on another port
-    const existing = Array.from(activeTunnels.values())
-      .find(t => t.instanceId === instanceId && t.profileName === profileName);
+    // Only an existing *RDP* tunnel can be reused. Without the kind check a port
+    // forward on the same instance would be mistaken for an open RDP session.
+    const existing = Array.from(activeTunnels.values()).find(tunnel =>
+      tunnel.kind === 'rdp' &&
+      tunnel.instanceId === instanceId &&
+      tunnel.profileName === profileName
+    );
 
     if (existing) {
       return {
@@ -1007,158 +1072,44 @@ function setupIpcHandlers() {
       };
     }
 
+    let localPort;
+    try {
+      localPort = await findFreePort();
+    } catch (error) {
+      return { success: false, error: `Could not find an available local port: ${error.message}` };
+    }
+
     const profileConfig = await getProfileConfig(profileName);
 
-    return new Promise((resolve, reject) => {
-      const platform = process.platform;
-      const net = require('net');
+    const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=3389,localPortNumber=${localPort}" --profile ${profileName} --region ${profileConfig.region}`;
 
-      const findAvailablePort = () => new Promise((portResolve, portReject) => {
-        const server = net.createServer();
-        server.listen(0, (err) => {
-          if (err) { portReject(err); return; }
-          const port = server.address().port;
-          server.close(() => portResolve(port));
-        });
-      });
-
-      findAvailablePort().then(availablePort => {
-        const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=3389,localPortNumber=${availablePort}" --profile ${profileName} --region ${profileConfig.region}`;
-
-        let rdpProcess;
-        let tunnelEstablished = false;
-        let tunnelId = null;
-
-        // Windows needs shell:true here. Node only passes the command line through
-        // verbatim for cmd.exe under a shell; without it the embedded quotes in
-        // --parameters are escaped as \" which cmd.exe does not understand, so the
-        // AWS CLI never starts forwarding. Depth of the process tree does not
-        // matter for cleanup because taskkill /T terminates all descendants.
-        // POSIX: exec replaces the shell with aws, making this pid the session.
-        const ssmProcess = platform === 'win32'
-          ? spawn('cmd', ['/c', ssmCommand], { stdio: 'pipe', shell: true, windowsHide: true })
-          : spawn('bash', ['-c', `exec ${ssmCommand}`], {
-              stdio: 'pipe',
-              env: { ...process.env, PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin' }
-            });
-
-        ssmProcess.stdout.on('data', (data) => {
-          const output = data.toString();
-
-          if ((output.includes('Port forwarding started') || output.includes('Waiting for connections')) && !tunnelEstablished) {
-            tunnelEstablished = true;
-
-            tunnelId = `tunnel-${++tunnelSequence}`;
-            activeTunnels.set(tunnelId, {
-              id: tunnelId,
-              kind: 'rdp',
-              instanceId,
-              instanceName: instanceName || instanceId,
-              profileName,
-              port: availablePort,
-              remotePort: 3389,
-              ssmProcess,
-              rdpProcess: null,
-              startedAt: Date.now()
-            });
-            broadcastTunnels();
-
-            setTimeout(() => {
-              if (platform === 'win32') {
-                rdpProcess = spawn('mstsc', [`/v:localhost:${availablePort}`], { detached: false });
-              } else if (platform === 'darwin') {
-                rdpProcess = spawn('open', ['-a', 'Microsoft Remote Desktop', `rdp://localhost:${availablePort}`], { detached: false });
-                rdpProcess.on('error', (error) => {
-                  if (error.code === 'ENOENT') {
-                    rdpProcess = spawn('open', [`rdp://localhost:${availablePort}`], { detached: false });
-                  }
-                });
-              } else {
-                const rdpClients = ['remmina', 'xfreerdp', 'rdesktop'];
-                let clientFound = false;
-                for (const client of rdpClients) {
-                  try {
-                    if (client === 'xfreerdp') {
-                      rdpProcess = spawn('xfreerdp', [`/v:localhost:${availablePort}`, '/cert-ignore'], { detached: false });
-                    } else if (client === 'rdesktop') {
-                      rdpProcess = spawn('rdesktop', [`localhost:${availablePort}`], { detached: false });
-                    } else {
-                      rdpProcess = spawn(client, ['--connect', `rdp://localhost:${availablePort}`], { detached: false });
-                    }
-                    clientFound = true;
-                    break;
-                  } catch (e) {
-                    continue;
-                  }
-                }
-                if (!clientFound) {
-                  closeTunnel(tunnelId);
-                  resolve({ success: false, error: 'No RDP client found. Please install remmina, xfreerdp, or rdesktop.' });
-                  return;
-                }
-              }
-
-              if (rdpProcess) {
-                const tunnel = activeTunnels.get(tunnelId);
-                if (tunnel) tunnel.rdpProcess = rdpProcess;
-
-                // Closing the RDP window tears the tunnel down with it
-                rdpProcess.on('close', () => closeTunnel(tunnelId));
-
-                rdpProcess.on('error', (error) => {
-                  closeTunnel(tunnelId);
-                  if (platform === 'win32' && error.code === 'ENOENT') {
-                    resolve({ success: false, error: 'Remote Desktop client not found. Please ensure mstsc is available.' });
-                  } else if (platform === 'darwin') {
-                    resolve({ success: false, error: 'RDP client not found. Please install Microsoft Remote Desktop from the Mac App Store, or try: brew install --cask microsoft-remote-desktop' });
-                  } else {
-                    resolve({ success: false, error: `RDP client error: ${error.message}` });
-                  }
-                });
-              }
-
-              resolve({
-                success: true,
-                message: `RDP tunnel established for ${instanceName} on port ${availablePort}.`,
-                port: availablePort
-              });
-            }, 2000);
-          }
-        });
-
-        ssmProcess.stderr.on('data', (data) => {
-          const errorOutput = data.toString();
-          if (errorOutput.includes('TargetNotConnected') || errorOutput.includes('InvalidInstanceId')) {
-            resolve({ success: false, error: 'Instance not available for SSM connection. Ensure SSM agent is running and the instance is a Windows instance.' });
-          }
-        });
-
-        // Keeps the registry honest if the session dies on its own
-        ssmProcess.on('close', () => {
-          if (tunnelId && activeTunnels.has(tunnelId)) {
-            closeTunnel(tunnelId);
-          }
-        });
-
-        ssmProcess.on('error', (error) => {
-          if (tunnelId) closeTunnel(tunnelId);
-          if (error.code === 'ENOENT') {
-            resolve({ success: false, error: 'AWS CLI not found. Please ensure AWS CLI is installed and in your PATH.' });
-          } else {
-            resolve({ success: false, error: `SSM tunnel error: ${error.message}` });
-          }
-        });
-
-        setTimeout(() => {
-          if (!tunnelEstablished) {
-            killProcessTree(ssmProcess);
-            resolve({ success: false, error: 'Timeout waiting for SSM tunnel to establish. Please check instance connectivity and ensure it is a Windows instance with SSM agent running.' });
-          }
-        }, 30000);
-      }).catch(portError => {
-        resolve({ success: false, error: `Could not find available port: ${portError.message}` });
-      });
+    const result = await startSsmTunnel({
+      ssmCommand,
+      kind: 'rdp',
+      instanceId,
+      instanceName,
+      profileName,
+      localPort,
+      remoteHost: '',
+      remotePort: 3389
     });
+
+    if (!result.success) return result;
+
+    // The listener needs a moment before a client can dial into it
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    const launched = await launchRdpClient(result.tunnelId, localPort);
+    if (!launched.success) {
+      closeTunnel(result.tunnelId);
+      return launched;
+    }
+
+    return {
+      success: true,
+      port: localPort,
+      message: `RDP tunnel established for ${instanceName} on port ${localPort}.`
+    };
   });
 }
 
