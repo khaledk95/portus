@@ -8,8 +8,8 @@
 
 Portus is a cross-platform desktop app (Electron) that lets you authenticate to AWS
 with Azure AD SSO, browse your EC2 instances, and open a **Systems Manager (SSM)
-shell** or a **RDP-over-SSM tunnel** to any instance — with no inbound ports, no
-bastion hosts, and no manual CLI commands.
+shell**, an **RDP-over-SSM tunnel**, or a **port forward to any TCP service** —
+with no inbound ports, no bastion hosts, and no manual CLI commands.
 
 > Open source, released under the MIT License.
 
@@ -68,7 +68,8 @@ for them on startup and tells you what is missing.
 - **Port forwarding over SSM** — tunnel any TCP port to `localhost`, either on the instance itself or on a host it can reach (an RDS endpoint, for example), so you can use your own database or web client without a bastion or an inbound rule
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
 - **Startup preflight** — missing external tools (AWS CLI, Session Manager plugin, aws-azure-login) are reported up front with install instructions, instead of failing later mid-connect
-- Smart buttons: SSM on any running instance, RDP only on running Windows instances
+- **Automatic session renewal** — the AWS session is refreshed before it expires, and an expired one is renewed and retried transparently, so you are not thrown back to the login screen mid-task
+- Smart buttons: connect actions are only offered when Systems Manager can actually reach the instance, and RDP only on running Windows instances
 - Cross-platform: Windows, macOS, Linux
 
 ---
@@ -78,11 +79,25 @@ for them on startup and tells you what is missing.
 ```
 1. SSO Connect      → pick an Azure AD profile → runs aws-azure-login
 2. Select Profile   → choose an operational AWS profile (loads its EC2 instances)
-3. Connect          → click SSM (shell) or RDP (tunnel) on an instance row
+3. Connect          → per instance row, choose:
+                        SSM   → shell in a new terminal
+                        RDP   → tunnel + your RDP client (Windows instances)
+                        Port  → forward any TCP port to localhost
 ```
 
 Under the hood the app shells out to the **AWS CLI** (`aws ssm start-session`) and the
 **Session Manager plugin**, so those must be installed (see prerequisites).
+
+**Port forwarding** can target either the instance itself or a host the instance can
+reach — which is how you get to an **RDS endpoint**, since RDS cannot run an SSM agent:
+
+| Target | SSM document | Reaches |
+|--------|--------------|---------|
+| This instance | `AWS-StartPortForwardingSession` | A port on the EC2 instance |
+| A reachable host | `AWS-StartPortForwardingSessionToRemoteHost` | RDS, ElastiCache, an internal load balancer… |
+
+Open tunnels appear in the 🔌 panel in the top bar, where you can copy the local
+address or disconnect. They are closed automatically when Portus exits.
 
 ---
 
@@ -99,8 +114,8 @@ Under the hood the app shells out to the **AWS CLI** (`aws ssm start-session`) a
 
 ### Runtime (needed on any machine that *uses* the app)
 
-These are external tools Portus calls at runtime. The app will show an error toast if
-one is missing.
+These are external tools Portus calls at runtime. The app checks for them on startup
+and shows a banner naming anything missing, with its install command.
 
 | Tool | Why | Install |
 |------|-----|---------|
@@ -122,7 +137,17 @@ one is missing.
 |--------|----------|
 | `ec2:DescribeInstances` | Listing instances |
 | `ssm:DescribeInstanceInformation` | The **SSM Agent** column (connection readiness) |
-| `ssm:StartSession` | Opening SSM shells and RDP tunnels |
+| `ssm:StartSession` | SSM shells, RDP tunnels and port forwards |
+| `ssm:TerminateSession` / `ssm:ResumeSession` | Closing your own sessions cleanly |
+
+If your policy restricts `ssm:StartSession` by resource, it must also allow the
+documents used for tunnelling, otherwise RDP and port forwarding are denied while
+plain shells still work:
+
+```
+arn:aws:ssm:<region>::document/AWS-StartPortForwardingSession
+arn:aws:ssm:<region>::document/AWS-StartPortForwardingSessionToRemoteHost
+```
 
 `ssm:DescribeInstanceInformation` is optional — without it the SSM Agent column
 shows *Unknown* and the connect buttons stay enabled, so nothing is blocked.
@@ -301,6 +326,10 @@ ie4uinit.exe -show
 | SSM session window opens then closes / errors | AWS CLI v2 and/or **Session Manager plugin** not installed, or instance has no SSM agent/IAM role |
 | `AWS CLI not found` | Install AWS CLI v2 and ensure it's on your `PATH` |
 | RDP button missing on an instance | RDP only appears for **running Windows** instances |
+| Connect buttons show *No SSM* and are disabled | The instance is not registered with Systems Manager — check the SSM agent is running and the instance IAM role includes `AmazonSSMManagedInstanceCore`. Hover the button for the exact reason |
+| SSM Agent column shows *Unknown* | Your credentials lack `ssm:DescribeInstanceInformation`. Harmless — the buttons stay enabled |
+| `Local port ... is already in use` | Something else holds that port. Leave **Local port** blank to have one picked automatically |
+| Port forward to an RDS endpoint fails | Use **A host reachable from it** (not *This instance*), and check the instance's security group is allowed to reach the database |
 | RDP client doesn't launch | Windows: ensure `mstsc` available · macOS: install Microsoft Remote Desktop · Linux: install `remmina`/`xfreerdp`/`rdesktop` |
 | No profiles in the SSO dialog | No `azure_*` profiles found in `~/.aws/config` |
 | No operational profiles in dropdown | Add a non-Azure profile to `~/.aws/config` |
@@ -311,7 +340,7 @@ ie4uinit.exe -show
 ## Tech stack
 
 - **Electron 37** (electron-builder 24 for packaging)
-- **AWS SDK v3** — `@aws-sdk/client-ec2`, `@aws-sdk/credential-providers`
+- **AWS SDK v3** — `@aws-sdk/client-ec2`, `@aws-sdk/client-ssm`, `@aws-sdk/credential-providers`
 - `fs-extra`, `ini` (read `~/.aws` config)
 - External CLIs at runtime: **AWS CLI v2**, **Session Manager plugin**, **aws-azure-login**
 
