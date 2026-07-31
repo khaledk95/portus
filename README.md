@@ -37,11 +37,18 @@ bastion hosts, and no manual CLI commands.
 Grab the latest installer for your platform from the
 [**Releases page**](https://github.com/khaledk95/portus/releases).
 
-| Platform | File |
-|----------|------|
-| Windows | `Portus-<version>-x64.exe` (installer) or `Portus-Portable-<version>-x64.exe` |
-| macOS | `Portus-<version>-x64.dmg` (Intel) or `Portus-<version>-arm64.dmg` (Apple Silicon) |
-| Linux | `Portus-<version>-x64.AppImage`, `.deb`, or `.rpm` |
+| Platform | File | Notes |
+|----------|------|-------|
+| Windows | `Portus-<version>-x64.exe` | Installer (choose location, adds shortcuts) |
+| Windows | `Portus-Portable-<version>-x64.exe` | Single file, no install |
+| macOS | `Portus-<version>-x64.dmg` | Intel |
+| macOS | `Portus-<version>-arm64.dmg` | Apple Silicon |
+| Linux | `Portus-<version>-x64.AppImage` | Runs anywhere, no install |
+| Linux | `Portus-<version>-x64.deb` | Debian / Ubuntu |
+| Linux | `Portus-<version>-x64.rpm` | Fedora / RHEL |
+| Linux | `Portus-<version>-x64.tar.gz` | Plain archive |
+
+Ignore the `.blockmap` and `latest*.yml` files — build metadata, not downloads.
 
 Portus still needs the [external tools](#prerequisites) below — the app checks
 for them on startup and tells you what is missing.
@@ -226,9 +233,19 @@ All builds output to the `dist/` folder (git-ignored).
 **Notes**
 - Build each OS on its own platform. macOS `.dmg` and `.icns` generation require
   running on macOS; Windows `.exe` targets require Windows.
-- Pushing a `v*` tag runs the release workflow, which builds on Windows, macOS
-  and Linux runners and attaches every installer to a **draft** GitHub Release.
-  Review it on the Releases page, then publish.
+- **Releasing is automatic.** Bump the version, tag it, push the tag:
+
+  ```bash
+  npm version 1.4.0 --no-git-tag-version   # or edit package.json by hand
+  git commit -am "Release v1.4.0"
+  git tag -a v1.4.0 -m "Portus v1.4.0"
+  git push origin main --follow-tags
+  ```
+
+  The workflow builds on all three runners, uploads into a draft, and publishes
+  the release only once every platform has finished — so nobody can download a
+  release that is missing an OS. The tag must match the version in
+  `package.json`.
 - Builds are **unsigned** — see [Installing a release](#installing-a-release).
 
 ---
