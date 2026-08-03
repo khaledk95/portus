@@ -1,9 +1,8 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <!-- Content Security Policy -->
     <meta http-equiv="Content-Security-Policy" content="
         default-src 'self';
         script-src 'self' 'unsafe-inline';
@@ -15,248 +14,200 @@
     <title>Portus</title>
     <link rel="stylesheet" href="styles.css">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-    <!-- Preloader -->
-    <div id="preloader" class="preloader">
-        <div class="preloader-content">
-            <div class="logo-container">
-                <img src="assets/portus.png" alt="Portus logo" class="preloader-logo">
-                <div class="logo-pulse"></div>
-            </div>
-            <div class="loading-text">
-                <h2>PORTUS</h2>
-                <p id="loadingStatus">Initializing application...</p>
-            </div>
-            <div class="progress-container">
-                <div class="progress-bar">
-                    <div class="progress-fill" id="progressFill"></div>
-                </div>
-                <div class="progress-percentage" id="progressPercentage">0%</div>
-            </div>
-            <div class="loading-dots">
-                <span></span>
-                <span></span>
-                <span></span>
-            </div>
-        </div>
-        <div class="preloader-footer">
-            <p>Secure SSM &amp; RDP access for AWS instances</p>
-            <div class="company-info">
-                <span>Open Source · MIT License</span>
-                <span class="version js-app-version">v1.3.3</span>
-            </div>
-        </div>
-    </div>
 
-    <!-- Main Application -->
-    <div class="app-container">
-        <!-- Top Navigation Bar -->
-        <header class="top-nav">
-            <div class="nav-left">
-                <div class="app-logo" id="appLogo" style="cursor: pointer;">
-                    <img src="assets/portus.png" alt="Portus logo" class="logo-icon">
-                    <div class="logo-text">
-                        <span class="app-name">PORTUS</span>
-                        <span class="app-tagline">SSM &amp; RDP Gateway</span>
+<!-- Brief splash while profiles load. No fake progress: it hides as soon as init finishes. -->
+<div id="splash" class="splash">
+    <img src="assets/portus.png" alt="" class="splash-logo">
+    <div class="splash-name">Portus</div>
+    <div class="splash-hint" id="splashHint">Loading AWS profiles…</div>
+</div>
+
+<div class="app">
+
+    <!-- ===================== TOP BAR ===================== -->
+    <header class="topbar">
+        <div class="brand" id="brandHome" title="Portus">
+            <img src="assets/portus.png" alt="" class="brand-mark">
+            <span class="brand-name">Portus</span>
+            <span class="brand-version js-app-version">v2.0.0</span>
+        </div>
+
+        <div class="search">
+            <i class="fas fa-search"></i>
+            <input type="text" id="searchInput" placeholder="Filter instances…"
+                   autocomplete="off" spellcheck="false" disabled>
+            <kbd>Ctrl K</kbd>
+        </div>
+
+        <div class="topbar-right">
+            <button type="button" class="icon-btn" id="themeBtn" title="Toggle light / dark">
+                <i class="fas fa-moon"></i>
+            </button>
+            <button type="button" class="btn" id="loginBtn">
+                <i class="fas fa-right-to-bracket"></i> <span>SSO Connect</span>
+            </button>
+        </div>
+
+        <!-- indeterminate bar shown while a background request is in flight -->
+        <div class="topbar-progress" id="topProgress" hidden></div>
+    </header>
+
+    <!-- ===================== BODY ===================== -->
+    <div class="body">
+
+        <!-- ---------- sidebar ---------- -->
+        <aside class="sidebar">
+            <div class="side-head">
+                <button type="button" class="icon-btn" id="railToggle"
+                        data-label="Expand" title="Collapse sidebar">
+                    <i class="fas fa-table-columns"></i>
+                </button>
+            </div>
+
+            <div class="side-section">
+                <div class="side-label">Account</div>
+                <div class="profile-combo" id="profileCombo">
+                    <button type="button" id="profileComboTrigger" class="profile-picker"
+                            disabled aria-haspopup="listbox" aria-expanded="false"
+                            data-label="Select profile">
+                        <i class="fas fa-layer-group dim"></i>
+                        <span class="name" id="profileComboLabel">Select profile</span>
+                        <i class="fas fa-chevron-down dim caret"></i>
+                    </button>
+                    <div class="combo-panel" id="profileComboPanel">
+                        <div class="combo-search">
+                            <i class="fas fa-search"></i>
+                            <input type="text" id="profileComboSearch" placeholder="Search profiles…"
+                                   autocomplete="off" spellcheck="false">
+                        </div>
+                        <div class="combo-list" id="profileComboList" role="listbox"
+                             aria-label="Operational AWS profiles"></div>
+                        <div class="combo-foot" id="profileComboCount"></div>
                     </div>
                 </div>
             </div>
 
-            <div class="nav-right">
-                <!-- Active RDP tunnels (hidden until at least one exists) -->
-                <div class="sessions-wrap" id="sessionsWrap" style="display: none;">
-                    <button type="button" id="sessionsTrigger" class="sessions-trigger"
-                            aria-haspopup="dialog" aria-expanded="false" title="Active RDP tunnels">
+            <nav class="nav">
+                <button type="button" class="nav-item active" data-view="instances" data-label="Instances">
+                    <i class="fas fa-server"></i>
+                    <span class="nav-text">Instances</span>
+                    <span class="badge" id="navInstanceCount">0</span>
+                </button>
+                <button type="button" class="nav-item" data-view="tunnels" data-label="Tunnels">
+                    <i class="fas fa-plug"></i>
+                    <span class="nav-text">Tunnels</span>
+                    <span class="badge" id="navTunnelCount">0</span>
+                </button>
+            </nav>
+
+            <div class="side-foot" id="sessionMeter" style="display:none;">
+                <div class="meter">
+                    <span>Session</span>
+                    <span class="num" id="sessionRemaining">—</span>
+                </div>
+                <div class="meter-bar"><div class="meter-fill" id="sessionFill"></div></div>
+            </div>
+        </aside>
+
+        <!-- ---------- main ---------- -->
+        <section class="main">
+
+            <!-- missing external tools -->
+            <div id="depBanner" class="banner" style="display:none;">
+                <i class="fas fa-triangle-exclamation banner-icon"></i>
+                <div class="banner-body">
+                    <strong>Some required tools are missing.</strong>
+                    <span class="dim">Connecting will fail until these are installed and on your PATH.</span>
+                    <ul class="banner-list" id="depBannerList"></ul>
+                </div>
+                <button type="button" class="icon-btn" id="depBannerClose" title="Dismiss">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+
+            <!-- ===== INSTANCES VIEW ===== -->
+            <div class="view" id="viewInstances">
+                <div class="toolbar">
+                    <div class="seg" id="filterState">
+                        <button type="button" class="on" data-state="all">All</button>
+                        <button type="button" data-state="running">Running</button>
+                        <button type="button" data-state="stopped">Stopped</button>
+                    </div>
+                    <div class="seg" id="filterOs">
+                        <button type="button" class="on" data-os="all">Any OS</button>
+                        <button type="button" data-os="linux">Linux</button>
+                        <button type="button" data-os="windows">Windows</button>
+                    </div>
+                    <button type="button" class="btn btn-sm" id="refreshBtn" disabled>
+                        <i class="fas fa-rotate"></i> Refresh
+                    </button>
+                    <span class="count" id="instanceCount"></span>
+                </div>
+
+                <!-- no-detail until a row is selected, so no empty column is reserved -->
+                <div class="split no-detail" id="instancesSplit">
+                    <div class="table-wrap" id="instanceTableWrap">
+                        <div class="empty" id="instanceEmpty">
+                            <i class="fas fa-server"></i>
+                            <p id="instanceEmptyText">Sign in and choose a profile to list instances.</p>
+                        </div>
+                    </div>
+
+                    <aside class="detail" id="detailPanel" style="display:none;">
+                        <div class="detail-head">
+                            <div class="detail-title" id="detailTitle"></div>
+                            <div class="detail-sub mono" id="detailId"></div>
+                        </div>
+                        <div class="detail-body" id="detailBody"></div>
+                        <div class="detail-actions" id="detailActions"></div>
+                    </aside>
+                </div>
+            </div>
+
+            <!-- ===== TUNNELS VIEW ===== -->
+            <div class="view" id="viewTunnels" style="display:none;">
+                <div class="toolbar">
+                    <span class="view-title">Active tunnels</span>
+                    <span class="count" id="tunnelCount"></span>
+                </div>
+                <div class="table-wrap" id="tunnelTableWrap">
+                    <div class="empty" id="tunnelEmpty">
                         <i class="fas fa-plug"></i>
-                        <span id="sessionsCount">0</span>
-                    </button>
-                    <div class="sessions-panel" id="sessionsPanel">
-                        <div class="sessions-panel-header">Active RDP tunnels</div>
-                        <div class="sessions-list" id="sessionsList"></div>
+                        <p>No tunnels are open. Use <strong>RDP</strong> or <strong>Port</strong> on an instance.</p>
                     </div>
-                </div>
-
-                <!-- Profile Selector -->
-                <div class="profile-section">
-                    <div class="profile-combo" id="profileCombo">
-                        <button type="button" id="profileComboTrigger" class="profile-combo-trigger"
-                                disabled aria-haspopup="listbox" aria-expanded="false">
-                            <i class="fas fa-user-circle trigger-icon"></i>
-                            <span class="trigger-label" id="profileComboLabel">Select Operational Profile</span>
-                            <i class="fas fa-chevron-down trigger-caret"></i>
-                        </button>
-
-                        <div class="profile-combo-panel" id="profileComboPanel">
-                            <div class="profile-combo-search">
-                                <i class="fas fa-search"></i>
-                                <input type="text" id="profileComboSearch"
-                                       placeholder="Search profiles..." autocomplete="off" spellcheck="false">
-                            </div>
-                            <div class="profile-combo-list" id="profileComboList" role="listbox"
-                                 aria-label="Operational AWS profiles"></div>
-                            <div class="profile-combo-footer" id="profileComboCount"></div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Connection Status -->
-                <div class="connection-status" id="connectionStatus">
-                    <div class="status-indicator offline" id="statusIndicator"></div>
-                    <span class="status-text" id="statusText">Disconnected</span>
-                </div>
-
-                <!-- Login Button -->
-                <div class="action-buttons">
-                    <button id="loginBtn" class="action-btn login-btn">
-                        <i class="fas fa-sign-in-alt"></i>
-                        <span>SSO Connect</span>
-                    </button>
                 </div>
             </div>
-        </header>
-
-        <!-- Missing external tool warning -->
-        <div id="depBanner" class="dep-banner" style="display: none;">
-            <i class="fas fa-triangle-exclamation dep-banner-icon"></i>
-            <div class="dep-banner-body">
-                <strong class="dep-banner-title">Some required tools are missing</strong>
-                <p class="dep-banner-sub">Connecting to instances will fail until these are installed and on your PATH.</p>
-                <ul class="dep-banner-list" id="depBannerList"></ul>
-            </div>
-            <button type="button" id="depBannerClose" class="dep-banner-close" title="Dismiss">
-                <i class="fas fa-times"></i>
-            </button>
-        </div>
-
-        <!-- Main Layout -->
-        <div class="main-layout">
-            <main class="main-content">
-                <!-- Welcome Screen -->
-                <div id="welcomeScreen" class="content-view welcome-view">
-                    <div class="welcome-container">
-                        <div class="welcome-hero">
-                            <div class="about-header">
-                                <div class="about-logo-section">
-                                    <img src="assets/portus.png" alt="Portus logo" class="about-logo">
-                                    <div class="about-title-section">
-                                        <h1 class="about-title">PORTUS</h1>
-                                        <p class="app-slogan-large">Your secure gateway to every instance</p>
-                                        <div class="version-info">
-                                            <span class="version-badge js-app-version">v1.3.3</span>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="welcome-steps">
-                            <div class="step-card">
-                                <div class="step-number">1</div>
-                                <div class="step-content">
-                                    <h3>SSO Connect</h3>
-                                    <p>Authenticate using Azure AD SSO for secure access</p>
-                                </div>
-                                <div class="step-icon">
-                                    <i class="fas fa-sign-in-alt"></i>
-                                </div>
-                            </div>
-
-                            <div class="step-divider">
-                                <i class="fas fa-arrow-down"></i>
-                            </div>
-
-                            <div class="step-card">
-                                <div class="step-number">2</div>
-                                <div class="step-content">
-                                    <h3>Select Profile</h3>
-                                    <p>Choose your operational AWS profile to load instances</p>
-                                </div>
-                                <div class="step-icon">
-                                    <i class="fas fa-user-circle"></i>
-                                </div>
-                            </div>
-
-                            <div class="step-divider">
-                                <i class="fas fa-arrow-down"></i>
-                            </div>
-
-                            <div class="step-card">
-                                <div class="step-number">3</div>
-                                <div class="step-content">
-                                    <h3>Connect</h3>
-                                    <p>Launch an SSM shell or RDP-over-SSM session per instance</p>
-                                </div>
-                                <div class="step-icon">
-                                    <i class="fas fa-terminal"></i>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="welcome-features">
-                            <div class="feature-highlight">
-                                <i class="fas fa-terminal"></i>
-                                <span>One-click SSM shell sessions</span>
-                            </div>
-                            <div class="feature-highlight">
-                                <i class="fas fa-desktop"></i>
-                                <span>RDP over SSM for Windows instances</span>
-                            </div>
-                            <div class="feature-highlight">
-                                <i class="fas fa-shield-alt"></i>
-                                <span>No inbound ports, no bastion hosts</span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Instances View -->
-                <div id="serviceContent" class="content-view service-view" style="display: none;">
-                    <div class="content-header">
-                        <div class="header-info">
-                            <h1 id="serviceTitle" class="page-title">Instances</h1>
-                            <div class="breadcrumb" id="serviceBreadcrumb"></div>
-                        </div>
-                        <div class="header-actions">
-                            <button id="refreshBtn" class="action-btn refresh-btn">
-                                <i class="fas fa-sync-alt"></i>
-                                <span>Refresh</span>
-                            </button>
-                        </div>
-                    </div>
-
-                    <!-- Instance Data -->
-                    <div class="service-data-container">
-                        <div id="serviceData" class="service-data">
-                            <!-- Instance table is rendered here -->
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Loading Overlay -->
-                <div id="loadingOverlay" class="loading-overlay" style="display: none;">
-                    <div class="loading-content">
-                        <div class="loading-spinner">
-                            <div class="spinner-ring"></div>
-                        </div>
-                        <p class="loading-text">Loading...</p>
-                    </div>
-                </div>
-            </main>
-        </div>
+        </section>
     </div>
 
-    <!-- Toast Notification -->
-    <div id="toast" class="toast-notification">
-        <div class="toast-content">
-            <div class="toast-icon"></div>
-            <div class="toast-message"></div>
-            <button class="toast-close">
-                <i class="fas fa-times"></i>
-            </button>
+    <!-- ===================== STATUS BAR ===================== -->
+    <footer class="statusbar">
+        <span class="state">
+            <span class="dot off" id="statusDot"></span>
+            <span id="statusText">Disconnected</span>
+        </span>
+        <span class="sep"></span>
+        <span id="statusSso" class="dim">Not signed in</span>
+        <span class="sep" id="statusRenewSep" style="display:none;"></span>
+        <span id="statusRenew" style="display:none;">Renews in <span class="num" id="statusRenewValue">—</span></span>
+        <div class="status-right">
+            <span><i class="fas fa-plug dim"></i> <span class="num" id="statusTunnels">0</span> tunnels</span>
+            <span class="sep"></span>
+            <span class="mono dim" id="statusRegion">—</span>
         </div>
-    </div>
+    </footer>
+</div>
 
-    <script src="renderer.js"></script>
+<!-- ===================== TOAST ===================== -->
+<div id="toast" class="toast">
+    <i class="toast-icon"></i>
+    <span class="toast-message"></span>
+    <button type="button" class="icon-btn toast-close"><i class="fas fa-times"></i></button>
+</div>
+
+<script src="renderer.js"></script>
 </body>
 </html>

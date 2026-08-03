@@ -69,6 +69,7 @@ for them on startup and tells you what is missing.
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
 - **Startup preflight** — missing external tools (AWS CLI, Session Manager plugin, aws-azure-login) are reported up front with install instructions, instead of failing later mid-connect
 - **Automatic session renewal** — the AWS session is refreshed before it expires, and an expired one is renewed and retried transparently, so you are not thrown back to the login screen mid-task
+- **Light and dark themes**, a collapsible sidebar, an instance detail panel, state/OS filters and `Ctrl K` search — the session countdown and open tunnel count stay visible in the status bar
 - Smart buttons: connect actions are only offered when Systems Manager can actually reach the instance, and RDP only on running Windows instances
 - Cross-platform: Windows, macOS, Linux
 
@@ -235,8 +236,8 @@ npm start
 npm run dev
 ```
 
-The window opens on a welcome screen. Click **SSO Connect**, authenticate, pick an
-operational profile, and your instances load automatically.
+Click **SSO Connect**, authenticate, then pick an operational profile from the
+sidebar — instances load automatically.
 
 ---
 
@@ -286,7 +287,7 @@ All builds output to the `dist/` folder (git-ignored).
 │   ├── preload.js       # contextBridge — exposes the safe electronAPI to the renderer
 │   ├── renderer.js      # UI logic (AWSManager class): login, instances, connect
 │   ├── index.html       # App markup
-│   ├── styles.css        # Glassmorphism theme (graphite + steel blue)
+│   ├── styles.css        # Theme tokens (light + dark) and all component styles
 │   └── assets/
 │       └── portus.png   # In-app logo
 ├── build/

@@ -1001,6 +1001,12 @@ function setupIpcHandlers() {
           publicIp: instance.PublicIpAddress,
           privateIp: instance.PrivateIpAddress,
           platform: instance.Platform || 'Linux',
+          availabilityZone: instance.Placement ? instance.Placement.AvailabilityZone : null,
+          vpcId: instance.VpcId || null,
+          // Surfaced in the detail panel; Name is shown separately as the row title
+          tags: (instance.Tags || [])
+            .filter(tag => tag.Key !== 'Name')
+            .map(tag => ({ key: tag.Key, value: tag.Value })),
           ssmStatus: ssmLookupFailed ? 'unknown' : toSsmStatus(ssmInfo),
           ssmLastPing: ssmInfo ? ssmInfo.lastPingDateTime : null,
           ssmAgentVersion: ssmInfo ? ssmInfo.agentVersion : null,
