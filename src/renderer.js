@@ -70,6 +70,8 @@ class AWSManager {
         this.checkRequiredTools();
         await this.loadProfiles();
         this.updateInitialUI();
+        // Kept for debugging from DevTools. Nothing in the UI depends on it:
+        // buttons bind their handlers directly rather than through a global.
         window.awsManager = this;
     }
 
@@ -718,10 +720,13 @@ class AWSManager {
         label.classList.add('has-value');
     }
 
+    // textContent escapes & < > but leaves quotes alone, which is fine inside a text
+    // node and unsafe inside an attribute. Quotes are escaped too so the result can
+    // be used in either position without having to remember which is which.
     escapeHtml(text) {
         const div = document.createElement('div');
         div.textContent = text == null ? '' : String(text);
-        return div.innerHTML;
+        return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     // Escape first, then wrap the matched span — avoids injecting raw profile text
@@ -751,11 +756,11 @@ class AWSManager {
         popup.className = 'popup-content';
 
         const profileListHtml = this.profiles.map(profile =>
-            `<div class="profile-item" data-profile="${profile.name}" tabindex="0">
+            `<div class="profile-item" data-profile="${this.escapeHtml(profile.name)}" tabindex="0">
                 <div class="profile-info">
-                    <strong>${profile.name}</strong>
-                    <span class="profile-region">${profile.region}</span>
-                    ${profile.azureAppId ? `<span class="profile-azure">Azure SSO: ${profile.azureAppId.split('/').pop()}</span>` : ''}
+                    <strong>${this.escapeHtml(profile.name)}</strong>
+                    <span class="profile-region">${this.escapeHtml(profile.region)}</span>
+                    ${profile.azureAppId ? `<span class="profile-azure">Azure SSO: ${this.escapeHtml(String(profile.azureAppId).split('/').pop())}</span>` : ''}
                 </div>
                 <i class="fas fa-chevron-right"></i>
             </div>`
@@ -1094,7 +1099,6 @@ class AWSManager {
         const row = document.createElement('tr');
         const isRunning = item.state === 'running';
         const isWindows = item.platform && item.platform.toLowerCase().includes('windows');
-        const safeName = (item.instanceName || 'No Name').replace(/'/g, "\\'");
 
         // A Session Manager connection only works if the instance is registered and
         // reachable. 'unknown' means the status could not be read (e.g. missing
@@ -1102,45 +1106,50 @@ class AWSManager {
         const ssmStatus = item.ssmStatus || 'unknown';
         const ssmConnectable = isRunning && (ssmStatus === 'online' || ssmStatus === 'unknown');
 
+        const blockReason = this.escapeHtml(this.getSsmBlockReason(ssmStatus));
+
+        // Buttons carry no instance data in their markup. The values are read from
+        // the row's dataset by a listener attached below, so a hostile Name tag is
+        // only ever text and can never be parsed as markup or script.
         let ssmButton;
         if (!isRunning) {
             ssmButton = `<button class="ssm-connect-btn" disabled title="Instance is not running">
                     <i class="fas fa-power-off"></i> Stopped
                </button>`;
         } else if (ssmConnectable) {
-            ssmButton = `<button class="ssm-connect-btn" onclick="window.awsManager.connectToInstance('${item.instanceId}', '${safeName}')">
+            ssmButton = `<button class="ssm-connect-btn" data-action="ssm">
                     <i class="fas fa-terminal"></i> SSM
                </button>`;
         } else {
-            ssmButton = `<button class="ssm-connect-btn" disabled title="${this.escapeHtml(this.getSsmBlockReason(ssmStatus))}">
+            ssmButton = `<button class="ssm-connect-btn" disabled title="${blockReason}">
                     <i class="fas fa-unlink"></i> No SSM
                </button>`;
         }
 
         // RDP additionally requires a Windows instance
         const rdpButton = (ssmConnectable && isWindows)
-            ? `<button class="rdp-connect-btn" onclick="window.awsManager.connectToInstanceRDP('${item.instanceId}', '${safeName}')">
+            ? `<button class="rdp-connect-btn" data-action="rdp">
                     <i class="fas fa-desktop"></i> RDP
                </button>`
             : '';
 
         // Port forwarding rides the same SSM session, so it needs the same reachability
         const portButton = ssmConnectable
-            ? `<button class="port-forward-btn" onclick="window.awsManager.openPortForwardDialog('${item.instanceId}', '${safeName}')">
+            ? `<button class="port-forward-btn" data-action="port">
                     <i class="fas fa-right-left"></i> Port
                </button>`
-            : `<button class="port-forward-btn" disabled title="${this.escapeHtml(this.getSsmBlockReason(ssmStatus))}">
+            : `<button class="port-forward-btn" disabled title="${blockReason}">
                     <i class="fas fa-right-left"></i> Port
                </button>`;
 
         row.innerHTML = `
             <td>${this.escapeHtml(item.instanceName || 'No Name')}</td>
-            <td>${item.instanceId}</td>
-            <td>${item.instanceType}</td>
-            <td><span class="status-badge status-${item.state}">${item.state}</span></td>
+            <td>${this.escapeHtml(item.instanceId)}</td>
+            <td>${this.escapeHtml(item.instanceType)}</td>
+            <td><span class="status-badge status-${this.escapeHtml(item.state)}">${this.escapeHtml(item.state)}</span></td>
             <td>${this.createSsmCell(item)}</td>
-            <td>${item.publicIp || '-'}</td>
-            <td>${item.privateIp || '-'}</td>
+            <td>${this.escapeHtml(item.publicIp || '-')}</td>
+            <td>${this.escapeHtml(item.privateIp || '-')}</td>
             <td>${this.escapeHtml(item.platform)}</td>
             <td class="actions-cell">
                 <div class="action-buttons">
@@ -1150,6 +1159,26 @@ class AWSManager {
                 </div>
             </td>
         `;
+
+        // dataset values are set as properties, never rendered into markup
+        const instanceId = item.instanceId;
+        const instanceName = item.instanceName || 'No Name';
+
+        row.querySelectorAll('button[data-action]').forEach(button => {
+            button.addEventListener('click', () => {
+                switch (button.dataset.action) {
+                    case 'ssm':
+                        this.connectToInstance(instanceId, instanceName);
+                        break;
+                    case 'rdp':
+                        this.connectToInstanceRDP(instanceId, instanceName);
+                        break;
+                    case 'port':
+                        this.openPortForwardDialog(instanceId, instanceName);
+                        break;
+                }
+            });
+        });
 
         return row;
     }

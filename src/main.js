@@ -191,6 +191,28 @@ function ensurePortFree(port) {
   });
 }
 
+// The tunnel command is handed to a shell, which is unavoidable on Windows: it is
+// what makes the quoting around --parameters survive. Characters a shell would act
+// on therefore must never reach it, so the host is restricted to what a hostname or
+// IP can legitimately contain. This also protects any future caller that supplies a
+// host from somewhere other than the dialog, such as a saved bookmark or a deep link.
+const VALID_HOST = /^[A-Za-z0-9._:-]+$/;
+
+function validateRemoteHost(host) {
+  if (!host) return { valid: true };
+
+  if (host.length > 255) {
+    return { valid: false, error: 'Remote host is too long to be a valid hostname.' };
+  }
+  if (!VALID_HOST.test(host)) {
+    return {
+      valid: false,
+      error: 'Remote host may only contain letters, digits, dots, hyphens, underscores and colons.'
+    };
+  }
+  return { valid: true };
+}
+
 function describeTunnelFailure(stderrText) {
   if (/TargetNotConnected/i.test(stderrText)) {
     return 'The instance is not connected to Systems Manager, so no session could be started.';
@@ -609,6 +631,11 @@ function setupIpcHandlers() {
     }
 
     const targetHost = (remoteHost || '').trim();
+
+    const hostCheck = validateRemoteHost(targetHost);
+    if (!hostCheck.valid) {
+      return { success: false, error: hostCheck.error };
+    }
 
     // Same instance, same target, same port means the existing tunnel already
     // does the job; different services on one instance still coexist.
