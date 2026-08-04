@@ -1,6 +1,6 @@
 {
   "name": "portus",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Cross-platform AWS SSM & RDP-over-SSM access tool",
   "main": "src/main.js",
   "scripts": {
@@ -42,6 +42,8 @@
   },
   "dependencies": {
     "@aws-sdk/client-ec2": "^3.450.0",
+    "@aws-sdk/client-elasticache": "^3.1102.0",
+    "@aws-sdk/client-rds": "^3.1102.0",
     "@aws-sdk/client-ssm": "^3.1098.0",
     "@aws-sdk/credential-providers": "^3.450.0",
     "fs-extra": "^11.1.1",
@@ -214,7 +216,7 @@
     "removePackageScripts": true,
     "removePackageKeywords": true,
     "electronVersion": "37.1.0",
-    "buildVersion": "2.0.0"
+    "buildVersion": "2.1.0"
   },
   "repository": {
     "type": "git",

@@ -12,6 +12,11 @@ class Portus {
         this.selectedInstanceId = null;
         this.tunnels = [];
 
+        // Managed endpoints suggested in the port forwarding dialog, keyed by
+        // profile. Databases do not come and go between dialog openings, so this
+        // is only cleared when the profile changes or the user asks to refresh.
+        this.endpointCache = new Map();
+
         // view state
         this.view = 'instances';
         this.filters = { text: '', state: 'all', os: 'all' };
@@ -22,6 +27,7 @@ class Portus {
         this.comboIndex = 0;
 
         // session
+        this.uptimeTicker = null;
         this.sessionWatcher = null;
         this.isRefreshingSession = false;
         this.lastRefreshAt = null;
@@ -199,6 +205,10 @@ class Portus {
         document.querySelectorAll('.nav-item[data-view]').forEach(item => {
             item.classList.toggle('active', item.dataset.view === view);
         });
+
+        // the uptime column only needs redrawing while it is on screen
+        this.syncUptimeTicker();
+        if (view === 'tunnels') this.tickUptime();
     }
 
     // ==========================================================================
@@ -850,17 +860,17 @@ class Portus {
 
     openPortDialog(instanceId, name) {
         const presets = [
-            { label: 'Oracle', port: 1521 },
-            { label: 'SQL Server', port: 1433 },
-            { label: 'PostgreSQL', port: 5432 },
-            { label: 'MySQL', port: 3306 },
-            { label: 'Redis', port: 6379 }
+            { label: 'Oracle', port: 1521, service: 'oracle' },
+            { label: 'SQL Server', port: 1433, service: 'sqlserver' },
+            { label: 'PostgreSQL', port: 5432, service: 'postgresql' },
+            { label: 'MySQL', port: 3306, service: 'mysql' },
+            { label: 'Redis', port: 6379, service: 'redis' }
         ];
 
         const overlay = document.createElement('div');
         overlay.className = 'overlay';
         overlay.innerHTML = `
-            <div class="dialog wide">
+            <div class="dialog wide port-dialog">
                 <div class="dialog-head">
                     <h3>Forward a port</h3>
                     <button type="button" class="icon-btn" data-close><i class="fas fa-times"></i></button>
@@ -879,16 +889,32 @@ class Portus {
                         </div>
                     </div>
 
-                    <div class="field" id="pfHostField" style="display:none;">
-                        <label class="field-label">Remote host</label>
-                        <input class="input mono" id="pfHost" spellcheck="false" autocomplete="off"
-                               placeholder="my-db.abc123.eu-central-1.rds.amazonaws.com">
-                    </div>
-
                     <div class="field">
                         <label class="field-label">Service</label>
                         <div class="chips" id="pfChips">
-                            ${presets.map(p => `<button type="button" class="chip" data-port="${p.port}">${p.label}</button>`).join('')}
+                            ${presets.map(p => `<button type="button" class="chip" data-port="${p.port}" data-service="${p.service}">${p.label}</button>`).join('')}
+                        </div>
+                    </div>
+
+                    <div class="field" id="pfHostField" style="display:none;">
+                        <label class="field-label">Remote host</label>
+                        <div class="host-combo" id="pfHostCombo">
+                            <input class="input mono" id="pfHost" spellcheck="false" autocomplete="off"
+                                   role="combobox" aria-expanded="false" aria-autocomplete="list"
+                                   placeholder="Pick a discovered endpoint, or type any host">
+                            <button type="button" class="host-combo-toggle" id="pfHostBrowse"
+                                    tabindex="-1" aria-label="Browse discovered endpoints">
+                                <i class="fas fa-chevron-down"></i>
+                            </button>
+                            <div class="combo-panel host-panel" id="pfHostPanel">
+                                <div class="combo-list" id="pfHostList" role="listbox"></div>
+                                <div class="combo-foot">
+                                    <button type="button" class="link-btn" id="pfHostRefresh" tabindex="-1">
+                                        <i class="fas fa-rotate"></i> Refresh
+                                    </button>
+                                    <span id="pfHostFoot"></span>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
@@ -929,26 +955,235 @@ class Portus {
         const local = overlay.querySelector('#pfLocal');
         const start = overlay.querySelector('#pfStart');
 
+        const combo = overlay.querySelector('#pfHostCombo');
+        const panel = overlay.querySelector('#pfHostPanel');
+        const list = overlay.querySelector('#pfHostList');
+        const foot = overlay.querySelector('#pfHostFoot');
+
+        // Endpoint discovery state, local to this dialog. The fetched list is
+        // cached on the instance so reopening the dialog does not re-query AWS.
+        let loadState = 'idle';       // idle | loading | ready | error
+        let loadError = '';
+        let endpoints = [];
+        let matches = [];
+        let activeIndex = -1;
+        let panelOpen = false;
+
+        const activeService = () => {
+            const chip = overlay.querySelector('.chip.on');
+            return chip ? chip.dataset.service : null;
+        };
+
+        const openPanel = () => {
+            panelOpen = true;
+            combo.classList.add('open');
+            host.setAttribute('aria-expanded', 'true');
+            renderList();
+            ensureEndpoints();
+        };
+
+        const closePanel = () => {
+            panelOpen = false;
+            activeIndex = -1;
+            combo.classList.remove('open');
+            host.setAttribute('aria-expanded', 'false');
+        };
+
+        // Fetched on demand rather than on dialog open: forwarding a port on the
+        // instance itself never needs this, and it costs four AWS calls.
+        const ensureEndpoints = async () => {
+            if (loadState === 'loading' || loadState === 'ready') return;
+
+            const cached = this.endpointCache.get(this.currentProfile);
+            if (cached) {
+                endpoints = cached;
+                loadState = 'ready';
+                renderList();
+                return;
+            }
+
+            loadState = 'loading';
+            renderList();
+
+            const result = await this.loadEndpoints();
+            if (!overlay.isConnected) return;   // dialog closed while in flight
+
+            if (result.success) {
+                endpoints = result.data;
+                loadState = 'ready';
+            } else {
+                loadError = result.error || 'Could not list endpoints';
+                loadState = 'error';
+            }
+            renderList();
+        };
+
+        const renderList = () => {
+            const term = host.value.trim().toLowerCase();
+            const service = activeService();
+
+            // 'idle' only lasts until ensureEndpoints runs; showing the empty
+            // state for that frame would read as "nothing found"
+            if (loadState === 'idle' || loadState === 'loading') {
+                list.innerHTML = '<div class="combo-empty"><i class="fas fa-spinner fa-spin"></i> Discovering endpoints…</div>';
+                foot.textContent = '';
+                return;
+            }
+
+            if (loadState === 'error') {
+                list.innerHTML = `<div class="combo-empty">${this.escapeHtml(loadError)}</div>`;
+                foot.textContent = 'Type the host manually';
+                return;
+            }
+
+            matches = endpoints.filter(e => {
+                if (service && e.service !== service) return false;
+                if (!term) return true;
+                return e.name.toLowerCase().includes(term) || e.host.toLowerCase().includes(term);
+            });
+
+            if (!endpoints.length) {
+                list.innerHTML = '<div class="combo-empty">No databases or caches found in this region</div>';
+                foot.textContent = 'Type the host manually';
+                return;
+            }
+
+            if (!matches.length) {
+                list.innerHTML = '<div class="combo-empty">Nothing matches — the typed host will be used as-is</div>';
+                foot.textContent = `0 of ${endpoints.length} endpoints`;
+                return;
+            }
+
+            list.innerHTML = '';
+            matches.forEach((endpoint, index) => {
+                const option = document.createElement('div');
+                option.className = 'combo-option endpoint-option';
+                option.setAttribute('role', 'option');
+                option.innerHTML = `
+                    <div class="opt-main">
+                        <span class="opt-name">${this.escapeHtml(endpoint.name)}</span>
+                        <span class="opt-host mono">${this.escapeHtml(endpoint.host)}</span>
+                    </div>
+                    <span class="opt-kind">${this.escapeHtml(endpoint.kind)}</span>
+                    <span class="opt-port mono">${this.escapeHtml(endpoint.port ?? '')}</span>
+                `;
+                option.addEventListener('mousedown', (e) => {
+                    e.preventDefault();          // keep focus in the input
+                    selectEndpoint(endpoint);
+                });
+                option.addEventListener('mousemove', () => setActive(index));
+                list.appendChild(option);
+            });
+
+            foot.textContent = service || term
+                ? `${matches.length} of ${endpoints.length} endpoints`
+                : `${endpoints.length} endpoints`;
+
+            setActive(matches.length ? 0 : -1);
+        };
+
+        const setActive = (index) => {
+            const options = list.querySelectorAll('.combo-option');
+            options.forEach(o => o.classList.remove('active'));
+            activeIndex = index;
+            if (index >= 0 && options[index]) {
+                options[index].classList.add('active');
+                options[index].scrollIntoView({ block: 'nearest' });
+            }
+        };
+
+        const selectEndpoint = (endpoint) => {
+            host.value = endpoint.host;
+
+            // The port the API reported wins over the service preset — a database
+            // on a non-standard port is otherwise silently wrong.
+            if (endpoint.port) {
+                remote.value = String(endpoint.port);
+                syncChips();
+            }
+
+            // Encrypted Redis presents a certificate for its real hostname, which
+            // will not match the localhost the client connects to.
+            if (endpoint.tls) {
+                this.toast(`${endpoint.name} has encryption in transit — your client must skip hostname verification`, 'info');
+            }
+
+            closePanel();
+            local.focus();
+        };
+
+        const syncChips = () => {
+            overlay.querySelectorAll('.chip').forEach(chip =>
+                chip.classList.toggle('on', chip.dataset.port === remote.value.trim()));
+        };
+
         overlay.querySelectorAll('#pfTarget button').forEach(btn => {
             btn.addEventListener('click', () => {
                 overlay.querySelectorAll('#pfTarget button').forEach(b => b.classList.remove('on'));
                 btn.classList.add('on');
                 const isRemote = btn.dataset.target === 'remote';
                 hostField.style.display = isRemote ? 'block' : 'none';
-                if (isRemote) host.focus();
+                // openPanel explicitly rather than relying on the focus handler:
+                // focus() is a no-op when the window itself is not focused, and
+                // the panel would then render its contents but stay closed
+                if (isRemote) { host.focus(); openPanel(); }
+                else closePanel();
             });
+        });
+
+        overlay.querySelector('#pfHostBrowse').addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            if (panelOpen) { closePanel(); return; }
+            host.focus();
+            openPanel();
+        });
+
+        // A database created since the list was cached would otherwise need an
+        // app restart to show up
+        overlay.querySelector('#pfHostRefresh').addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            this.endpointCache.delete(this.currentProfile);
+            endpoints = [];
+            loadState = 'idle';
+            if (!panelOpen) openPanel(); else { renderList(); ensureEndpoints(); }
+        });
+
+        host.addEventListener('focus', () => openPanel());
+        host.addEventListener('input', () => {
+            if (!panelOpen) openPanel(); else renderList();
+        });
+        host.addEventListener('blur', () => closePanel());
+
+        host.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && panelOpen) { e.stopPropagation(); closePanel(); return; }
+            if (!panelOpen || !matches.length) return;
+
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                setActive((activeIndex + 1) % matches.length);
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                setActive((activeIndex - 1 + matches.length) % matches.length);
+            } else if (e.key === 'Enter' && activeIndex >= 0) {
+                e.preventDefault();
+                selectEndpoint(matches[activeIndex]);
+            }
         });
 
         overlay.querySelectorAll('.chip').forEach(chip => {
             chip.addEventListener('click', () => {
+                const wasOn = chip.classList.contains('on');
                 overlay.querySelectorAll('.chip').forEach(c => c.classList.remove('on'));
-                chip.classList.add('on');
-                remote.value = chip.dataset.port;
+                if (!wasOn) {
+                    chip.classList.add('on');
+                    remote.value = chip.dataset.port;
+                }
+                renderList();   // the chip is also the endpoint filter
             });
         });
         remote.addEventListener('input', () => {
-            overlay.querySelectorAll('.chip').forEach(chip =>
-                chip.classList.toggle('on', chip.dataset.port === remote.value.trim()));
+            syncChips();
+            renderList();
         });
 
         start.addEventListener('click', async () => {
@@ -974,6 +1209,46 @@ class Portus {
         });
 
         setTimeout(() => remote.focus(), 50);
+    }
+
+    // Managed database and cache endpoints in the profile's region. Failure is
+    // returned rather than thrown: the dialog degrades to a plain text field,
+    // which is exactly how it worked before this existed.
+    async loadEndpoints() {
+        if (!this.currentProfile) return { success: false, error: 'No profile selected' };
+
+        this.setBusy(true);
+        try {
+            const result = await window.electronAPI.getEndpoints(this.currentProfile);
+
+            if (result && result.success) {
+                if (result.reauthenticated) {
+                    this.isLoggedIn = true;
+                    this.updateConnection(true, this.selectedAuthProfile);
+                    this.startSessionWatcher();
+                }
+
+                const data = result.data || [];
+                this.endpointCache.set(this.currentProfile, data);
+
+                // A permission gap on one service still leaves the others usable,
+                // so this is a note rather than a failure.
+                if (result.warnings && result.warnings.length) {
+                    this.toast(`Some endpoints could not be listed: ${result.warnings.join('; ')}`, 'warning');
+                }
+                return { success: true, data };
+            }
+
+            if (result && result.sessionExpired) {
+                this.handleSessionExpired(result.error);
+                return { success: false, error: result.error };
+            }
+            return { success: false, error: result?.error || 'Could not list endpoints' };
+        } catch (error) {
+            return { success: false, error: error.message || 'Could not list endpoints' };
+        } finally {
+            this.setBusy(false);
+        }
     }
 
     async startPortForward(instanceId, name, options) {
@@ -1003,7 +1278,29 @@ class Portus {
     bindTunnelEvents() {
         window.electronAPI.onTunnelsChanged(tunnels => this.renderTunnels(tunnels));
         window.electronAPI.listTunnels().then(t => this.renderTunnels(t)).catch(() => {});
-        setInterval(() => { if (this.tunnels.length) this.renderTunnels(this.tunnels); }, 30000);
+    }
+
+    // Uptime is shown to the second, so it has to be redrawn every second or the
+    // column reads as frozen. Only the text of each cell is rewritten: rebuilding
+    // the table on a timer would drop a click landing mid-redraw, which is what
+    // the old 30-second full re-render did between its long stale gaps.
+    syncUptimeTicker() {
+        const wanted = this.view === 'tunnels' && this.tunnels.length > 0;
+
+        if (wanted && !this.uptimeTicker) {
+            this.uptimeTicker = setInterval(() => this.tickUptime(), 1000);
+        } else if (!wanted && this.uptimeTicker) {
+            clearInterval(this.uptimeTicker);
+            this.uptimeTicker = null;
+        }
+    }
+
+    tickUptime() {
+        if (this.view !== 'tunnels' || !this.tunnels.length) { this.syncUptimeTicker(); return; }
+
+        document.querySelectorAll('#tunnelTableWrap [data-started-at]').forEach(cell => {
+            cell.textContent = this.uptime(Number(cell.dataset.startedAt));
+        });
     }
 
     renderTunnels(tunnels) {
@@ -1021,6 +1318,7 @@ class Portus {
                     <i class="fas fa-plug"></i>
                     <p>No tunnels are open. Use <strong>RDP</strong> or <strong>Port</strong> on an instance.</p>
                 </div>`;
+            this.syncUptimeTicker();
             return;
         }
 
@@ -1039,13 +1337,16 @@ class Portus {
                 ? `${tunnel.remoteHost}:${tunnel.remotePort}`
                 : `this instance:${tunnel.remotePort || 3389}`;
 
+            // kept on the cell so the ticker can redraw it without the tunnel list
+            const startedAt = new Date(tunnel.startedAt).getTime();
+
             const row = document.createElement('tr');
             row.innerHTML = `
                 <td><span class="state"><span class="dot ok"></span>${kind}</span></td>
                 <td class="name-cell">${this.escapeHtml(tunnel.instanceName || tunnel.instanceId)}</td>
                 <td class="mono">localhost:${tunnel.port}</td>
                 <td class="mono muted">${this.escapeHtml(target)}</td>
-                <td class="muted num">${this.uptime(tunnel.startedAt)}</td>
+                <td class="muted num" data-started-at="${startedAt}">${this.uptime(startedAt)}</td>
                 <td class="actions"><div class="row-actions">
                     <button class="act" data-copy>Copy</button>
                     <button class="act" data-close>Disconnect</button>
@@ -1066,6 +1367,8 @@ class Portus {
         table.appendChild(tbody);
         wrap.innerHTML = '';
         wrap.appendChild(table);
+
+        this.syncUptimeTicker();
     }
 
     uptime(startedAt) {

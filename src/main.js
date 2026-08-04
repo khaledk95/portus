@@ -13,6 +13,12 @@ const os = require('os');
 // AWS SDK imports (EC2 only - needed to list SSM/RDP targets)
 const { EC2Client, DescribeInstancesCommand } = require('@aws-sdk/client-ec2');
 const { SSMClient, DescribeInstanceInformationCommand } = require('@aws-sdk/client-ssm');
+const { RDSClient, DescribeDBInstancesCommand, DescribeDBClustersCommand } = require('@aws-sdk/client-rds');
+const {
+  ElastiCacheClient,
+  DescribeReplicationGroupsCommand,
+  DescribeCacheClustersCommand
+} = require('@aws-sdk/client-elasticache');
 const { fromIni } = require('@aws-sdk/credential-providers');
 
 let mainWindow;
@@ -37,6 +43,34 @@ function isCredentialsError(error) {
   const haystack = `${name} ${code} ${message}`;
 
   return /ExpiredToken|ExpiredTokenException|TokenRefreshRequired|InvalidClientTokenId|UnrecognizedClientException|RequestExpired|AuthFailure|InvalidAccessKeyId|SignatureDoesNotMatch|CredentialsProviderError|CredentialsError|Could not load credentials|is not authorized|security token included in the request is (expired|invalid)/i.test(haystack);
+}
+
+// "You may not do this" rather than "we do not know who you are". The two look
+// alike — isCredentialsError deliberately matches "is not authorized" so a stale
+// session is caught early — but only one of them is fixed by signing in again.
+// Re-authenticating on a permissions gap loops without ever succeeding, so any
+// caller that can carry on with partial results must check this first.
+function isAuthorizationError(error) {
+  if (!error) return false;
+  const haystack = `${error.name || ''} ${error.Code || error.code || ''} ${error.message || ''}`;
+
+  return /AccessDenied|AccessDeniedException|UnauthorizedOperation|not authorized to perform/i.test(haystack);
+}
+
+// AWS spells an authorization failure out in full:
+//   "User: arn:aws:sts::123456789012:assumed-role/Team/alice is not authorized
+//    to perform: rds:DescribeDBInstances on resource: ..."
+// The account id, role and username in there are of no use in a toast, but they
+// do leak the moment someone screenshots it into a bug report. Only the denied
+// action is kept, which is the part that says what to add to the policy.
+function describeDeniedAction(error) {
+  const message = (error && error.message) || '';
+  const action = message.match(/not authorized to perform:?\s*([A-Za-z0-9]+:[A-Za-z0-9]+)/);
+
+  if (action) return `not authorized to perform ${action[1]}`;
+  if (isAuthorizationError(error)) return 'access denied';
+
+  return message || 'request failed';
 }
 
 function createWindow() {
@@ -597,6 +631,39 @@ function toSsmStatus(info) {
   }
 }
 
+// ============================================================================
+// MANAGED ENDPOINT DISCOVERY
+// ============================================================================
+
+// Maps an AWS engine identifier onto one of the services offered in the port
+// forwarding dialog. Anything unrecognised (MariaDB, DocumentDB, Neptune,
+// Memcached) returns null and is left out rather than filed under the wrong
+// service, where its default port would be wrong too.
+function engineToService(engine) {
+  const name = (engine || '').toLowerCase();
+
+  if (name.startsWith('oracle')) return 'oracle';
+  if (name.startsWith('sqlserver')) return 'sqlserver';
+  if (name === 'aurora-postgresql' || name === 'postgres') return 'postgresql';
+  if (name === 'aurora-mysql' || name === 'mysql') return 'mysql';
+  if (name === 'redis' || name === 'valkey') return 'redis';
+
+  return null;
+}
+
+// Fallback only. The real port comes from the endpoint the API returned, which
+// is what makes a database on a non-standard port work without being edited.
+function defaultPortFor(service) {
+  switch (service) {
+    case 'oracle': return 1521;
+    case 'sqlserver': return 1433;
+    case 'postgresql': return 5432;
+    case 'mysql': return 3306;
+    case 'redis': return 6379;
+    default: return null;
+  }
+}
+
 function setupIpcHandlers() {
   // Single source of truth for the version shown in the UI: package.json, via
   // Electron. Hardcoding it in the markup means it silently goes stale.
@@ -1016,6 +1083,237 @@ function setupIpcHandlers() {
     });
 
     return { success: true, data: instances, ssmLookupFailed };
+  }
+
+  // Managed database endpoints in the profile's region — the target list for
+  // "a host reachable from it" in port forwarding.
+  // Same re-auth path as the EC2 listing: expired credentials trigger one silent
+  // SSO login and a single retry.
+  ipcMain.handle('get-endpoints', async (event, profileName) => {
+    try {
+      return await describeEndpoints(profileName);
+    } catch (error) {
+      if (!isCredentialsError(error)) {
+        return { success: false, error: `Failed to list endpoints: ${error.message}` };
+      }
+
+      if (!lastSsoProfile) {
+        return {
+          success: false,
+          sessionExpired: true,
+          error: 'Your AWS session has expired. Please sign in again with SSO Connect.'
+        };
+      }
+
+      try {
+        await runAzureLogin(lastSsoProfile);
+      } catch (loginError) {
+        return {
+          success: false,
+          sessionExpired: true,
+          error: `Session expired and automatic re-authentication failed: ${loginError.error || loginError.message}`
+        };
+      }
+
+      try {
+        const result = await describeEndpoints(profileName);
+        return { ...result, reauthenticated: true };
+      } catch (retryError) {
+        return {
+          success: false,
+          sessionExpired: true,
+          error: `Failed to list endpoints after re-authentication: ${retryError.message}`
+        };
+      }
+    }
+  });
+
+  // Raw endpoint discovery — throws so the caller can handle credential failures.
+  //
+  // Each of the four API calls is isolated: a missing rds:* or elasticache:*
+  // permission must degrade to "fewer suggestions", never to a broken dialog,
+  // because typing the host by hand still works.
+  async function describeEndpoints(profileName) {
+    const profile = await getProfileConfig(profileName);
+    const config = { credentials: awsCredentials(profileName), region: profile.region };
+
+    const rds = new RDSClient(config);
+    const elasticache = new ElastiCacheClient(config);
+
+    const endpoints = [];
+    const warnings = [];
+
+    // A read-only Describe that fails on permissions costs the user suggestions,
+    // not the feature. Only a genuine credential failure belongs to the caller's
+    // re-auth path — checked second, because an AccessDenied message also matches
+    // isCredentialsError and would otherwise trigger a sign-in that cannot help.
+    const collect = async (label, fn) => {
+      try {
+        await fn();
+      } catch (error) {
+        if (!isAuthorizationError(error) && isCredentialsError(error)) throw error;
+        warnings.push(`${label}: ${describeDeniedAction(error)}`);
+      }
+    };
+
+    // RDS and ElastiCache both paginate with an opaque Marker
+    const MAX_PAGES = 20;
+    const paginate = async (send) => {
+      const pages = [];
+      let marker;
+      let page = 0;
+      do {
+        const response = await send(marker);
+        pages.push(response);
+        marker = response.Marker;
+        page += 1;
+      } while (marker && page < MAX_PAGES);
+      return pages;
+    };
+
+    // --- RDS instances -------------------------------------------------------
+    // Aurora member instances are skipped: they carry a DBClusterIdentifier and
+    // their per-instance endpoints move on failover. The cluster writer endpoint
+    // below is the one that stays correct.
+    await collect('RDS instances', async () => {
+      const pages = await paginate(marker => rds.send(new DescribeDBInstancesCommand({
+        MaxRecords: 100,
+        Marker: marker
+      })));
+
+      pages.forEach(page => {
+        (page.DBInstances || []).forEach(db => {
+          if (db.DBClusterIdentifier) return;
+          if (!db.Endpoint || !db.Endpoint.Address) return; // still being created
+
+          const service = engineToService(db.Engine);
+          if (!service) return;
+
+          endpoints.push({
+            id: `rds-instance:${db.DBInstanceIdentifier}`,
+            name: db.DBInstanceIdentifier,
+            host: db.Endpoint.Address,
+            port: db.Endpoint.Port || defaultPortFor(service),
+            service,
+            kind: 'RDS instance',
+            engine: db.Engine,
+            engineVersion: db.EngineVersion || null,
+            status: db.DBInstanceStatus || null,
+            tls: false
+          });
+        });
+      });
+    });
+
+    // --- Aurora clusters -----------------------------------------------------
+    // Writer endpoint only, one row per cluster.
+    await collect('Aurora clusters', async () => {
+      const pages = await paginate(marker => rds.send(new DescribeDBClustersCommand({
+        MaxRecords: 100,
+        Marker: marker
+      })));
+
+      pages.forEach(page => {
+        (page.DBClusters || []).forEach(cluster => {
+          if (!cluster.Endpoint) return;
+
+          const service = engineToService(cluster.Engine);
+          if (!service) return;
+
+          endpoints.push({
+            id: `rds-cluster:${cluster.DBClusterIdentifier}`,
+            name: cluster.DBClusterIdentifier,
+            host: cluster.Endpoint,
+            port: cluster.Port || defaultPortFor(service),
+            service,
+            kind: 'Aurora writer',
+            engine: cluster.Engine,
+            engineVersion: cluster.EngineVersion || null,
+            status: cluster.Status || null,
+            tls: false
+          });
+        });
+      });
+    });
+
+    // --- ElastiCache replication groups --------------------------------------
+    // Cluster mode enabled exposes a ConfigurationEndpoint; cluster mode disabled
+    // exposes a primary endpoint per node group. Either way the writer is wanted.
+    const groupedCacheClusters = new Set();
+    await collect('ElastiCache replication groups', async () => {
+      const pages = await paginate(marker => elasticache.send(new DescribeReplicationGroupsCommand({
+        MaxRecords: 100,
+        Marker: marker
+      })));
+
+      pages.forEach(page => {
+        (page.ReplicationGroups || []).forEach(group => {
+          (group.MemberClusters || []).forEach(id => groupedCacheClusters.add(id));
+
+          const engine = (group.Engine || 'redis').toLowerCase();
+          const service = engineToService(engine);
+          if (!service) return;
+
+          const primary = group.ConfigurationEndpoint
+            || ((group.NodeGroups || []).find(n => n.PrimaryEndpoint) || {}).PrimaryEndpoint;
+          if (!primary || !primary.Address) return;
+
+          endpoints.push({
+            id: `elasticache-group:${group.ReplicationGroupId}`,
+            name: group.ReplicationGroupId,
+            host: primary.Address,
+            port: primary.Port || defaultPortFor(service),
+            service,
+            kind: group.ConfigurationEndpoint ? 'ElastiCache (cluster mode)' : 'ElastiCache primary',
+            engine,
+            engineVersion: null,
+            status: group.Status || null,
+            tls: !!group.TransitEncryptionEnabled
+          });
+        });
+      });
+    });
+
+    // --- Standalone ElastiCache nodes ----------------------------------------
+    // Members of a replication group are already covered above.
+    await collect('ElastiCache clusters', async () => {
+      const pages = await paginate(marker => elasticache.send(new DescribeCacheClustersCommand({
+        MaxRecords: 100,
+        Marker: marker,
+        ShowCacheNodeInfo: true
+      })));
+
+      pages.forEach(page => {
+        (page.CacheClusters || []).forEach(cluster => {
+          if (cluster.ReplicationGroupId) return;
+          if (groupedCacheClusters.has(cluster.CacheClusterId)) return;
+
+          const service = engineToService(cluster.Engine);
+          if (!service) return;
+
+          const node = (cluster.CacheNodes || []).find(n => n.Endpoint && n.Endpoint.Address);
+          const endpoint = node ? node.Endpoint : cluster.ConfigurationEndpoint;
+          if (!endpoint || !endpoint.Address) return;
+
+          endpoints.push({
+            id: `elasticache-cluster:${cluster.CacheClusterId}`,
+            name: cluster.CacheClusterId,
+            host: endpoint.Address,
+            port: endpoint.Port || defaultPortFor(service),
+            service,
+            kind: 'ElastiCache node',
+            engine: (cluster.Engine || '').toLowerCase(),
+            engineVersion: cluster.EngineVersion || null,
+            status: cluster.CacheClusterStatus || null,
+            tls: !!cluster.TransitEncryptionEnabled
+          });
+        });
+      });
+    });
+
+    endpoints.sort((a, b) => a.name.localeCompare(b.name));
+
+    return { success: true, data: endpoints, region: profile.region, warnings };
   }
 
   // SSM Session - open a shell in a new terminal window

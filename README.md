@@ -66,6 +66,7 @@ for them on startup and tells you what is missing.
 - **One-click SSM shell** — opens `aws ssm start-session` in a new terminal window
 - **RDP over SSM** — auto port-forward tunnel + launches your RDP client (Windows-only instances)
 - **Port forwarding over SSM** — tunnel any TCP port to `localhost`, either on the instance itself or on a host it can reach (an RDS endpoint, for example), so you can use your own database or web client without a bastion or an inbound rule
+- **Endpoint discovery** — RDS, Aurora (writer endpoint) and ElastiCache endpoints in the profile's region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
 - **Startup preflight** — missing external tools (AWS CLI, Session Manager plugin, aws-azure-login) are reported up front with install instructions, instead of failing later mid-connect
 - **Automatic session renewal** — the AWS session is refreshed before it expires, and an expired one is renewed and retried transparently, so you are not thrown back to the login screen mid-task
@@ -96,6 +97,24 @@ reach — which is how you get to an **RDS endpoint**, since RDS cannot run an S
 |--------|--------------|---------|
 | This instance | `AWS-StartPortForwardingSession` | A port on the EC2 instance |
 | A reachable host | `AWS-StartPortForwardingSessionToRemoteHost` | RDS, ElastiCache, an internal load balancer… |
+
+For a reachable host, Portus lists the managed database and cache endpoints in the
+profile's region so the hostname does not have to be copied out of the console. Pick
+one, or type any other host — the field accepts both.
+
+| Service | Listed |
+|---------|--------|
+| Oracle | RDS instances |
+| SQL Server | RDS instances |
+| PostgreSQL | RDS instances, and the **writer endpoint** of Aurora PostgreSQL clusters |
+| MySQL | RDS instances, and the **writer endpoint** of Aurora MySQL clusters |
+| Redis | ElastiCache primary / configuration endpoints, and standalone nodes |
+
+The port comes from the endpoint itself rather than the service preset, so a database
+on a non-standard port connects without being corrected by hand.
+
+Every endpoint in the region is listed. Being listed does not mean the instance can
+reach it — the database's security group and route table still decide that.
 
 Open tunnels appear in the 🔌 panel in the top bar, where you can copy the local
 address or disconnect. They are closed automatically when Portus exits.
@@ -140,6 +159,8 @@ and shows a banner naming anything missing, with its install command.
 | `ssm:DescribeInstanceInformation` | The **SSM Agent** column (connection readiness) |
 | `ssm:StartSession` | SSM shells, RDP tunnels and port forwards |
 | `ssm:TerminateSession` / `ssm:ResumeSession` | Closing your own sessions cleanly |
+| `rds:DescribeDBInstances` / `rds:DescribeDBClusters` | Suggesting database endpoints in **Forward a port** |
+| `elasticache:DescribeReplicationGroups` / `elasticache:DescribeCacheClusters` | Suggesting Redis endpoints in **Forward a port** |
 
 If your policy restricts `ssm:StartSession` by resource, it must also allow the
 documents used for tunnelling, otherwise RDP and port forwarding are denied while
@@ -152,6 +173,10 @@ arn:aws:ssm:<region>::document/AWS-StartPortForwardingSessionToRemoteHost
 
 `ssm:DescribeInstanceInformation` is optional — without it the SSM Agent column
 shows *Unknown* and the connect buttons stay enabled, so nothing is blocked.
+
+The `rds:*` and `elasticache:*` actions are optional too. They only populate the
+endpoint suggestions in **Forward a port**; without them the list is empty or
+partial and the host is typed by hand, exactly as before.
 
 ---
 
@@ -331,6 +356,8 @@ ie4uinit.exe -show
 | SSM Agent column shows *Unknown* | Your credentials lack `ssm:DescribeInstanceInformation`. Harmless — the buttons stay enabled |
 | `Local port ... is already in use` | Something else holds that port. Leave **Local port** blank to have one picked automatically |
 | Port forward to an RDS endpoint fails | Use **A host reachable from it** (not *This instance*), and check the instance's security group is allowed to reach the database |
+| Endpoint list is empty or missing a database | Your credentials lack the `rds:*` / `elasticache:*` describe actions, or the database is in another region. Type the host manually — nothing is blocked |
+| Redis connects but the TLS handshake fails | The cluster has encryption in transit, and its certificate names the real host, not `localhost`. Point your client at the real SNI name or disable hostname verification |
 | RDP client doesn't launch | Windows: ensure `mstsc` available · macOS: install Microsoft Remote Desktop · Linux: install `remmina`/`xfreerdp`/`rdesktop` |
 | No profiles in the SSO dialog | No `azure_*` profiles found in `~/.aws/config` |
 | No operational profiles in dropdown | Add a non-Azure profile to `~/.aws/config` |

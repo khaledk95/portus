@@ -35,6 +35,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // EC2 (target list for SSM / RDP)
   getEc2Instances: (profileName) => ipcRenderer.invoke('get-ec2-instances', profileName),
 
+  // Managed database endpoints suggested in the port forwarding dialog
+  getEndpoints: (profileName) => ipcRenderer.invoke('get-endpoints', profileName),
+
   // SSM Connect
   connectSSM: (profileName, instanceId) => ipcRenderer.invoke('connect-ssm', profileName, instanceId),
 

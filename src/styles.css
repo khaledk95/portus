@@ -328,6 +328,42 @@ button { cursor: pointer; }
   font-size: 11px; color: var(--text-dim); text-align: right;
 }
 
+/* ---------- endpoint combobox (port forwarding) ----------
+   Editable rather than a picker: the input is both the filter and the value, so
+   an endpoint that was never discovered can still be typed in full. */
+.host-combo { position: relative; }
+.host-combo .input { width: 100%; padding-right: 30px; }
+.host-combo-toggle {
+  position: absolute; top: 0; right: 0; width: 28px; height: 100%;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: none; color: var(--text-dim); font-size: 10px;
+}
+.host-combo-toggle:hover { color: var(--text); }
+.host-combo.open .host-combo-toggle i { transform: rotate(180deg); }
+
+.host-panel { width: 100%; }
+.host-panel .combo-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.link-btn {
+  background: none; border: none; padding: 0;
+  color: var(--text-dim); font-size: 11px;
+}
+.link-btn:hover { color: var(--accent); }
+.link-btn i { font-size: 10px; margin-right: 3px; }
+.host-combo.open .host-panel { display: flex; }
+.host-panel .combo-list { max-height: 220px; }
+/* the dropdown has to leave the dialog box, which is otherwise clipped for its
+   corner radius — safe here because nothing in this dialog is full-bleed */
+.dialog.port-dialog { overflow: visible; }
+
+.endpoint-option { gap: 10px; }
+.endpoint-option .opt-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.endpoint-option .opt-host {
+  font-size: 11px; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.endpoint-option .opt-kind { font-size: 10.5px; color: var(--text-dim); white-space: nowrap; }
+.endpoint-option .opt-port { font-size: 11px; color: var(--text-dim); min-width: 34px; text-align: right; }
+
 /* ==========================================================================
    MAIN / TOOLBAR
    ========================================================================== */
