@@ -60,17 +60,40 @@ jobs:
       # The `--` matters: without it npm consumes --publish itself and passes a
       # bare "always" through, which electron-builder rejects as an unknown
       # argument before any build starts.
-      - name: Build and upload
-        run: ${{ matrix.build }} -- --publish always
+      #
+      # --publish never, deliberately. electron-builder's GitHub publisher looks
+      # for a draft release for the tag and creates one if it finds none. All
+      # three runners start together, all three look before any has created, and
+      # all three create — GitHub allows it because a draft does not bind the
+      # tag. That produced three releases for v2.2.0, one per platform. The files
+      # are handed to the publish job instead, which creates exactly one release.
+      - name: Build
+        run: ${{ matrix.build }} -- --publish never
         env:
-          # electron-builder reads GH_TOKEN; the token Actions injects is enough
-          # to create and upload to a release in this repository.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # No Apple Developer certificate is configured, so builds stay unsigned
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
-  # Each build uploads into the same draft. Publishing only once they have all
-  # finished stops anyone downloading a release that is missing a platform.
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          if-no-files-found: error
+          retention-days: 1
+          # Named extensions rather than dist/*: the unpacked application
+          # directories also live there and must not reach the release.
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.zip
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+            dist/*.blockmap
+            dist/latest*.yml
+
+  # One job, one release. Runs only once every platform has built, so nobody can
+  # download a release that is missing an OS.
   publish:
     name: Publish release
     needs: build
@@ -79,11 +102,52 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Resolve tag from package version
-        id: tag
-        run: echo "tag=v$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Download every platform's artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
-      - name: Mark the draft as published
+      # Artifacts arrive in a directory per matrix job; the release wants them flat
+      - name: Collect
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec mv -t dist/ {} +
+          ls -lh dist
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$(node -p "require('./package.json').version")"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # A release missing a platform is worse than a failed workflow, so the
+      # absence of any one of them stops the publish rather than shipping a gap.
+      - name: Check every platform is present
+        run: |
+          for pattern in '*.exe' '*.dmg' '*.AppImage' '*.deb' '*.rpm'; do
+            if ! compgen -G "dist/$pattern" > /dev/null; then
+              echo "::error::No $pattern in the collected artifacts — refusing to publish an incomplete release"
+              exit 1
+            fi
+          done
+        shell: bash
+
+      - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ steps.tag.outputs.tag }}" --draft=false --latest
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            # a re-run: replace the assets on the release that already exists
+            gh release upload "$tag" dist/* --clobber
+            gh release edit "$tag" --draft=false --latest
+          else
+            gh release create "$tag" dist/* \
+              --title "Portus $tag" \
+              --notes-from-tag \
+              --latest
+          fi
