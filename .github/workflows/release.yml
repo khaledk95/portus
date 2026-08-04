@@ -146,8 +146,11 @@ jobs:
             gh release upload "$tag" dist/* --clobber
             gh release edit "$tag" --draft=false --latest
           else
+            # Titled with the tag itself: the repository name already heads the
+            # releases page, and a title that differs from the tag people search
+            # for is a papercut with nothing to gain.
             gh release create "$tag" dist/* \
-              --title "Portus $tag" \
+              --title "$tag" \
               --notes-from-tag \
               --latest
           fi
