@@ -21,12 +21,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('tunnels-changed', listener);
   },
 
-  // AWS Profile Management
-  getAwsProfiles: () => ipcRenderer.invoke('get-aws-profiles'),
-  getOperationalProfiles: () => ipcRenderer.invoke('get-operational-profiles'),
+  // AWS profiles, each tagged with the credential provider it uses
+  getProfiles: () => ipcRenderer.invoke('get-profiles'),
 
-  // Azure AD SSO Login
-  azureAwsLogin: (profileName) => ipcRenderer.invoke('azure-aws-login', profileName),
+  // What the sign-in dialog lists — Identity Center grouped by portal session
+  getLoginTargets: () => ipcRenderer.invoke('get-login-targets'),
+
+  // Start the login the profile's provider declares (Azure AD, Identity Center)
+  signIn: (profileName) => ipcRenderer.invoke('sign-in', profileName),
+
+  // Identity Center prints a code the user has to confirm in the browser
+  onSsoVerification: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('sso-verification', listener);
+    return () => ipcRenderer.removeListener('sso-verification', listener);
+  },
 
   // Session lifecycle
   getSessionStatus: (profileName) => ipcRenderer.invoke('get-session-status', profileName),

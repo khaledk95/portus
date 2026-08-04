@@ -292,7 +292,7 @@ button { cursor: pointer; }
 .profile-combo.open .profile-picker { border-color: var(--accent); }
 
 .combo-panel {
-  position: absolute; top: calc(100% + 5px); left: 0; width: 268px; z-index: 400;
+  position: absolute; top: calc(100% + 5px); left: 0; width: 330px; z-index: 400;
   display: none; flex-direction: column; overflow: hidden;
   background: var(--surface); border: 1px solid var(--border-strong);
   border-radius: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
@@ -320,12 +320,18 @@ button { cursor: pointer; }
 }
 .combo-option .opt-name mark { background: var(--accent-soft); color: var(--accent); border-radius: 2px; }
 .combo-option .opt-region { font-size: 11px; color: var(--text-dim); }
+/* which credential provider the profile uses — Identity Center, Azure AD, keys… */
+.combo-option .opt-provider {
+  font-size: 10.5px; color: var(--text-dim); white-space: nowrap;
+  padding: 1px 6px; border: 1px solid var(--border); border-radius: 3px;
+}
 .combo-option .opt-check { font-size: 10px; color: var(--accent); opacity: 0; }
 .combo-option.selected .opt-check { opacity: 1; }
 .combo-empty { padding: 16px 10px; text-align: center; font-size: 12px; color: var(--text-dim); }
 .combo-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
   padding: 6px 10px; border-top: 1px solid var(--border);
-  font-size: 11px; color: var(--text-dim); text-align: right;
+  font-size: 11px; color: var(--text-dim);
 }
 
 /* ---------- endpoint combobox (port forwarding) ----------
@@ -342,7 +348,6 @@ button { cursor: pointer; }
 .host-combo.open .host-combo-toggle i { transform: rotate(180deg); }
 
 .host-panel { width: 100%; }
-.host-panel .combo-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .link-btn {
   background: none; border: none; padding: 0;
   color: var(--text-dim); font-size: 11px;
@@ -572,12 +577,21 @@ td.actions { text-align: left; }
   padding: 12px 14px; border-bottom: 1px solid var(--border);
 }
 .dialog-head h3 { font-size: 13.5px; font-weight: 600; }
+.dialog-head .head-actions { display: flex; align-items: center; gap: 12px; }
 .dialog-body { padding: 14px; }
 .dialog-foot {
   display: flex; justify-content: flex-end; gap: 8px;
   padding: 12px 14px; border-top: 1px solid var(--border);
 }
 .dialog-note { font-size: 12px; color: var(--text-dim); margin-bottom: 10px; }
+
+/* the Identity Center pairing code, sized to be read off the screen at a glance */
+.verify-code {
+  margin: 4px 0 12px; padding: 14px 10px;
+  font-size: 26px; font-weight: 600; letter-spacing: 4px; text-align: center;
+  background: var(--surface-2); border: 1px solid var(--border-strong);
+  border-radius: 6px; color: var(--text);
+}
 
 /* profile list inside the SSO dialog */
 .profile-list { display: flex; flex-direction: column; gap: 4px; max-height: 320px; overflow-y: auto; }

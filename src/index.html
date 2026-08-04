@@ -47,7 +47,7 @@
                 <i class="fas fa-moon"></i>
             </button>
             <button type="button" class="btn" id="loginBtn">
-                <i class="fas fa-right-to-bracket"></i> <span>SSO Connect</span>
+                <i class="fas fa-right-to-bracket"></i> <span>Sign in</span>
             </button>
         </div>
 
@@ -84,8 +84,14 @@
                                    autocomplete="off" spellcheck="false">
                         </div>
                         <div class="combo-list" id="profileComboList" role="listbox"
-                             aria-label="Operational AWS profiles"></div>
-                        <div class="combo-foot" id="profileComboCount"></div>
+                             aria-label="AWS profiles"></div>
+                        <div class="combo-foot">
+                            <button type="button" class="link-btn" id="profileComboRefresh" tabindex="-1"
+                                    title="Re-read ~/.aws/config and ~/.aws/credentials">
+                                <i class="fas fa-rotate"></i> Refresh
+                            </button>
+                            <span id="profileComboCount"></span>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -152,7 +158,7 @@
                     <div class="table-wrap" id="instanceTableWrap">
                         <div class="empty" id="instanceEmpty">
                             <i class="fas fa-server"></i>
-                            <p id="instanceEmptyText">Sign in and choose a profile to list instances.</p>
+                            <p id="instanceEmptyText">Choose a profile to list instances.</p>
                         </div>
                     </div>
 
@@ -190,7 +196,7 @@
             <span id="statusText">Disconnected</span>
         </span>
         <span class="sep"></span>
-        <span id="statusSso" class="dim">Not signed in</span>
+        <span id="statusSso" class="dim">No profile selected</span>
         <span class="sep" id="statusRenewSep" style="display:none;"></span>
         <span id="statusRenew" style="display:none;">Renews in <span class="num" id="statusRenewValue">—</span></span>
         <div class="status-right">

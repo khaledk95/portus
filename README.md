@@ -6,10 +6,14 @@
 
 <p align="center"><strong>Secure SSM &amp; RDP-over-SSM access for AWS instances.</strong></p>
 
-Portus is a cross-platform desktop app (Electron) that lets you authenticate to AWS
-with Azure AD SSO, browse your EC2 instances, and open a **Systems Manager (SSM)
-shell**, an **RDP-over-SSM tunnel**, or a **port forward to any TCP service** —
-with no inbound ports, no bastion hosts, and no manual CLI commands.
+Portus is a cross-platform desktop app (Electron) that browses your EC2 instances and
+opens a **Systems Manager (SSM) shell**, an **RDP-over-SSM tunnel**, or a **port
+forward to any TCP service** — with no inbound ports, no bastion hosts, and no manual
+CLI commands.
+
+It works with however you already authenticate to AWS — IAM Identity Center, Azure AD,
+`credential_process`, assume-role or static keys — because it reads the same
+`~/.aws` config the AWS CLI does.
 
 > Open source, released under the MIT License.
 
@@ -21,7 +25,7 @@ with no inbound ports, no bastion hosts, and no manual CLI commands.
 2. [Features](#features)
 3. [How it works](#how-it-works)
 4. [Prerequisites](#prerequisites)
-5. [AWS profile configuration](#aws-profile-configuration)
+5. [Authentication and AWS profiles](#authentication-and-aws-profiles)
 6. [Installing a release](#installing-a-release)
 7. [Running from source](#running-from-source)
 8. [Building installers](#building-installers)
@@ -60,7 +64,8 @@ for them on startup and tells you what is missing.
 
 ## Features
 
-- **Azure AD SSO login** via `aws-azure-login`
+- **Works with however you authenticate to AWS** — IAM Identity Center, Azure AD, `credential_process`, assume-role, static keys or environment credentials. Every profile in `~/.aws` is listed and selectable with no sign-in required first
+- **Sign in from the app** for IAM Identity Center (`aws sso login`, with the browser pairing code shown so you can confirm it) and Azure AD (`aws-azure-login`) — the session countdown reads from whichever store that provider uses
 - **EC2 instance browser** — live list per profile/region, searchable
 - **SSM readiness at a glance** — per-instance agent status (Online / Connection lost / Not managed), so you never click Connect on an instance that can't accept a session
 - **One-click SSM shell** — opens `aws ssm start-session` in a new terminal window
@@ -68,8 +73,8 @@ for them on startup and tells you what is missing.
 - **Port forwarding over SSM** — tunnel any TCP port to `localhost`, either on the instance itself or on a host it can reach (an RDS endpoint, for example), so you can use your own database or web client without a bastion or an inbound rule
 - **Endpoint discovery** — RDS, Aurora (writer endpoint) and ElastiCache endpoints in the profile's region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
-- **Startup preflight** — missing external tools (AWS CLI, Session Manager plugin, aws-azure-login) are reported up front with install instructions, instead of failing later mid-connect
-- **Automatic session renewal** — the AWS session is refreshed before it expires, and an expired one is renewed and retried transparently, so you are not thrown back to the login screen mid-task
+- **Startup preflight** — missing external tools are reported up front with install instructions rather than failing later mid-connect, and provider-specific ones are only demanded when a profile actually uses them
+- **Session renewal** — Azure AD sessions are refreshed before they expire and an expired one is renewed and retried transparently, so you are not thrown back to the login screen mid-task. IAM Identity Center needs a browser approval, so it is never renewed on a timer — you get a warning shortly before it lapses and sign in when you are ready
 - **Light and dark themes**, a collapsible sidebar, an instance detail panel, state/OS filters and `Ctrl K` search — the session countdown and open tunnel count stay visible in the status bar
 - Smart buttons: connect actions are only offered when Systems Manager can actually reach the instance, and RDP only on running Windows instances
 - Cross-platform: Windows, macOS, Linux
@@ -79,8 +84,9 @@ for them on startup and tells you what is missing.
 ## How it works
 
 ```
-1. SSO Connect      → pick an Azure AD profile → runs aws-azure-login
-2. Select Profile   → choose an operational AWS profile (loads its EC2 instances)
+1. Select Profile   → pick any profile from ~/.aws (loads its EC2 instances)
+2. Sign in          → only if those credentials are missing or expired
+                      (IAM Identity Center or Azure AD)
 3. Connect          → per instance row, choose:
                         SSM   → shell in a new terminal
                         RDP   → tunnel + your RDP client (Windows instances)
@@ -116,8 +122,10 @@ on a non-standard port connects without being corrected by hand.
 Every endpoint in the region is listed. Being listed does not mean the instance can
 reach it — the database's security group and route table still decide that.
 
-Open tunnels appear in the 🔌 panel in the top bar, where you can copy the local
-address or disconnect. They are closed automatically when Portus exits.
+Open tunnels get their own **Tunnels** view in the sidebar, listing each one with its
+local address and a live uptime, where you can copy the address or disconnect. The
+open count also shows in the status bar. They are closed automatically when Portus
+exits.
 
 ---
 
@@ -141,7 +149,7 @@ and shows a banner naming anything missing, with its install command.
 |------|-----|---------|
 | **AWS CLI v2** | Runs `aws ssm start-session` for SSM & RDP | <https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html> |
 | **AWS Session Manager plugin** | Required by `aws ssm start-session` | <https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html> |
-| **aws-azure-login** | Azure AD SSO authentication | `npm install -g aws-azure-login` |
+| **aws-azure-login** | Only for Azure AD profiles — not checked unless you have one | `npm install -g aws-azure-login` |
 | **RDP client** | Needed only for RDP-over-SSM | Windows: `mstsc` (built-in) · macOS: [Microsoft Remote Desktop](https://apps.apple.com/app/microsoft-remote-desktop/id1295203466) · Linux: `remmina`, `xfreerdp`, or `rdesktop` |
 
 ### AWS-side requirements (per target instance)
@@ -180,18 +188,64 @@ partial and the host is typed by hand, exactly as before.
 
 ---
 
-## AWS profile configuration
+## Authentication and AWS profiles
 
 Portus reads your standard AWS config at `~/.aws/config` (and `~/.aws/credentials`).
-It splits profiles into two groups:
+Every profile is listed, tagged with the credential provider it uses, and can be
+selected. **No sign-in is required first** — if the AWS CLI can use a profile, so
+can Portus, because it hands the profile name to the same SDK the CLI uses.
 
-- **SSO profiles** — contain `azure_*` fields → shown in the "SSO Connect" dialog
-- **Operational profiles** — everything else → shown in the top-bar profile dropdown
+| Provider | Recognised by | Sign-in button |
+|----------|---------------|----------------|
+| **Identity Center** | `sso_session` or `sso_start_url` | yes — runs `aws sso login --sso-session <name>`, your browser opens and Portus shows the pairing code to confirm |
+| **Azure AD** | any `azure_*` field | yes, runs `aws-azure-login` |
+| **Credential process** | `credential_process` | none needed |
+| **Assume role** | `role_arn` | none needed |
+| **Access keys** | `aws_access_key_id` | none needed, they do not expire |
+
+Environment credentials (`AWS_ACCESS_KEY_ID`, an EC2 instance role) work too.
+
+The sidebar dropdown lists every profile. The **Sign in** dialog lists only what
+Portus can actually start a login for, and lists it by the right unit: an Identity
+Center token belongs to the portal session, so all the profiles sharing an
+`[sso-session]` appear as **one** row that signs you into all of them at once.
+Azure AD, and older Identity Center profiles with an inline `sso_start_url`, stay
+one row per profile because that is genuinely how they log in.
+
+Each row says how many profiles that one sign-in makes usable — the profiles it
+signs in directly, plus any that reach them through `source_profile`. So an Azure
+AD profile that three other profiles assume a role from reads *4 profiles*:
+
+```ini
+[profile azure-corp]          # the sign-in
+azure_tenant_id = ...
+
+[profile prod]                # usable after signing in to azure-corp
+role_arn = arn:aws:iam::111111111111:role/Admin
+source_profile = azure-corp
+```
+
+Both the dropdown and the Sign in dialog have a **Refresh** that re-reads
+`~/.aws/config` and `~/.aws/credentials`, so a profile added or edited while
+Portus is running shows up without restarting it. If the profile you had selected
+disappears, the selection is cleared; if its region changed, the status bar
+follows.
 
 Example `~/.aws/config`:
 
 ```ini
-# --- Azure AD SSO profile (used for "SSO Connect") ---
+# --- IAM Identity Center ---
+[sso-session mycompany]
+sso_start_url = https://mycompany.awsapps.com/start
+sso_region = me-central-1
+
+[profile idc-prod]
+sso_session = mycompany
+sso_account_id = 123456789012
+sso_role_name = Developer
+region = me-central-1
+
+# --- Azure AD (signs in from the app) ---
 [profile my-sso]
 azure_tenant_id = 00000000-0000-0000-0000-000000000000
 azure_app_id_uri = https://signin.aws.amazon.com/saml
@@ -199,14 +253,39 @@ azure_default_username = you@company.com
 azure_default_role_arn = arn:aws:iam::123456789012:role/YourRole
 region = me-central-1
 
-# --- Operational profile (used to list instances & connect) ---
+# --- Assume role from a base profile ---
 [profile my-account]
+role_arn = arn:aws:iam::123456789012:role/YourRole
+source_profile = my-sso
 region = me-central-1
-# credentials populated by aws-azure-login after SSO, or static keys, etc.
+
+# --- Credentials from an external helper (1Password, Vault, aws-vault…) ---
+[profile vault]
+credential_process = /usr/local/bin/aws-vault export --format=json prod
+region = me-central-1
 ```
 
-> Tip: `aws-azure-login --profile my-sso` should work from your terminal before you
-> rely on it in the app.
+**Access keys** go in `~/.aws/credentials`, and note the section header has no
+`profile ` prefix there — that mismatch is the usual reason a profile shows up
+half-configured:
+
+```ini
+# ~/.aws/credentials          note: [name], not [profile name]
+[my-keys]
+aws_access_key_id = AKIA...
+aws_secret_access_key = ...
+region = me-central-1
+```
+
+`aws configure --profile my-keys` writes this for you and gets the syntax right.
+Portus merges both files per profile, so the region can live in either.
+
+**Environment credentials** need no configuration at all: if `AWS_ACCESS_KEY_ID`
+and `AWS_SECRET_ACCESS_KEY` are exported, or Portus is running on an EC2 instance
+with an instance role, the SDK picks them up for the `default` profile.
+
+> Tip: whatever the provider, the profile should already work from your terminal —
+> `aws sts get-caller-identity --profile <name>` — before you rely on it in the app.
 
 ---
 
@@ -261,8 +340,9 @@ npm start
 npm run dev
 ```
 
-Click **SSO Connect**, authenticate, then pick an operational profile from the
-sidebar — instances load automatically.
+Pick a profile from the sidebar and its instances load automatically. If those
+credentials are missing or expired, Portus says so — click **Sign in** and pick the
+Identity Center session or Azure AD profile that provides them.
 
 ---
 
@@ -289,11 +369,13 @@ All builds output to the `dist/` folder (git-ignored).
 - **Releasing is automatic.** Bump the version, tag it, push the tag:
 
   ```bash
-  npm version 1.4.0 --no-git-tag-version   # or edit package.json by hand
-  git commit -am "Release v1.4.0"
-  git tag -a v1.4.0 -m "Portus v1.4.0"
+  npm version 2.3.0 --no-git-tag-version   # or edit package.json by hand
+  git commit -am "Release v2.3.0"
+  git tag -a v2.3.0 -m "Portus v2.3.0"
   git push origin main --follow-tags
   ```
+
+  `build.buildVersion` in `package.json` has to match too.
 
   The workflow builds on all three runners, uploads into a draft, and publishes
   the release only once every platform has finished — so nobody can download a
@@ -310,9 +392,9 @@ All builds output to the `dist/` folder (git-ignored).
 ├── src/
 │   ├── main.js          # Electron main process — IPC handlers, AWS SDK, CLI spawns
 │   ├── preload.js       # contextBridge — exposes the safe electronAPI to the renderer
-│   ├── renderer.js      # UI logic (AWSManager class): login, instances, connect
+│   ├── renderer.js      # UI logic (Portus class): profiles, instances, tunnels
 │   ├── index.html       # App markup
-│   ├── styles.css        # Theme tokens (light + dark) and all component styles
+│   ├── styles.css       # Theme tokens (light + dark) and all component styles
 │   └── assets/
 │       └── portus.png   # In-app logo
 ├── build/
@@ -359,8 +441,11 @@ ie4uinit.exe -show
 | Endpoint list is empty or missing a database | Your credentials lack the `rds:*` / `elasticache:*` describe actions, or the database is in another region. Type the host manually — nothing is blocked |
 | Redis connects but the TLS handshake fails | The cluster has encryption in transit, and its certificate names the real host, not `localhost`. Point your client at the real SNI name or disable hostname verification |
 | RDP client doesn't launch | Windows: ensure `mstsc` available · macOS: install Microsoft Remote Desktop · Linux: install `remmina`/`xfreerdp`/`rdesktop` |
-| No profiles in the SSO dialog | No `azure_*` profiles found in `~/.aws/config` |
-| No operational profiles in dropdown | Add a non-Azure profile to `~/.aws/config` |
+| Sign-in button disabled | No profile in `~/.aws` has a login Portus can run. Pick a profile directly instead — its credentials are used as-is |
+| `aws sso login` sign-in times out | The browser approval was not completed within 3 minutes. If no browser opened, run `aws sso login --profile <name>` in a terminal once |
+| Session countdown missing on an Identity Center profile | The cached token in `~/.aws/sso/cache` has no entry for that portal yet — sign in once and it appears |
+| No profiles in the dropdown | Nothing readable in `~/.aws/config` or `~/.aws/credentials` |
+| A profile you just added is missing | Click **Refresh** in the dropdown (or in the Sign in dialog) — `~/.aws` is otherwise only read at startup |
 | App icon not updating (Windows) | Stale icon cache — run `ie4uinit.exe -show` or reinstall to a new path |
 
 ---
@@ -368,9 +453,11 @@ ie4uinit.exe -show
 ## Tech stack
 
 - **Electron 37** (electron-builder 24 for packaging)
-- **AWS SDK v3** — `@aws-sdk/client-ec2`, `@aws-sdk/client-ssm`, `@aws-sdk/credential-providers`
+- **AWS SDK v3** — `@aws-sdk/client-ec2`, `@aws-sdk/client-ssm`, `@aws-sdk/client-rds`,
+  `@aws-sdk/client-elasticache`, `@aws-sdk/credential-providers`
 - `fs-extra`, `ini` (read `~/.aws` config)
-- External CLIs at runtime: **AWS CLI v2**, **Session Manager plugin**, **aws-azure-login**
+- External CLIs at runtime: **AWS CLI v2** and the **Session Manager plugin** always;
+  **aws-azure-login** only if you have an Azure AD profile
 
 ---
 

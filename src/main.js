@@ -130,7 +130,11 @@ const REQUIRED_TOOLS = [
     name: 'aws-azure-login',
     command: 'aws-azure-login',
     purpose: 'Performs the Azure AD SSO sign-in',
-    install: 'npm install -g aws-azure-login'
+    install: 'npm install -g aws-azure-login',
+    // Only meaningful to someone who actually has an Azure profile. Demanding it
+    // of everyone put a red banner in front of every other kind of AWS user for
+    // a tool they will never install.
+    neededFor: 'azure'
   }
 ];
 
@@ -166,7 +170,18 @@ function isCommandAvailable(command) {
 }
 
 async function checkRequiredTools() {
-  return Promise.all(REQUIRED_TOOLS.map(async tool => ({
+  // A tool tied to a provider is only checked when a profile actually uses it
+  let providersInUse = new Set();
+  try {
+    providersInUse = new Set((await readAwsProfiles()).map(profile => profile.provider));
+  } catch (error) {
+    // If ~/.aws cannot be read, check everything rather than silently skipping
+    providersInUse = new Set(REQUIRED_TOOLS.map(tool => tool.neededFor).filter(Boolean));
+  }
+
+  const applicable = REQUIRED_TOOLS.filter(tool => !tool.neededFor || providersInUse.has(tool.neededFor));
+
+  return Promise.all(applicable.map(async tool => ({
     id: tool.id,
     name: tool.name,
     purpose: tool.purpose,
@@ -472,21 +487,280 @@ async function getProfileConfig(profileName) {
   }
 }
 
-// Helper: detect aws-azure-login (Azure AD SSO) compatible profiles
-function isProfileAzureLoginCompatible(profileConfig) {
-  if (!profileConfig) return false;
+// ============================================================================
+// CREDENTIAL PROVIDERS
+// ============================================================================
+//
+// Portus never authenticates. It hands a profile name to the AWS SDK and to the
+// CLI, both of which already resolve every credential type AWS supports. The
+// only thing a provider decides is whether Portus can *start a login* for that
+// profile, and where the session expiry can be read from.
+//
+// Order matters: the first match wins, so the more specific entries come first.
+// A profile with sso_session is an Identity Center profile even though it also
+// has a region, and an Azure profile usually has role_arn too.
+const CREDENTIAL_PROVIDERS = [
+  {
+    id: 'sso',
+    label: 'Identity Center',
+    detect: settings => !!(settings.sso_session || settings.sso_start_url)
+  },
+  {
+    id: 'azure',
+    label: 'Azure AD',
+    // any azure_* key, so a profile configured with only some of them is still
+    // recognised — which is what the previous detection did
+    detect: settings => Object.keys(settings).some(key => key.toLowerCase().startsWith('azure_'))
+  },
+  {
+    id: 'process',
+    label: 'Credential process',
+    detect: settings => !!settings.credential_process
+  },
+  {
+    id: 'assume-role',
+    label: 'Assume role',
+    detect: settings => !!settings.role_arn
+  },
+  {
+    id: 'static',
+    label: 'Access keys',
+    detect: settings => !!settings.aws_access_key_id
+  },
+  {
+    id: 'unknown',
+    label: 'Profile',
+    detect: () => true
+  }
+];
 
-  const hasAzureAppId = !!(profileConfig.azure_app_id_uri || profileConfig.azure_app_id);
-  const hasAzureTenant = !!profileConfig.azure_tenant_id;
-  const hasAzureRole = !!profileConfig.azure_default_role_arn;
-  const hasAzureUsername = !!profileConfig.azure_default_username;
+// Logins Portus knows how to run itself. A provider missing from here is not
+// unsupported — its credentials still resolve normally — it just cannot be
+// refreshed from inside the app, the way access keys have nothing to refresh.
+// Adding `aws sso login` here is what turns Identity Center from "works if you
+// already logged in through the CLI" into "works from the button".
+// Each runner receives the resolved profile, not just its name, because what the
+// command should target differs: aws-azure-login takes the profile, while
+// `aws sso login` should take the session when the profile names one.
+// `interactive` means the login cannot complete without the user doing something
+// in another window. Those are never started on a timer: silently opening a
+// browser at someone mid-task is worse than letting the session lapse and saying so.
+const LOGIN_RUNNERS = {
+  azure: { run: profile => runAzureLogin(profile.name), interactive: false },
+  sso: { run: profile => runSsoLogin(profile), interactive: true }
+};
 
-  if (hasAzureAppId || hasAzureTenant || hasAzureRole || hasAzureUsername) {
-    return true;
+function detectProvider(settings) {
+  return CREDENTIAL_PROVIDERS.find(provider => provider.detect(settings || {}))
+    || CREDENTIAL_PROVIDERS[CREDENTIAL_PROVIDERS.length - 1];
+}
+
+// Every profile in ~/.aws, classified. The two files are merged per profile
+// before detection, because the pieces that identify a provider are routinely
+// split across them — sso_session in config, cached keys in credentials — and
+// reading either alone misidentifies the profile.
+//
+// Only the whitelisted fields below are returned. The ini sections themselves
+// are never handed to the renderer: aws_secret_access_key is legal in ~/.aws/config,
+// and there is no reason for a secret to cross the IPC boundary to reach a
+// dropdown that shows a name and a region.
+async function describeProfiles() {
+  const home = os.homedir();
+  const sections = new Map();
+  const ssoSessions = new Map();
+
+  const remember = (name, settings, source) => {
+    if (!name) return;
+    const existing = sections.get(name);
+
+    if (existing) {
+      // config is authoritative where the two files disagree
+      existing.settings = source === 'config'
+        ? { ...existing.settings, ...settings }
+        : { ...settings, ...existing.settings };
+      return;
+    }
+
+    sections.set(name, { settings: { ...settings }, source });
+  };
+
+  const readIni = async (file) => {
+    try {
+      if (!(await fs.pathExists(file))) return null;
+      return ini.parse(await fs.readFile(file, 'utf8'));
+    } catch (error) {
+      return null;   // an unreadable or malformed file must not empty the list
+    }
+  };
+
+  const config = await readIni(path.join(home, '.aws', 'config'));
+  if (config) {
+    Object.keys(config).forEach(key => {
+      // [sso-session name] and [services name] are not profiles
+      if (key === 'default') remember('default', config[key], 'config');
+      else if (key.startsWith('profile ')) remember(key.slice('profile '.length).trim(), config[key], 'config');
+      else if (key.startsWith('sso-session ')) ssoSessions.set(key.slice('sso-session '.length).trim(), config[key]);
+    });
   }
 
-  const azureFields = Object.keys(profileConfig).filter(key => key.toLowerCase().includes('azure'));
-  return azureFields.length > 0;
+  const credentials = await readIni(path.join(home, '.aws', 'credentials'));
+  if (credentials) {
+    Object.keys(credentials).forEach(key => {
+      if (typeof credentials[key] === 'object') remember(key, credentials[key], 'credentials');
+    });
+  }
+
+  return [...sections.entries()]
+    .map(([name, { settings, source }]) => {
+      const provider = detectProvider(settings);
+
+      // An Identity Center profile keeps its portal URL either inline (the older
+      // layout) or in the [sso-session] section it names. Resolving it here is
+      // what lets the cached token for this profile be found later.
+      const sessionName = settings.sso_session || null;
+      const session = sessionName ? ssoSessions.get(sessionName) : null;
+      const ssoStartUrl = settings.sso_start_url || (session && session.sso_start_url) || null;
+      const ssoRegion = settings.sso_region || (session && session.sso_region) || null;
+
+      return {
+        name,
+        region: settings.region || 'us-east-1',
+        source,
+        provider: provider.id,
+        providerLabel: provider.label,
+        canLogin: Object.prototype.hasOwnProperty.call(LOGIN_RUNNERS, provider.id),
+        interactiveLogin: !!(LOGIN_RUNNERS[provider.id] && LOGIN_RUNNERS[provider.id].interactive),
+        // the profile this one assumes a role from; a sign-in to that profile is
+        // what makes this one work
+        sourceProfile: settings.source_profile || null,
+        ssoSession: sessionName,
+        ssoStartUrl,
+        ssoRegion
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// The IPC-facing view. ssoStartUrl names the organisation's sign-in portal, so it
+// stays in the main process — the dropdown only ever needs a name and a region.
+const PROFILE_FIELDS_FOR_RENDERER = [
+  'name', 'region', 'source', 'provider', 'providerLabel', 'canLogin', 'interactiveLogin'
+];
+
+async function readAwsProfiles() {
+  return (await describeProfiles()).map(profile =>
+    Object.fromEntries(PROFILE_FIELDS_FOR_RENDERER.map(key => [key, profile[key]])));
+}
+
+// What the sign-in dialog offers — which is not the same as the profile list.
+//
+// An Identity Center token belongs to the portal session, not to a profile: one
+// `aws sso login` for a session covers every profile that names it. Listing them
+// per profile would offer the same login several times over, each appearing to do
+// something different. They are grouped by session instead.
+//
+// aws-azure-login really is per profile, and an older Identity Center profile with
+// an inline sso_start_url has no session name to group under, so both stay
+// individual entries.
+async function readLoginTargets() {
+  const all = await describeProfiles();
+  const byName = new Map(all.map(profile => [profile.name, profile]));
+
+  const targets = [];
+  const sessions = new Map();
+  const ownerOf = new Map();   // profile name -> the target that signs it in
+
+  all.filter(profile => profile.canLogin).forEach(profile => {
+    if (profile.provider === 'sso' && profile.ssoSession) {
+      const existing = sessions.get(profile.ssoSession);
+      if (existing) {
+        existing.profileCount += 1;
+        ownerOf.set(profile.name, existing);
+        return;
+      }
+
+      const target = {
+        id: `sso-session:${profile.ssoSession}`,
+        label: profile.ssoSession,
+        provider: profile.provider,
+        providerLabel: profile.providerLabel,
+        // the login runs against a profile; any member resolves to the same session
+        profileName: profile.name,
+        profileCount: 1
+      };
+      sessions.set(profile.ssoSession, target);
+      ownerOf.set(profile.name, target);
+      targets.push(target);
+      return;
+    }
+
+    const target = {
+      id: `profile:${profile.name}`,
+      label: profile.name,
+      provider: profile.provider,
+      providerLabel: profile.providerLabel,
+      profileName: profile.name,
+      profileCount: 1,
+      region: profile.region
+    };
+    ownerOf.set(profile.name, target);
+    targets.push(target);
+  });
+
+  // Profiles that assume a role from one of the above are made usable by that
+  // same sign-in — the SDK reads the source profile's freshly written credentials
+  // and calls AssumeRole with them. This is how one aws-azure-login covers a whole
+  // set of accounts, so those profiles belong in the count.
+  all.forEach(profile => {
+    if (ownerOf.has(profile.name)) return;   // signs itself in; already counted
+
+    for (const ancestor of sourceProfileChain(profile.name, byName)) {
+      const target = ownerOf.get(ancestor);
+      if (target) {
+        target.profileCount += 1;
+        break;   // the nearest sign-in wins; anything above it is that one's problem
+      }
+    }
+  });
+
+  return targets.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+// Walk source_profile upwards. Bounded and cycle-guarded: a self-referential or
+// mutually referential pair is a broken config, not a reason to hang.
+function sourceProfileChain(name, byName, maxDepth = 10) {
+  const chain = [];
+  const seen = new Set([name]);
+  let current = byName.get(name);
+
+  while (current && current.sourceProfile && chain.length < maxDepth) {
+    const next = current.sourceProfile;
+    if (seen.has(next)) break;
+
+    seen.add(next);
+    chain.push(next);
+    current = byName.get(next);
+  }
+
+  return chain;
+}
+
+// Start whatever login the profile's provider declares, and remember it so the
+// session can later be refreshed without asking again. Throws when the provider
+// has no login — which is not a failure state, only a thing this cannot do.
+async function runLoginFor(profileName) {
+  const profile = (await describeProfiles()).find(p => p.name === profileName);
+  if (!profile) throw new Error(`Profile "${profileName}" was not found in ~/.aws`);
+
+  const runner = LOGIN_RUNNERS[profile.provider];
+  if (!runner) {
+    throw new Error(`${profile.providerLabel} profiles have no sign-in for Portus to run.`);
+  }
+
+  const result = await runner.run(profile);
+  lastSsoProfile = profileName;
+
+  return { ...result, provider: profile.provider, providerLabel: profile.providerLabel };
 }
 
 // Run aws-azure-login for a profile. Resolves on success, rejects with { error }.
@@ -551,6 +825,110 @@ function runAzureLogin(profileName, timeoutMs = 25000) {
   });
 }
 
+// Run `aws sso login` for an IAM Identity Center profile.
+//
+// Unlike aws-azure-login this is a browser flow: the CLI opens the portal and then
+// blocks until the user approves, so the timeout is minutes rather than seconds.
+// The CLI prints a verification code that AWS asks the user to confirm in the
+// browser; it is forwarded to the renderer as soon as it appears, because a code
+// the user cannot see is a code they cannot check.
+function runSsoLogin(profile, timeoutMs = 180000) {
+  return new Promise((resolve, reject) => {
+    const platform = process.platform;
+
+    // The token is issued per session, so sign in against the session where the
+    // profile names one — that is the unit the cache is keyed on, and it covers
+    // every other profile pointing at the same portal. Profiles carrying an
+    // inline sso_start_url have no session to name and fall back to themselves,
+    // which also keeps this working on AWS CLI older than v2.9.
+    const args = profile.ssoSession
+      ? ['sso', 'login', '--sso-session', profile.ssoSession]
+      : ['sso', 'login', '--profile', profile.name];
+
+    const spawnOptions = platform === 'win32'
+      ? { stdio: 'pipe', shell: true, windowsHide: true }
+      : {
+          stdio: 'pipe',
+          shell: true,
+          env: { ...process.env, PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin' }
+        };
+
+    const proc = spawn('aws', args, spawnOptions);
+
+    let output = '';
+    let errorOutput = '';
+    let codeSent = false;
+    let hasResponded = false;
+
+    const timeout = setTimeout(() => {
+      if (hasResponded) return;
+      hasResponded = true;
+      killProcessTree(proc);
+      reject({
+        success: false,
+        error: `Sign-in timed out after ${Math.round(timeoutMs / 60000)} minutes. The browser approval was not completed.`
+      });
+    }, timeoutMs);
+
+    // AWS prints the pairing code as XXXX-XXXX alongside the verification URL.
+    // Both stdout and stderr are scanned because the CLI has moved it between the
+    // two across versions.
+    const scanForCode = (text) => {
+      if (codeSent) return;
+      const match = text.match(/\b([A-Z0-9]{4}-[A-Z0-9]{4})\b/);
+      if (!match) return;
+
+      codeSent = true;
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('sso-verification', {
+          profileName: profile.name,
+          session: profile.ssoSession || null,
+          code: match[1]
+        });
+      }
+    };
+
+    proc.stdout.on('data', data => {
+      const text = data.toString();
+      output += text;
+      scanForCode(text);
+    });
+    proc.stderr.on('data', data => {
+      const text = data.toString();
+      errorOutput += text;
+      scanForCode(text);
+    });
+
+    proc.on('close', code => {
+      if (hasResponded) return;
+      hasResponded = true;
+      clearTimeout(timeout);
+
+      if (code === 0) {
+        resolve({ success: true, output });
+        return;
+      }
+      reject({
+        success: false,
+        error: `Sign-in failed: ${(errorOutput || output || `aws sso login exited with code ${code}`).trim()}`
+      });
+    });
+
+    proc.on('error', error => {
+      if (hasResponded) return;
+      hasResponded = true;
+      clearTimeout(timeout);
+
+      reject({
+        success: false,
+        error: error.code === 'ENOENT'
+          ? 'The AWS CLI was not found. Install AWS CLI v2 and make sure "aws" is on your PATH.'
+          : `Could not start aws sso login: ${error.message}`
+      });
+    });
+  });
+}
+
 // Read the session expiry that aws-azure-login writes into ~/.aws/credentials.
 // Only the profiles actually in use are considered, in priority order — scanning
 // every section would pick up stale profiles from old logins whose expiry is long
@@ -568,9 +946,8 @@ async function getSessionExpiry(profileNames = []) {
       if (!section || typeof section !== 'object') continue;
 
       for (const key of expiryKeys) {
-        if (!section[key]) continue;
-        const parsed = new Date(section[key]);
-        if (!isNaN(parsed.getTime())) return parsed;
+        const parsed = parseAwsTimestamp(section[key]);
+        if (parsed) return parsed;
       }
     }
 
@@ -578,6 +955,67 @@ async function getSessionExpiry(profileNames = []) {
   } catch (error) {
     return null;
   }
+}
+
+// The AWS CLI writes SSO expiry as "2026-08-04T18:00:00UTC" in some versions and
+// as a normal ISO string in others. Date cannot parse the first, which would read
+// as "no session" and quietly disable the countdown.
+function parseAwsTimestamp(value) {
+  if (!value) return null;
+
+  const normalised = String(value).trim().replace(/UTC$/, 'Z');
+  const parsed = new Date(normalised);
+
+  return isNaN(parsed.getTime()) ? null : parsed;
+}
+
+// Identity Center keeps its token in ~/.aws/sso/cache, not ~/.aws/credentials, so
+// the expiry the status bar shows has to come from there.
+//
+// The filename is a hash of the session name or start URL, which differs by CLI
+// version. Rather than reproduce that, every cache entry is read and matched on
+// the startUrl the profile resolved to — the registration files sitting in the
+// same directory have no startUrl and fall out on their own.
+async function getSsoExpiry(startUrl) {
+  if (!startUrl) return null;
+
+  try {
+    const cacheDir = path.join(os.homedir(), '.aws', 'sso', 'cache');
+    if (!(await fs.pathExists(cacheDir))) return null;
+
+    const files = (await fs.readdir(cacheDir)).filter(name => name.endsWith('.json'));
+    let newest = null;
+
+    for (const file of files) {
+      let entry;
+      try {
+        entry = JSON.parse(await fs.readFile(path.join(cacheDir, file), 'utf8'));
+      } catch (error) {
+        continue;   // a half-written or unrelated file is not a reason to give up
+      }
+
+      if (!entry || entry.startUrl !== startUrl) continue;
+
+      const expiresAt = parseAwsTimestamp(entry.expiresAt);
+      // several tokens can exist for one portal; the newest is the live one
+      if (expiresAt && (!newest || expiresAt > newest)) newest = expiresAt;
+    }
+
+    return newest;
+  } catch (error) {
+    return null;
+  }
+}
+
+// When the session for a profile runs out, whichever store its provider uses.
+async function getExpiryForProfile(profileName) {
+  if (!profileName) return null;
+
+  const profile = (await describeProfiles()).find(p => p.name === profileName);
+  if (!profile) return null;
+
+  if (profile.provider === 'sso') return getSsoExpiry(profile.ssoStartUrl);
+  return getSessionExpiry([profileName]);
 }
 
 // Fetch the SSM-managed instance inventory for a region, keyed by instance id.
@@ -769,155 +1207,35 @@ function setupIpcHandlers() {
   ipcMain.handle('list-tunnels', () => listTunnels());
   ipcMain.handle('close-tunnel', (event, tunnelId) => ({ success: closeTunnel(tunnelId) }));
 
-  // Get Azure AD SSO profiles (for aws-azure-login)
-  ipcMain.handle('get-aws-profiles', async () => {
+  // Every profile in ~/.aws, each tagged with the credential provider it uses.
+  // One list, not two: the old split into "SSO" and "operational" profiles only
+  // ever meant "Azure" and "not Azure", which says nothing to anyone whose
+  // credentials come from somewhere else.
+  ipcMain.handle('get-profiles', async () => {
     try {
-      const awsConfigPath = path.join(os.homedir(), '.aws', 'config');
-      const awsCredentialsPath = path.join(os.homedir(), '.aws', 'credentials');
-
-      let profiles = [];
-
-      try {
-        if (await fs.pathExists(awsConfigPath)) {
-          const configContent = await fs.readFile(awsConfigPath, 'utf8');
-          const config = ini.parse(configContent);
-
-          Object.keys(config).forEach(key => {
-            let profileName;
-            const profileConfig = config[key];
-
-            if (key === 'default') {
-              profileName = 'default';
-            } else if (key.startsWith('profile ')) {
-              profileName = key.replace('profile ', '');
-            } else {
-              return;
-            }
-
-            if (isProfileAzureLoginCompatible(profileConfig)) {
-              profiles.push({
-                name: profileName,
-                region: profileConfig.region || 'us-east-1',
-                source: 'config',
-                azureAppId: profileConfig.azure_app_id_uri || profileConfig.azure_app_id,
-                azureTenant: profileConfig.azure_tenant_id,
-                azureDefaultRole: profileConfig.azure_default_role_arn,
-                ...profileConfig
-              });
-            }
-          });
-        }
-      } catch (configError) {
-        console.error('Error reading AWS config file:', configError);
-      }
-
-      try {
-        if (await fs.pathExists(awsCredentialsPath)) {
-          const credentialsContent = await fs.readFile(awsCredentialsPath, 'utf8');
-          const credentials = ini.parse(credentialsContent);
-
-          Object.keys(credentials).forEach(profileName => {
-            if (!profiles.find(p => p.name === profileName)) {
-              const credProfile = credentials[profileName];
-              if (credProfile.azure_app_id_uri || credProfile.azure_app_id || credProfile.azure_tenant_id) {
-                profiles.push({
-                  name: profileName,
-                  region: credProfile.region || 'us-east-1',
-                  source: 'credentials',
-                  azureAppId: credProfile.azure_app_id_uri || credProfile.azure_app_id,
-                  azureTenant: credProfile.azure_tenant_id,
-                  azureDefaultRole: credProfile.azure_default_role_arn
-                });
-              }
-            }
-          });
-        }
-      } catch (credentialsError) {
-        console.error('Error reading AWS credentials file:', credentialsError);
-      }
-
-      return profiles;
+      return { success: true, data: await readAwsProfiles() };
     } catch (error) {
-      console.error('Error loading AWS profiles:', error);
-      return [];
+      return { success: false, error: `Failed to read ~/.aws: ${error.message}`, data: [] };
     }
   });
 
-  // Get operational (non-SSO) profiles for day-to-day work
-  ipcMain.handle('get-operational-profiles', async () => {
+  // What the sign-in dialog offers: Identity Center grouped by portal session,
+  // everything else per profile.
+  ipcMain.handle('get-login-targets', async () => {
     try {
-      const awsConfigPath = path.join(os.homedir(), '.aws', 'config');
-      const awsCredentialsPath = path.join(os.homedir(), '.aws', 'credentials');
-
-      let profiles = [];
-
-      try {
-        if (await fs.pathExists(awsConfigPath)) {
-          const configContent = await fs.readFile(awsConfigPath, 'utf8');
-          const config = ini.parse(configContent);
-
-          Object.keys(config).forEach(key => {
-            let profileName;
-            const profileConfig = config[key];
-
-            if (key === 'default') {
-              profileName = 'default';
-            } else if (key.startsWith('profile ')) {
-              profileName = key.replace('profile ', '');
-            } else {
-              return;
-            }
-
-            if (!isProfileAzureLoginCompatible(profileConfig)) {
-              profiles.push({
-                name: profileName,
-                region: profileConfig.region || 'us-east-1',
-                source: 'config',
-                ...profileConfig
-              });
-            }
-          });
-        }
-      } catch (configError) {
-        console.error('Error reading AWS config file:', configError);
-      }
-
-      try {
-        if (await fs.pathExists(awsCredentialsPath)) {
-          const credentialsContent = await fs.readFile(awsCredentialsPath, 'utf8');
-          const credentials = ini.parse(credentialsContent);
-
-          Object.keys(credentials).forEach(profileName => {
-            if (!profiles.find(p => p.name === profileName)) {
-              const credProfile = credentials[profileName];
-              const isAzureProfile = !!(credProfile.azure_app_id_uri || credProfile.azure_app_id || credProfile.azure_tenant_id);
-              if (!isAzureProfile) {
-                profiles.push({
-                  name: profileName,
-                  region: credProfile.region || 'us-east-1',
-                  source: 'credentials'
-                });
-              }
-            }
-          });
-        }
-      } catch (credentialsError) {
-        console.error('Error reading AWS credentials file:', credentialsError);
-      }
-
-      return profiles;
+      return { success: true, data: await readLoginTargets() };
     } catch (error) {
-      console.error('Error loading operational profiles:', error);
-      return [];
+      return { success: false, error: `Failed to read ~/.aws: ${error.message}`, data: [] };
     }
   });
 
-  // Azure AD SSO login via aws-azure-login CLI
-  ipcMain.handle('azure-aws-login', async (event, profileName) => {
+  // Start a login for a profile, using whichever runner its provider declares.
+  // Providers with no runner are not an error to select — they simply have
+  // nothing to sign into — so this is only reached from a button that is shown
+  // for loginable profiles.
+  ipcMain.handle('sign-in', async (event, profileName) => {
     try {
-      const result = await runAzureLogin(profileName);
-      lastSsoProfile = profileName;
-      return result;
+      return await runLoginFor(profileName);
     } catch (error) {
       // Rejecting with a plain object crosses IPC as "[object Object]"; an Error
       // carries its message through intact.
@@ -929,8 +1247,23 @@ function setupIpcHandlers() {
   // Checks the operational profile in use first, then the SSO profile that was
   // actually logged in — never unrelated leftover profiles.
   ipcMain.handle('get-session-status', async (event, operationalProfile) => {
-    const candidates = [operationalProfile, lastSsoProfile].filter(Boolean);
-    const expiresAt = candidates.length ? await getSessionExpiry(candidates) : null;
+    // Asked of the selected profile's own provider: Identity Center keeps its
+    // expiry in ~/.aws/sso/cache, everything else in ~/.aws/credentials.
+    let expiresAt = operationalProfile ? await getExpiryForProfile(operationalProfile) : null;
+
+    if (!expiresAt && lastSsoProfile && lastSsoProfile !== operationalProfile) {
+      // The long-standing Azure shape is a plain profile whose credentials were
+      // written by signing in to a *different* one, so its countdown lives under
+      // that other name. Providers that carry their own session are never asked
+      // about someone else's: showing the Azure clock next to a set of access
+      // keys, or next to another org's Identity Center profile, is just wrong.
+      const selected = operationalProfile
+        ? (await describeProfiles()).find(p => p.name === operationalProfile)
+        : null;
+
+      const selfContained = selected && ['sso', 'azure', 'static'].includes(selected.provider);
+      if (!selfContained) expiresAt = await getExpiryForProfile(lastSsoProfile);
+    }
 
     return {
       success: true,
@@ -940,15 +1273,27 @@ function setupIpcHandlers() {
     };
   });
 
-  // Re-run SSO login for the last used profile (silent refresh)
+  // Re-run the login for the last used profile (silent refresh)
   ipcMain.handle('refresh-session', async (event, profileName) => {
     const target = profileName || lastSsoProfile;
     if (!target) {
-      return { success: false, error: 'No SSO profile has been used yet' };
+      return { success: false, error: 'No profile has been signed into yet' };
     }
+
+    // This runs on a timer, so an interactive login is refused rather than
+    // started: opening a browser unannounced is not a silent renewal, and the
+    // user has to be at the keyboard to finish it anyway.
+    const profile = (await describeProfiles()).find(p => p.name === target);
+    if (profile && profile.interactiveLogin) {
+      return {
+        success: false,
+        interactive: true,
+        error: `${profile.providerLabel} sessions cannot be renewed in the background — sign in again when you are ready.`
+      };
+    }
+
     try {
-      await runAzureLogin(target);
-      lastSsoProfile = target;
+      await runLoginFor(target);
       return { success: true, ssoProfile: target };
     } catch (error) {
       return { success: false, error: error.error || error.message || 'Re-authentication failed' };
@@ -974,7 +1319,7 @@ function setupIpcHandlers() {
       }
 
       try {
-        await runAzureLogin(lastSsoProfile);
+        await runLoginFor(lastSsoProfile);
       } catch (loginError) {
         return {
           success: false,
@@ -1106,7 +1451,7 @@ function setupIpcHandlers() {
       }
 
       try {
-        await runAzureLogin(lastSsoProfile);
+        await runLoginFor(lastSsoProfile);
       } catch (loginError) {
         return {
           success: false,

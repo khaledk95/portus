@@ -1,11 +1,12 @@
 class Portus {
     constructor() {
         // auth / profiles
-        this.profiles = [];              // Azure AD SSO profiles
-        this.operationalProfiles = [];   // non-SSO profiles
+        this.profiles = [];              // every profile in ~/.aws, provider-tagged
+        this.loginTargets = [];          // what the sign-in dialog offers, SSO grouped by session
         this.currentProfile = null;
+        this.selectedProfile = null;
         this.selectedAuthProfile = null;
-        this.isLoggedIn = false;
+        this.isLoggedIn = false;         // the current profile's credentials work
 
         // data
         this.instances = [];
@@ -50,6 +51,7 @@ class Portus {
         this.bindCombo();
         this.bindFilters();
         this.bindTunnelEvents();
+        window.electronAPI.onSsoVerification(({ code }) => this.showSsoVerification(code));
 
         await this.applyAppVersion();
         this.checkRequiredTools();
@@ -243,12 +245,85 @@ class Portus {
 
     async loadProfiles() {
         try {
-            this.profiles = await window.electronAPI.getAwsProfiles();
-            this.operationalProfiles = await window.electronAPI.getOperationalProfiles();
+            const result = await window.electronAPI.getProfiles();
+            this.profiles = (result && result.data) || [];
+
+            // What the sign-in dialog offers is not one entry per profile:
+            // Identity Center issues one token per portal session, so those are
+            // grouped. Everything else here is still selectable — its credentials
+            // just come from somewhere Portus does not drive.
+            const targets = await window.electronAPI.getLoginTargets();
+            this.loginTargets = (targets && targets.data) || [];
+
+            if (result && !result.success) this.toast(result.error, 'error');
+
             this.renderComboOptions('');
+            this.updateProfileControls();
         } catch (error) {
             this.toast('Failed to load AWS profiles: ' + error.message, 'error');
         }
+    }
+
+    // Re-read ~/.aws on demand and report what changed, so it is obvious whether
+    // the edit that was just made actually landed.
+    async reloadProfiles() {
+        const before = new Set((this.profiles || []).map(p => p.name));
+
+        this.setBusy(true);
+        try {
+            await this.loadProfiles();
+        } finally {
+            this.setBusy(false);
+        }
+
+        const after = (this.profiles || []).map(p => p.name);
+        const added = after.filter(name => !before.has(name));
+        const removed = [...before].filter(name => !after.includes(name));
+
+        if (added.length) {
+            this.toast(`Found ${added.length === 1 ? added[0] : `${added.length} new profiles`}`, 'success');
+        } else if (removed.length) {
+            this.toast(`${removed.length === 1 ? removed[0] : `${removed.length} profiles`} no longer in ~/.aws`, 'info');
+        } else {
+            this.toast(`No change — ${after.length} profile${after.length === 1 ? '' : 's'}`, 'info');
+        }
+
+        // a profile that vanished cannot stay selected
+        if (this.currentProfile && !after.includes(this.currentProfile)) {
+            this.currentProfile = null;
+            this.selectedProfile = null;
+            this.isLoggedIn = false;
+            const label = document.getElementById('profileComboLabel');
+            label.textContent = 'Select profile';
+            label.classList.add('placeholder');
+            document.getElementById('statusRegion').textContent = '—';
+            this.updateConnection(false);
+        } else if (this.currentProfile) {
+            // its region or provider may have been edited
+            this.selectedProfile = (this.profiles || []).find(p => p.name === this.currentProfile) || null;
+            document.getElementById('statusRegion').textContent =
+                (this.selectedProfile && this.selectedProfile.region) || '—';
+        }
+    }
+
+    // Having nothing to pick from is the only reason to disable the picker — a
+    // sign-in is never a precondition. Likewise the sign-in button: with no
+    // profile that has a login behind it, it is not broken, there is simply
+    // nothing to sign into.
+    updateProfileControls() {
+        const btn = document.getElementById('loginBtn');
+        const trigger = document.getElementById('profileComboTrigger');
+        if (!btn || !trigger) return;
+
+        trigger.disabled = (this.profiles || []).length === 0;
+
+        // It is a sign-in control, so what matters is whether there is anything
+        // to sign into — not whether the current profile happens to be working.
+        const available = (this.loginTargets || []).length > 0;
+        btn.disabled = !available;
+        btn.title = available
+            ? 'Sign in to a profile that supports it'
+            : 'No profile in ~/.aws has a sign-in Portus can run';
     }
 
     bindCombo() {
@@ -262,6 +337,15 @@ class Portus {
         });
 
         search.addEventListener('input', () => this.renderComboOptions(search.value));
+
+        // ~/.aws is read once at startup, so a profile added while Portus is open
+        // was invisible until it was restarted.
+        document.getElementById('profileComboRefresh').addEventListener('mousedown', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            await this.reloadProfiles();
+            this.renderComboOptions(search.value);
+        });
 
         search.addEventListener('keydown', (e) => {
             const count = this.comboMatches.length;
@@ -310,17 +394,19 @@ class Portus {
     renderComboOptions(filter) {
         const list = document.getElementById('profileComboList');
         const foot = document.getElementById('profileComboCount');
-        const all = this.operationalProfiles || [];
+        const all = this.profiles || [];
         const term = (filter || '').trim().toLowerCase();
 
         this.comboMatches = term
-            ? all.filter(p => p.name.toLowerCase().includes(term) || (p.region || '').toLowerCase().includes(term))
+            ? all.filter(p => p.name.toLowerCase().includes(term)
+                || (p.region || '').toLowerCase().includes(term)
+                || (p.providerLabel || '').toLowerCase().includes(term))
             : all.slice();
 
         list.innerHTML = '';
 
         if (!all.length) {
-            list.innerHTML = '<div class="combo-empty">No operational profiles in ~/.aws/config</div>';
+            list.innerHTML = '<div class="combo-empty">No profiles found in ~/.aws</div>';
             foot.textContent = '';
             return;
         }
@@ -340,6 +426,7 @@ class Portus {
             }
             option.innerHTML = `
                 <span class="opt-name">${this.highlight(profile.name, term)}</span>
+                <span class="opt-provider">${this.escapeHtml(profile.providerLabel || '')}</span>
                 <span class="opt-region mono">${this.escapeHtml(profile.region || '')}</span>
                 <i class="fas fa-check opt-check"></i>
             `;
@@ -364,20 +451,23 @@ class Portus {
         if (options[index]) options[index].scrollIntoView({ block: 'nearest' });
     }
 
+    // No sign-in is demanded up front. Most credential types — access keys, an
+    // assumed role, credential_process, an Identity Center token the CLI already
+    // holds — are simply valid, and requiring an Azure login before any of them
+    // could be selected locked out everyone who does not use Azure. If the
+    // credentials turn out to be missing or expired, loadInstances says so and
+    // offers the sign-in, which is the only point at which it is needed.
     chooseProfile(name) {
         this.closeCombo();
-        if (!this.isLoggedIn) {
-            this.toast('Sign in with SSO Connect first', 'error');
-            return;
-        }
 
         this.currentProfile = name;
-        const profile = (this.operationalProfiles || []).find(p => p.name === name);
+        this.selectedProfile = (this.profiles || []).find(p => p.name === name) || null;
 
         const label = document.getElementById('profileComboLabel');
         label.textContent = name;
         label.classList.remove('placeholder');
-        document.getElementById('statusRegion').textContent = (profile && profile.region) || '—';
+        document.getElementById('statusRegion').textContent =
+            (this.selectedProfile && this.selectedProfile.region) || '—';
 
         this.loadInstances();
     }
@@ -386,9 +476,23 @@ class Portus {
     // SSO
     // ==========================================================================
 
+    // Every row says how many profiles that one sign-in makes usable: the profiles
+    // it signs in directly, plus any that assume a role from those via
+    // source_profile, since one login covers the whole chain.
+    describeLoginTarget(target) {
+        const count = target.profileCount || 1;
+        const label = target.providerLabel || '';
+
+        return `${label} · ${count} profile${count === 1 ? '' : 's'}`;
+    }
+
     openSsoDialog() {
-        if (!this.profiles.length) {
-            this.toast('No aws-azure-login compatible profiles found in ~/.aws/config', 'warning');
+        const loginable = this.loginTargets || [];
+
+        if (!loginable.length) {
+            this.toast((this.profiles || []).length
+                ? 'None of your profiles have a sign-in Portus can run — pick one and it will use the credentials you already have'
+                : 'No profiles found in ~/.aws', 'info');
             return;
         }
 
@@ -397,44 +501,107 @@ class Portus {
         overlay.innerHTML = `
             <div class="dialog">
                 <div class="dialog-head">
-                    <h3>Sign in with Azure AD</h3>
-                    <button type="button" class="icon-btn" data-close><i class="fas fa-times"></i></button>
+                    <h3>Sign in</h3>
+                    <div class="head-actions">
+                        <button type="button" class="link-btn" id="signInRefresh"
+                                title="Re-read ~/.aws/config and ~/.aws/credentials">
+                            <i class="fas fa-rotate"></i> Refresh
+                        </button>
+                        <button type="button" class="icon-btn" data-close><i class="fas fa-times"></i></button>
+                    </div>
                 </div>
                 <div class="dialog-body">
-                    <p class="dialog-note">Only profiles configured for aws-azure-login are listed.</p>
-                    <div class="profile-list">
-                        ${this.profiles.map(p => `
-                            <div class="profile-item" tabindex="0" data-profile="${this.escapeHtml(p.name)}">
-                                <i class="fas fa-key dim"></i>
-                                <div class="pi-body">
-                                    <div class="pi-name">${this.escapeHtml(p.name)}</div>
-                                    <div class="pi-meta mono">${this.escapeHtml(p.region || '')}</div>
-                                </div>
-                                <i class="fas fa-chevron-right dim"></i>
-                            </div>
-                        `).join('')}
-                    </div>
+                    <p class="dialog-note">
+                        Profiles whose sign-in Portus can start. Every other profile can be
+                        selected directly — its credentials are resolved by the AWS CLI.
+                    </p>
+                    <div class="profile-list" id="signInList"></div>
                 </div>
             </div>
         `;
         document.body.appendChild(overlay);
 
         const close = () => overlay.remove();
-        overlay.querySelector('[data-close]').addEventListener('click', close);
+        overlay.querySelectorAll('[data-close]').forEach(el => el.addEventListener('click', close));
         overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
-        overlay.querySelectorAll('.profile-item').forEach(item => {
-            const go = () => { close(); this.authenticate(item.dataset.profile); };
-            item.addEventListener('click', go);
-            item.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+        // Redrawn in place rather than reopened, so a refresh does not throw away
+        // the dialog the user is looking at.
+        const renderList = () => {
+            const list = overlay.querySelector('#signInList');
+            const targets = this.loginTargets || [];
+
+            if (!targets.length) {
+                list.innerHTML = '<div class="combo-empty">No profile in ~/.aws has a sign-in Portus can run</div>';
+                return;
+            }
+
+            list.innerHTML = targets.map(target => `
+                <div class="profile-item" tabindex="0" data-profile="${this.escapeHtml(target.profileName)}">
+                    <i class="fas fa-key dim"></i>
+                    <div class="pi-body">
+                        <div class="pi-name">${this.escapeHtml(target.label)}</div>
+                        <div class="pi-meta mono">${this.escapeHtml(this.describeLoginTarget(target))}</div>
+                    </div>
+                    <i class="fas fa-chevron-right dim"></i>
+                </div>
+            `).join('');
+
+            list.querySelectorAll('.profile-item').forEach(item => {
+                const go = () => { close(); this.authenticate(item.dataset.profile); };
+                item.addEventListener('click', go);
+                item.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+                });
             });
+        };
+
+        overlay.querySelector('#signInRefresh').addEventListener('click', async () => {
+            await this.reloadProfiles();
+            if (!overlay.isConnected) return;   // closed while reading
+            renderList();
         });
+
+        renderList();
 
         setTimeout(() => {
             const first = overlay.querySelector('.profile-item');
             if (first) first.focus();
         }, 50);
+    }
+
+    // Identity Center asks the user to confirm a pairing code in the browser. It
+    // is only useful if they can see it here to compare, so it stays on screen
+    // until the sign-in finishes one way or the other.
+    showSsoVerification(code) {
+        this.dismissSsoVerification();
+
+        const overlay = document.createElement('div');
+        overlay.className = 'overlay';
+        overlay.id = 'ssoVerifyOverlay';
+        overlay.innerHTML = `
+            <div class="dialog">
+                <div class="dialog-head"><h3>Confirm the sign-in</h3></div>
+                <div class="dialog-body">
+                    <p class="dialog-note">
+                        Your browser is opening the AWS access portal. Check that it shows
+                        this code, then approve the request.
+                    </p>
+                    <div class="verify-code mono">${this.escapeHtml(code)}</div>
+                    <div class="hint">
+                        <i class="fas fa-circle-info"></i>
+                        <span>If no browser opened, run <span class="mono">aws sso login</span>
+                              in a terminal — this window closes on its own when you are done.</span>
+                    </div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+    }
+
+    dismissSsoVerification() {
+        const existing = document.getElementById('ssoVerifyOverlay');
+        if (existing) existing.remove();
     }
 
     async authenticate(profileName) {
@@ -448,11 +615,15 @@ class Portus {
         this.toast(`Authenticating with ${profileName}…`, 'info');
 
         try {
-            await window.electronAPI.azureAwsLogin(profileName);
+            const result = await window.electronAPI.signIn(profileName);
             this.isLoggedIn = true;
             this.updateConnection(true, profileName);
             this.startSessionWatcher();
-            this.toast('Signed in', 'success');
+            this.toast(`Signed in with ${(result && result.providerLabel) || 'AWS'}`, 'success');
+
+            // Signing in does not pick a profile; if one is already selected its
+            // credentials have just changed, so reload against them.
+            if (this.currentProfile) this.loadInstances();
         } catch (error) {
             this.isLoggedIn = false;
             this.selectedAuthProfile = null;
@@ -460,6 +631,7 @@ class Portus {
             btn.innerHTML = original;
             this.toast(`Authentication failed: ${error.error || error.message}`, 'error');
         } finally {
+            this.dismissSsoVerification();
             this.setBusy(false);
             btn.disabled = false;
         }
@@ -470,25 +642,31 @@ class Portus {
         const text = document.getElementById('statusText');
         const sso = document.getElementById('statusSso');
         const btn = document.getElementById('loginBtn');
-        const trigger = document.getElementById('profileComboTrigger');
         const search = document.getElementById('searchInput');
         const refresh = document.getElementById('refreshBtn');
 
+        const provider = this.selectedProfile && this.selectedProfile.providerLabel;
+        const shown = profileName || this.currentProfile || this.selectedAuthProfile || '';
+
         dot.className = `dot ${connected ? 'ok' : 'off'}`;
-        text.textContent = connected ? 'Connected' : 'Disconnected';
-        sso.textContent = connected ? `SSO ${profileName || this.selectedAuthProfile || ''}` : 'Not signed in';
+        text.textContent = connected ? 'Connected' : 'Not connected';
+        sso.textContent = connected && shown
+            ? (provider ? `${provider} · ${shown}` : shown)
+            : 'No profile selected';
 
         btn.classList.toggle('connected', connected);
         btn.innerHTML = connected
             ? '<i class="fas fa-check"></i> <span>Signed in</span>'
-            : '<i class="fas fa-right-to-bracket"></i> <span>SSO Connect</span>';
+            : '<i class="fas fa-right-to-bracket"></i> <span>Sign in</span>';
 
-        trigger.disabled = !connected;
-        search.disabled = !connected;
-        refresh.disabled = !connected || !this.currentProfile;
+        // The picker is never gated on a sign-in. Whether a profile works is
+        // decided by the first API call, not by whether an interactive login has
+        // happened, because most credential types never have one.
+        this.updateProfileControls();
+        search.disabled = !this.currentProfile;
+        refresh.disabled = !this.currentProfile;
 
         if (!connected) {
-            this.closeCombo();
             document.getElementById('sessionMeter').style.display = 'none';
             document.getElementById('statusRenew').style.display = 'none';
             document.getElementById('statusRenewSep').style.display = 'none';
@@ -512,11 +690,12 @@ class Portus {
             const result = await window.electronAPI.getEc2Instances(this.currentProfile);
 
             if (result && result.success) {
-                if (result.reauthenticated) {
-                    this.isLoggedIn = true;
-                    this.updateConnection(true, this.selectedAuthProfile);
-                    this.startSessionWatcher();
-                }
+                // A successful call is the proof that the profile works, whatever
+                // its credentials came from. Nothing else marks the app connected.
+                this.isLoggedIn = true;
+                this.updateConnection(true, this.currentProfile);
+                this.startSessionWatcher();
+
                 this.instances = result.data || [];
                 this.selectedInstanceId = null;
                 this.renderInstances();
@@ -534,8 +713,10 @@ class Portus {
             throw new Error(result?.error || 'No data returned');
         } catch (error) {
             const message = error.message || error.error || 'Unknown error';
+            this.isLoggedIn = false;
             this.instances = [];
             this.renderInstances();
+            this.updateConnection(false);
             this.setInstanceEmpty(message, 'fa-triangle-exclamation');
             this.toast(`Failed to load instances: ${message}`, 'error');
         } finally {
@@ -575,7 +756,7 @@ class Portus {
         if (!this.instances.length) {
             this.setInstanceEmpty(
                 this.currentProfile ? 'No instances found in this profile and region.'
-                                    : 'Sign in and choose a profile to list instances.',
+                                    : 'Choose a profile to list instances.',
                 'fa-server'
             );
             this.renderDetail(null);
@@ -1417,6 +1598,14 @@ class Portus {
             if (this.lastRefreshAt && Date.now() - this.lastRefreshAt < COOLDOWN) return;
             if (status.expiresInMs > 3 * 60 * 1000) return;
 
+            // A login that needs a browser is not something to start on a timer.
+            // Say the session is about to lapse and leave the choice to the user.
+            if (this.selectedProfile && this.selectedProfile.interactiveLogin) {
+                this.lastRefreshAt = Date.now();
+                this.toast('This session expires shortly — sign in again to keep working', 'warning');
+                return;
+            }
+
             this.isRefreshingSession = true;
             this.lastRefreshAt = Date.now();
             const result = await window.electronAPI.refreshSession();
@@ -1454,7 +1643,13 @@ class Portus {
         this.isLoggedIn = false;
         this.stopSessionWatcher();
         this.updateConnection(false);
-        this.toast(message || 'Your AWS session expired. Sign in again.', 'warning');
+
+        // Telling someone to sign in again is only useful advice when there is a
+        // sign-in to run. Expired access keys are replaced in ~/.aws, not here.
+        const canSignIn = this.selectedProfile && this.selectedProfile.canLogin;
+        this.toast(message || (canSignIn
+            ? 'Your AWS session expired. Sign in again.'
+            : 'The credentials for this profile are no longer valid. Refresh them and try again.'), 'warning');
     }
 
     // ==========================================================================
