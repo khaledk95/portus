@@ -154,6 +154,23 @@ const release = (tag, body) => ({
     (await openReleasePage({}, { toString: () => 'https://github.com/khaledk95/portus/releases' })).success === false
       && opened.length === 0);
 
+  // ---------------------------------------------------------------------------
+  suite.section('nothing here depends on build config that is not shipped');
+  // electron-builder strips the build block from the packaged package.json. The
+  // first version of this feature read build.publish for the owner and repo, so
+  // it threw in every installed copy while working perfectly in the source tree
+  // — which is where both the tests and a hand-written probe had been looking.
+  const source = require('fs').readFileSync(
+    require('path').join(__dirname, '..', 'src', 'main.js'), 'utf8');
+
+  suite.check('main.js never reads .build at runtime',
+    !/require\([^)]*package\.json[^)]*\)\s*\.\s*build/.test(source)
+      && !/\.build\.publish/.test(source),
+    (source.match(/.*\.build\.publish.*/) || [])[0]);
+
+  suite.check('the owner and repo are compiled in',
+    /const GITHUB_OWNER = 'khaledk95'/.test(source) && /const GITHUB_REPO = 'portus'/.test(source));
+
   suite.done();
 })();
 

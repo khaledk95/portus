@@ -211,6 +211,16 @@ function describeDeniedAction(error) {
 
 const UPDATE_CHECK_TIMEOUT_MS = 5000;
 
+// Deliberately constants rather than read from package.json's build.publish.
+// electron-builder strips the build block when it packages the app — it is build
+// configuration, not runtime data — so build.publish is present in development
+// and undefined in every installed copy. Reading it there threw before the first
+// request was made, which is why v2.3.0 shipped an update check that could never
+// report an update, and why nothing caught it: the source tree still had the key.
+const GITHUB_OWNER = 'khaledk95';
+const GITHUB_REPO = 'portus';
+const RELEASES_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases`;
+
 // Compares two dot-separated versions. Anything after a dash — 2.3.0-beta.1 —
 // is ignored rather than half-understood; releases/latest excludes prereleases,
 // so it should never arrive in the first place.
@@ -272,8 +282,7 @@ function fetchLatestRelease(owner, repo) {
 // all mean the same thing: no notification this time.
 async function checkForNewRelease() {
   try {
-    const publish = require(path.join(__dirname, '..', 'package.json')).build.publish;
-    const release = await fetchLatestRelease(publish.owner, publish.repo);
+    const release = await fetchLatestRelease(GITHUB_OWNER, GITHUB_REPO);
 
     const latest = String(release.tag_name || '').replace(/^v/, '');
     const current = app.getVersion();
@@ -289,8 +298,8 @@ async function checkForNewRelease() {
       // Rendered as text by the renderer, never as markup — this string comes
       // over the network.
       notes: String(release.body || '').trim(),
-      url: release.html_url || `https://github.com/${publish.owner}/${publish.repo}/releases`,
-      releasesUrl: `https://github.com/${publish.owner}/${publish.repo}/releases`
+      url: release.html_url || RELEASES_URL,
+      releasesUrl: RELEASES_URL
     };
   } catch (error) {
     return { available: false, error: error.message };
@@ -1354,10 +1363,7 @@ function setupIpcHandlers() {
   // anything that is not an https URL on the project's own release pages. A
   // renderer bug should not be able to launch arbitrary things.
   ipcMain.handle('open-release-page', (event, url) => {
-    const publish = require(path.join(__dirname, '..', 'package.json')).build.publish;
-    const allowedPrefix = `https://github.com/${publish.owner}/${publish.repo}/releases`;
-
-    if (typeof url !== 'string' || !url.startsWith(allowedPrefix)) {
+    if (typeof url !== 'string' || !url.startsWith(RELEASES_URL)) {
       return { success: false, error: 'Refused to open a link outside the project releases page.' };
     }
 
