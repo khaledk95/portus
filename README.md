@@ -200,7 +200,7 @@ can Portus, because it hands the profile name to the same SDK the CLI uses.
 | **Identity Center** | `sso_session` or `sso_start_url` | yes — runs `aws sso login --sso-session <name>`, your browser opens and Portus shows the pairing code to confirm |
 | **Azure AD** | any `azure_*` field | yes, runs `aws-azure-login` |
 | **Credential process** | `credential_process` | none needed |
-| **Assume role** | `role_arn` | none needed |
+| **Assume role** | `role_arn` | none needed — with `mfa_serial`, Portus asks for the code when it needs one |
 | **Access keys** | `aws_access_key_id` | none needed, they do not expire |
 
 Environment credentials (`AWS_ACCESS_KEY_ID`, an EC2 instance role) work too.
@@ -283,6 +283,22 @@ Portus merges both files per profile, so the region can live in either.
 **Environment credentials** need no configuration at all: if `AWS_ACCESS_KEY_ID`
 and `AWS_SECRET_ACCESS_KEY` are exported, or Portus is running on an EC2 instance
 with an instance role, the SDK picks them up for the `default` profile.
+
+**Assume role with MFA** works too. A profile with `mfa_serial` cannot produce
+credentials until a six-digit code is entered, so Portus asks for one when a call
+needs it:
+
+```ini
+[profile prod]
+role_arn   = arn:aws:iam::123456789012:role/Admin
+source_profile = keys
+mfa_serial = arn:aws:iam::123456789012:mfa/you
+region = me-central-1
+```
+
+The code is asked for once. The credentials it produces are reused until they
+expire, and are handed to the AWS CLI directly so a tunnel never stops to ask
+again on a prompt you cannot see.
 
 > Tip: whatever the provider, the profile should already work from your terminal —
 > `aws sts get-caller-identity --profile <name>` — before you rely on it in the app.
@@ -410,6 +426,7 @@ All builds output to the `dist/` folder (git-ignored).
 │   ├── providers.test.js  # Credential providers, sign-in routing, session expiry
 │   ├── endpoints.test.js  # RDS / Aurora / ElastiCache discovery
 │   ├── injection.test.js  # Nothing hostile reaches a shell command
+│   ├── mfa.test.js        # mfa_serial prompting, caching and cancellation
 │   └── run.js           # Runs every suite, one process each
 ├── .github/workflows/
 │   ├── ci.yml           # Runs the tests on every push and pull request
@@ -468,6 +485,7 @@ ie4uinit.exe -show
 | Sign-in button disabled | No profile in `~/.aws` has a login Portus can run. Pick a profile directly instead — its credentials are used as-is |
 | `aws sso login` sign-in times out | The browser approval was not completed within 3 minutes. If no browser opened, run `aws sso login --profile <name>` in a terminal once |
 | Session countdown missing on an Identity Center profile | The cached token in `~/.aws/sso/cache` has no entry for that portal yet — sign in once and it appears |
+| Asked for an MFA code again sooner than expected | The credentials from the last code expired. Role sessions are an hour by default; raise `duration_seconds` on the profile if that is too often |
 | No profiles in the dropdown | Nothing readable in `~/.aws/config` or `~/.aws/credentials` |
 | A profile you just added is missing | Click **Refresh** in the dropdown (or in the Sign in dialog) — `~/.aws` is otherwise only read at startup |
 | App icon not updating (Windows) | Stale icon cache — run `ie4uinit.exe -show` or reinstall to a new path |

@@ -26,12 +26,138 @@ let mainWindow;
 // Last Azure AD SSO profile used for a successful login — enables silent re-auth
 let lastSsoProfile = null;
 
+// ============================================================================
+// MULTI-FACTOR AUTHENTICATION
+// ============================================================================
+//
+// A profile carrying mfa_serial cannot produce credentials until someone types a
+// six-digit code. Nothing in a desktop app can do that on its own, so the request
+// is forwarded to the renderer and the answer handed back to the SDK.
+//
+// Without this the AWS CLI still asks — but it asks on a stdin that is piped to
+// nothing, so a port forward sat for thirty seconds and then blamed Systems
+// Manager for a problem that was never there.
+
+let mfaRequestSequence = 0;
+const pendingMfaRequests = new Map();
+
+// Two minutes: long enough to unlock a phone and read a code, short enough that a
+// dialog nobody answered does not hold an AWS call open forever.
+const MFA_PROMPT_TIMEOUT_MS = 120000;
+
+// The device serial the SDK passes in is an ARN naming the account and the user.
+// It is not forwarded: the dialog asks for a code, and knowing which authenticator
+// entry to open is something only the person holding the phone can do anyway.
+function askRendererForMfaCode(profileName) {
+  return new Promise((resolve, reject) => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      reject(new Error(`Profile "${profileName}" requires an MFA code and there is no window to ask in.`));
+      return;
+    }
+
+    const id = `mfa-${++mfaRequestSequence}`;
+
+    const timer = setTimeout(() => {
+      pendingMfaRequests.delete(id);
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('mfa-cancelled', { id });
+      reject(new Error('No MFA code was entered in time.'));
+    }, MFA_PROMPT_TIMEOUT_MS);
+
+    pendingMfaRequests.set(id, { resolve, reject, timer });
+    mainWindow.webContents.send('mfa-required', { id, profileName });
+  });
+}
+
+function settleMfaRequest(id, code) {
+  const pending = pendingMfaRequests.get(id);
+  if (!pending) return false;
+
+  clearTimeout(pending.timer);
+  pendingMfaRequests.delete(id);
+
+  if (code) pending.resolve(code);
+  else pending.reject(new Error('MFA code entry was cancelled.'));
+
+  return true;
+}
+
+// Credentials resolved after an MFA prompt, kept until they expire.
+//
+// This cache exists only for profiles that need a code. The SDK provider is
+// rebuilt for every client, so without it the user would be asked again for the
+// instance list, again for the SSM inventory, and again for every refresh.
+const mfaCredentialCache = new Map();
+
+// A minute of headroom, so credentials are not handed to a tunnel that outlives them
+const MFA_CREDENTIAL_SKEW_MS = 60000;
+
+function cachedMfaCredentials(profileName) {
+  const entry = mfaCredentialCache.get(profileName);
+  if (!entry) return null;
+
+  if (entry.expiration && entry.expiration.getTime() - Date.now() < MFA_CREDENTIAL_SKEW_MS) {
+    mfaCredentialCache.delete(profileName);
+    return null;
+  }
+
+  return entry;
+}
+
 // IMPORTANT: the AWS SDK caches ~/.aws/config and ~/.aws/credentials in-process
 // (@smithy/shared-ini-file-loader slurpFile keeps a module-level promise hash).
 // aws-azure-login rewrites those files on every login, so without ignoreCache the
 // app keeps using stale/expired credentials until the process restarts.
+//
+// Resolved credentials are deliberately NOT cached for ordinary profiles, for the
+// same reason: a fresh login has to take effect immediately. Only the MFA case
+// caches, because there the alternative is prompting on every single call.
 function awsCredentials(profileName) {
-  return fromIni({ profile: profileName, ignoreCache: true });
+  return async () => {
+    const cached = cachedMfaCredentials(profileName);
+    if (cached) return cached.credentials;
+
+    const profile = await findProfile(profileName);
+    const needsMfa = !!(profile && profile.mfaSerial);
+
+    const credentials = await fromIni({
+      profile: profileName,
+      ignoreCache: true,
+      ...(needsMfa ? { mfaCodeProvider: () => askRendererForMfaCode(profileName) } : {})
+    })();
+
+    if (needsMfa) {
+      mfaCredentialCache.set(profileName, {
+        credentials,
+        expiration: credentials.expiration ? new Date(credentials.expiration) : null
+      });
+    }
+
+    return credentials;
+  };
+}
+
+// The AWS CLI would prompt for the code itself, on a stdin nothing is attached to.
+// For an MFA profile the credentials are resolved here instead — asking once, in a
+// window the user can see — and passed to the CLI through the environment, so it
+// has nothing left to ask for.
+async function cliCredentialEnv(profileName) {
+  const profile = await findProfile(profileName);
+  if (!profile || !profile.mfaSerial) return null;
+
+  const credentials = await awsCredentials(profileName)();
+
+  return {
+    AWS_ACCESS_KEY_ID: credentials.accessKeyId,
+    AWS_SECRET_ACCESS_KEY: credentials.secretAccessKey,
+    ...(credentials.sessionToken ? { AWS_SESSION_TOKEN: credentials.sessionToken } : {})
+  };
+}
+
+// "…requires MFA" is not "your session expired": signing in again fixes the second
+// and does nothing for the first.
+function isMfaError(error) {
+  if (!error) return false;
+  return /MFA|multi-?factor|TokenCode|mfa_serial/i.test(`${error.name || ''} ${error.message || ''}`);
 }
 
 // Errors that mean "the AWS session is no longer valid" (vs. a real API failure)
@@ -338,20 +464,26 @@ async function launchRdpClient(tunnelId, localPort) {
 
 // Shared tunnel launcher for port forwarding. Resolves once the CLI reports the
 // listener is up, or with an error; never rejects, so the message survives IPC.
-function startSsmTunnel({ ssmCommand, kind, instanceId, instanceName, profileName, localPort, remoteHost, remotePort }) {
+function startSsmTunnel({ ssmCommand, kind, instanceId, instanceName, profileName, localPort, remoteHost, remotePort, credentialEnv }) {
   return new Promise(resolve => {
     const platform = process.platform;
     let established = false;
     let tunnelId = null;
     let stderrText = '';
 
+    // credentialEnv is set only for a profile needing MFA, where the code has
+    // already been entered and the credentials resolved here. Handing them over
+    // this way leaves the CLI with nothing to prompt for on a stdin it cannot
+    // reach — which is what used to stall the tunnel for thirty seconds.
+    const env = { ...process.env, ...(credentialEnv || {}) };
+
     // shell:true on Windows is required: it is what makes Node pass the command
     // line through verbatim, so the quotes around --parameters survive.
     const proc = platform === 'win32'
-      ? spawn('cmd', ['/c', ssmCommand], { stdio: 'pipe', shell: true, windowsHide: true })
+      ? spawn('cmd', ['/c', ssmCommand], { stdio: 'pipe', shell: true, windowsHide: true, env })
       : spawn('bash', ['-c', `exec ${ssmCommand}`], {
           stdio: 'pipe',
-          env: { ...process.env, PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin' }
+          env: { ...env, PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin' }
         });
 
     proc.stdout.on('data', data => {
@@ -630,6 +762,9 @@ async function describeProfiles() {
         providerLabel: provider.label,
         canLogin: Object.prototype.hasOwnProperty.call(LOGIN_RUNNERS, provider.id),
         interactiveLogin: !!(LOGIN_RUNNERS[provider.id] && LOGIN_RUNNERS[provider.id].interactive),
+        // the device AWS wants a code from before it will assume the role
+        mfaSerial: settings.mfa_serial || null,
+        requiresMfa: !!settings.mfa_serial,
         // the profile this one assumes a role from; a sign-in to that profile is
         // what makes this one work
         sourceProfile: settings.source_profile || null,
@@ -643,13 +778,20 @@ async function describeProfiles() {
 
 // The IPC-facing view. ssoStartUrl names the organisation's sign-in portal, so it
 // stays in the main process — the dropdown only ever needs a name and a region.
+// requiresMfa crosses as a boolean; mfaSerial itself is an ARN naming the user and
+// account, and the dialog only needs to know that a code is wanted.
 const PROFILE_FIELDS_FOR_RENDERER = [
-  'name', 'region', 'source', 'provider', 'providerLabel', 'canLogin', 'interactiveLogin'
+  'name', 'region', 'source', 'provider', 'providerLabel', 'canLogin', 'interactiveLogin', 'requiresMfa'
 ];
 
 async function readAwsProfiles() {
   return (await describeProfiles()).map(profile =>
     Object.fromEntries(PROFILE_FIELDS_FOR_RENDERER.map(key => [key, profile[key]])));
+}
+
+async function findProfile(profileName) {
+  if (!profileName) return null;
+  return (await describeProfiles()).find(profile => profile.name === profileName) || null;
 }
 
 // What the sign-in dialog offers — which is not the same as the profile list.
@@ -1179,10 +1321,21 @@ function setupIpcHandlers() {
       ? `host=${targetHost},portNumber=${targetPort},localPortNumber=${resolvedLocalPort}`
       : `portNumber=${targetPort},localPortNumber=${resolvedLocalPort}`;
 
-    const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name ${documentName} --parameters "${parameters}" --profile ${profileName} --region ${profileConfig.region}`;
+    // With credentials in the environment the CLI must not also be pointed at the
+    // profile, or it resolves that profile itself and asks for the code again.
+    let credentialEnv;
+    try {
+      credentialEnv = await cliCredentialEnv(profileName);
+    } catch (error) {
+      return { success: false, error: `Could not get credentials for ${profileName}: ${error.message}` };
+    }
+
+    const profileFlag = credentialEnv ? '' : ` --profile ${profileName}`;
+    const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name ${documentName} --parameters "${parameters}"${profileFlag} --region ${profileConfig.region}`;
 
     const result = await startSsmTunnel({
       ssmCommand,
+      credentialEnv,
       kind: 'port',
       instanceId,
       instanceName,
@@ -1217,6 +1370,14 @@ function setupIpcHandlers() {
     } catch (error) {
       return { success: false, error: `Failed to read ~/.aws: ${error.message}`, data: [] };
     }
+  });
+
+  // The answer to an mfa-required message. Returns whether anything was still
+  // waiting for it, so a dialog left open after the request timed out says so
+  // rather than appearing to succeed.
+  ipcMain.handle('submit-mfa-code', (event, { id, code } = {}) => {
+    const trimmed = (code || '').trim();
+    return { success: settleMfaRequest(id, trimmed || null) };
   });
 
   // What the sign-in dialog offers: Identity Center grouped by portal session,
@@ -1306,6 +1467,11 @@ function setupIpcHandlers() {
     try {
       return await describeInstances(profileName);
     } catch (error) {
+      // An MFA failure looks like a credentials failure to isCredentialsError, but
+      // re-running a sign-in cannot supply a code — it is reported as itself.
+      if (isMfaError(error)) {
+        return { success: false, mfaRequired: true, error: error.message };
+      }
       if (!isCredentialsError(error)) {
         return { success: false, error: `Failed to get EC2 instances: ${error.message}` };
       }
@@ -1438,6 +1604,9 @@ function setupIpcHandlers() {
     try {
       return await describeEndpoints(profileName);
     } catch (error) {
+      if (isMfaError(error)) {
+        return { success: false, mfaRequired: true, error: error.message };
+      }
       if (!isCredentialsError(error)) {
         return { success: false, error: `Failed to list endpoints: ${error.message}` };
       }
@@ -1757,10 +1926,19 @@ function setupIpcHandlers() {
 
     const profileConfig = await getProfileConfig(profileName);
 
-    const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=3389,localPortNumber=${localPort}" --profile ${profileName} --region ${profileConfig.region}`;
+    let credentialEnv;
+    try {
+      credentialEnv = await cliCredentialEnv(profileName);
+    } catch (error) {
+      return { success: false, error: `Could not get credentials for ${profileName}: ${error.message}` };
+    }
+
+    const profileFlag = credentialEnv ? '' : ` --profile ${profileName}`;
+    const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=3389,localPortNumber=${localPort}"${profileFlag} --region ${profileConfig.region}`;
 
     const result = await startSsmTunnel({
       ssmCommand,
+      credentialEnv,
       kind: 'rdp',
       instanceId,
       instanceName,

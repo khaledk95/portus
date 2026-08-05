@@ -102,8 +102,10 @@ function loadMain(options = {}) {
     },
 
     child_process: {
-      spawn: (command, args) => {
-        state.spawns.push({ command, args });
+      spawn: (command, args, options) => {
+        // options matters: it carries the environment credentials are passed
+        // through, and the shell:true that Windows quoting depends on
+        state.spawns.push({ command, args, options });
 
         const reply = onSpawn({ command, args }) || {};
         const proc = new EventEmitter();

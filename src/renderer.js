@@ -52,6 +52,8 @@ class Portus {
         this.bindFilters();
         this.bindTunnelEvents();
         window.electronAPI.onSsoVerification(({ code }) => this.showSsoVerification(code));
+        window.electronAPI.onMfaRequired(request => this.showMfaPrompt(request));
+        window.electronAPI.onMfaCancelled(({ id }) => this.dismissMfaPrompt(id));
 
         await this.applyAppVersion();
         this.checkRequiredTools();
@@ -602,6 +604,77 @@ class Portus {
     dismissSsoVerification() {
         const existing = document.getElementById('ssoVerifyOverlay');
         if (existing) existing.remove();
+    }
+
+    // A profile with mfa_serial cannot produce credentials until the code is
+    // entered, and the AWS call that triggered this is waiting on the answer.
+    // Cancelling is a real outcome, so the dialog always sends one back.
+    showMfaPrompt({ id, profileName }) {
+        this.dismissMfaPrompt();
+
+        const overlay = document.createElement('div');
+        overlay.className = 'overlay';
+        overlay.id = 'mfaOverlay';
+        overlay.dataset.requestId = id;
+        overlay.innerHTML = `
+            <div class="dialog">
+                <div class="dialog-head"><h3>Multi-factor authentication</h3></div>
+                <div class="dialog-body">
+                    <p class="dialog-note">
+                        <strong>${this.escapeHtml(profileName)}</strong> needs a code from your
+                        authenticator before AWS will issue credentials for it.
+                    </p>
+                    <div class="field">
+                        <label class="field-label" for="mfaCode">Code</label>
+                        <input class="input mono mfa-input" id="mfaCode" inputmode="numeric"
+                               autocomplete="one-time-code" maxlength="6" placeholder="000000"
+                               spellcheck="false">
+                    </div>
+                    <div class="hint">
+                        <i class="fas fa-circle-info"></i>
+                        <span>Entered once — the credentials it produces are reused until they expire.</span>
+                    </div>
+                </div>
+                <div class="dialog-foot">
+                    <button type="button" class="btn" data-cancel>Cancel</button>
+                    <button type="button" class="btn btn-primary" id="mfaSubmit" disabled>Continue</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        const input = overlay.querySelector('#mfaCode');
+        const submit = overlay.querySelector('#mfaSubmit');
+
+        let answered = false;
+        const answer = async (code) => {
+            if (answered) return;
+            answered = true;
+            overlay.remove();
+            await window.electronAPI.submitMfaCode(id, code);
+        };
+
+        // Six digits, nothing else — a pasted code often arrives with a space
+        input.addEventListener('input', () => {
+            input.value = input.value.replace(/\D/g, '').slice(0, 6);
+            submit.disabled = input.value.length !== 6;
+        });
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && input.value.length === 6) { e.preventDefault(); answer(input.value); }
+            if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); answer(null); }
+        });
+
+        submit.addEventListener('click', () => answer(input.value));
+        overlay.querySelector('[data-cancel]').addEventListener('click', () => answer(null));
+
+        setTimeout(() => input.focus(), 50);
+    }
+
+    dismissMfaPrompt(id) {
+        const existing = document.getElementById('mfaOverlay');
+        if (!existing) return;
+        if (id && existing.dataset.requestId !== id) return;
+        existing.remove();
     }
 
     async authenticate(profileName) {

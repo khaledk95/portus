@@ -161,8 +161,13 @@ const setConfig = (config, credentials) => {
     !JSON.stringify(listed.data).includes('awsapps.com'));
   suite.check('only the whitelisted fields are returned',
     (listed.data || []).every(profile => Object.keys(profile).sort().join(',')
-      === 'canLogin,interactiveLogin,name,provider,providerLabel,region,source'),
+      === 'canLogin,interactiveLogin,name,provider,providerLabel,region,requiresMfa,source'),
     Object.keys(listed.data[0] || {}));
+  suite.check('the MFA device ARN itself never crosses',
+    !JSON.stringify(listed.data).includes('mfa/alice'));
+  suite.check('but the fact that a code is needed does',
+    byName['mfa-assumed'].requiresMfa === true && byName.assumed.requiresMfa === false,
+    { mfa: byName['mfa-assumed'].requiresMfa, plain: byName.assumed.requiresMfa });
 
   // ---------------------------------------------------------------------------
   suite.section('the sign-in list groups by what one login covers');

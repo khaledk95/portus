@@ -585,6 +585,11 @@ td.actions { text-align: left; }
 }
 .dialog-note { font-size: 12px; color: var(--text-dim); margin-bottom: 10px; }
 
+/* six digits read off a phone, so they get room to breathe */
+.mfa-input {
+  font-size: 22px; letter-spacing: 8px; text-align: center; padding: 10px;
+}
+
 /* the Identity Center pairing code, sized to be read off the screen at a glance */
 .verify-code {
   margin: 4px 0 12px; padding: 14px 10px;

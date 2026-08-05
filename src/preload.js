@@ -37,6 +37,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('sso-verification', listener);
   },
 
+  // A profile with mfa_serial cannot produce credentials until a code is entered
+  onMfaRequired: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('mfa-required', listener);
+    return () => ipcRenderer.removeListener('mfa-required', listener);
+  },
+  onMfaCancelled: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('mfa-cancelled', listener);
+    return () => ipcRenderer.removeListener('mfa-cancelled', listener);
+  },
+  submitMfaCode: (id, code) => ipcRenderer.invoke('submit-mfa-code', { id, code }),
+
   // Session lifecycle
   getSessionStatus: (profileName) => ipcRenderer.invoke('get-session-status', profileName),
   refreshSession: (profileName) => ipcRenderer.invoke('refresh-session', profileName),
