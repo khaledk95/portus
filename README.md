@@ -338,6 +338,9 @@ npm start
 
 # Launch with DevTools open
 npm run dev
+
+# Run the test suite
+npm test
 ```
 
 Pick a profile from the sidebar and its instances load automatically. If those
@@ -400,11 +403,32 @@ All builds output to the `dist/` folder (git-ignored).
 ├── build/
 │   ├── portus.png       # Source icon (macOS/Linux; electron-builder generates sizes)
 │   └── portus.ico       # Multi-size Windows icon (16–256 px)
+├── tests/
+│   ├── helpers/
+│   │   ├── harness.js   # Loads the real main.js with electron/fs/AWS stubbed out
+│   │   └── assert.js    # Pass/fail counter, deliberately not a framework
+│   ├── providers.test.js  # Credential providers, sign-in routing, session expiry
+│   ├── endpoints.test.js  # RDS / Aurora / ElastiCache discovery
+│   ├── injection.test.js  # Nothing hostile reaches a shell command
+│   └── run.js           # Runs every suite, one process each
 ├── .github/workflows/
-│   └── release.yml      # Builds Windows/macOS/Linux on a v* tag, attaches to a draft release
+│   ├── ci.yml           # Runs the tests on every push and pull request
+│   └── release.yml      # Tests, then builds all three platforms on a v* tag
 ├── package.json         # Scripts + electron-builder config
 └── README.md
 ```
+
+**Tests** exercise the shipped `main.js` rather than a copy of it: the harness
+replaces electron, `fs-extra`, `child_process` and the AWS SDK clients, then calls
+the same IPC handlers the renderer calls. Each suite runs in its own process,
+because those replacements are process-wide.
+
+```bash
+npm test
+```
+
+A tag that fails its tests never reaches the build step, so no release can be cut
+from a broken commit.
 
 **Architecture:** standard Electron 3-process model. The renderer never touches Node
 or AWS directly — it calls `window.electronAPI.*`, which forwards over IPC to handlers

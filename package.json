@@ -6,6 +6,7 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
+    "test": "node tests/run.js",
     "build": "electron-builder",
     "build:win": "electron-builder --win",
     "build:win64": "electron-builder --win --x64",
@@ -74,6 +75,7 @@
       "!**/*.map",
       "!.github/**/*",
       "!.git/**/*",
+      "!tests/**/*",
       "!README.md",
       "!.gitignore"
     ],
