@@ -121,13 +121,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      # fetch-depth 0 so the annotated tag object comes with it. A shallow clone
-      # brings the ref but not the annotation, which is how v2.3.0 shipped with
-      # "Release v2.3.0" as its notes instead of the changelog written on the tag.
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Download every platform's artifacts
         uses: actions/download-artifact@v4
@@ -163,20 +158,37 @@ jobs:
           done
         shell: bash
 
-      # Read explicitly rather than relying on --notes-from-tag, which falls back
-      # to the commit message when it cannot find an annotation and says nothing
-      # about having done so. These notes are what the app shows people in its
-      # update dialog, so a silent fallback is not an acceptable failure mode.
+      # These notes are what the app shows people in its update dialog, so they
+      # are read from the tag object on GitHub rather than from the checkout.
+      #
+      # Local git cannot be trusted for this. actions/checkout fetches the real
+      # annotated tag and then force-updates the same ref to the commit SHA:
+      #
+      #   fetch ... +refs/tags/*:refs/tags/*                  <- the tag object
+      #   fetch --no-tags ... +<sha>:refs/tags/v2.3.1         <- overwrites it
+      #
+      # What is left is a lightweight tag, and asking it for its message returns
+      # the commit subject. Both v2.3.0 and v2.3.1 shipped with "Release v2.3.x"
+      # as their notes that way — once through gh's --notes-from-tag, and once
+      # through git tag --format, which fail identically because both read local
+      # git. Checking the file was non-empty caught neither, a commit message
+      # being perfectly non-empty.
       - name: Take the release notes from the tag
-        id: notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${{ steps.tag.outputs.tag }}"
-          git tag -l --format='%(contents)' "$tag" > release-notes.md
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")
 
-          if [ ! -s release-notes.md ]; then
-            echo "::error::Tag $tag has no annotation. Tag with -a or -F so the release has notes."
+          type=$(echo "$ref" | jq -r '.object.type')
+          sha=$(echo "$ref" | jq -r '.object.sha')
+
+          if [ "$type" != "tag" ]; then
+            echo "::error::$tag is a lightweight tag and carries no notes. Tag with -a or -F."
             exit 1
           fi
+
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha" --jq '.message' > release-notes.md
 
           echo "--- release notes ---"
           cat release-notes.md
