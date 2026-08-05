@@ -143,7 +143,6 @@
       "type": "distribution"
     },
     "dmg": {
-      "title": "${productName} ${version}",
       "iconSize": 80,
       "window": {
         "width": 540,
