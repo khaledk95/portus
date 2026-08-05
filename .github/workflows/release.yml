@@ -121,8 +121,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth 0 so the annotated tag object comes with it. A shallow clone
+      # brings the ref but not the annotation, which is how v2.3.0 shipped with
+      # "Release v2.3.0" as its notes instead of the changelog written on the tag.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download every platform's artifacts
         uses: actions/download-artifact@v4
@@ -158,6 +163,24 @@ jobs:
           done
         shell: bash
 
+      # Read explicitly rather than relying on --notes-from-tag, which falls back
+      # to the commit message when it cannot find an annotation and says nothing
+      # about having done so. These notes are what the app shows people in its
+      # update dialog, so a silent fallback is not an acceptable failure mode.
+      - name: Take the release notes from the tag
+        id: notes
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          git tag -l --format='%(contents)' "$tag" > release-notes.md
+
+          if [ ! -s release-notes.md ]; then
+            echo "::error::Tag $tag has no annotation. Tag with -a or -F so the release has notes."
+            exit 1
+          fi
+
+          echo "--- release notes ---"
+          cat release-notes.md
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -166,13 +189,13 @@ jobs:
           if gh release view "$tag" > /dev/null 2>&1; then
             # a re-run: replace the assets on the release that already exists
             gh release upload "$tag" dist/* --clobber
-            gh release edit "$tag" --draft=false --latest
+            gh release edit "$tag" --notes-file release-notes.md --draft=false --latest
           else
             # Titled with the tag itself: the repository name already heads the
             # releases page, and a title that differs from the tag people search
             # for is a papercut with nothing to gain.
             gh release create "$tag" dist/* \
               --title "$tag" \
-              --notes-from-tag \
+              --notes-file release-notes.md \
               --latest
           fi
