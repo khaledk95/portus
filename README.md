@@ -78,7 +78,7 @@ for them on startup and tells you what is missing.
 - **Release notifications** — on launch, Portus checks whether a newer version has been published and shows it once, with what changed and a link to the release. It never downloads or installs anything
 - **Light and dark themes**, a collapsible sidebar, an instance detail panel, state/OS filters and `Ctrl K` search — the session countdown and open tunnel count stay visible in the status bar
 - Smart buttons: connect actions are only offered when Systems Manager can actually reach the instance, and RDP only on running Windows instances
-- Cross-platform: Windows, macOS, Linux
+- Cross-platform: Windows, macOS, Linux — on Windows and Linux the stock Electron menu bar is removed, since Portus never used it
 
 ---
 
@@ -395,13 +395,15 @@ All builds output to the `dist/` folder (git-ignored).
 - **Releasing is automatic.** Bump the version, tag it, push the tag:
 
   ```bash
-  npm version 2.3.0 --no-git-tag-version   # or edit package.json by hand
-  git commit -am "Release v2.3.0"
-  git tag -a v2.3.0 -m "Portus v2.3.0"
+  npm version 2.4.0 --no-git-tag-version   # or edit package.json by hand
+  git commit -am "Release v2.4.0"
+  git tag -a v2.4.0 -F notes.md            # annotated: -a or -F, never a bare tag
   git push origin main --follow-tags
   ```
 
-  `build.buildVersion` in `package.json` has to match too.
+  `build.buildVersion` in `package.json` has to match too. The tag must be
+  **annotated** — a lightweight tag carries no message, and the release job fails
+  rather than publishing with empty notes.
 
 - **The tag message becomes the release notes**, and those notes are what users
   see in the update dialog. Keep them to a short bulleted *what changed for you*:
@@ -416,10 +418,13 @@ All builds output to the `dist/` folder (git-ignored).
   The reasoning — why a change was made, what it replaced, what broke before —
   belongs in the commit message, which has a different audience.
 
-  The workflow builds on all three runners, uploads into a draft, and publishes
-  the release only once every platform has finished — so nobody can download a
-  release that is missing an OS. The tag must match the version in
-  `package.json`.
+  The workflow runs the tests first and stops there if they fail. Each runner
+  builds its own platform and uploads the installers as workflow artifacts —
+  none of them publishes. A single job then collects all three, refuses to
+  continue unless an installer for every platform is present, and creates one
+  release. That last part is deliberate: when the runners published for
+  themselves they raced, and v2.2.0 came out as three separate releases with a
+  platform each.
 - Builds are **unsigned** — see [Installing a release](#installing-a-release).
 
 ---
@@ -525,6 +530,7 @@ ie4uinit.exe -show
 - **AWS SDK v3** — `@aws-sdk/client-ec2`, `@aws-sdk/client-ssm`, `@aws-sdk/client-rds`,
   `@aws-sdk/client-elasticache`, `@aws-sdk/credential-providers`
 - `fs-extra`, `ini` (read `~/.aws` config)
+- `jsdom` (development only — the renderer tests run the real UI without a display)
 - External CLIs at runtime: **AWS CLI v2** and the **Session Manager plugin** always;
   **aws-azure-login** only if you have an Azure AD profile
 
