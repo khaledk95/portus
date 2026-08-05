@@ -81,14 +81,12 @@ class Portus {
         this.announceRelease(await updateCheck);
     }
 
-    // Shown once for a version and never again. Nothing is downloaded: the link
-    // goes to the releases page and the user installs it however they installed
-    // Portus in the first place.
+    // Shown until it is dismissed, then not again for that version. Nothing is
+    // downloaded: the link goes to the releases page and the user installs it
+    // however they installed Portus in the first place.
     announceRelease(update) {
         if (!update || !update.available || !update.version) return;
         if (this.releaseAlreadySeen(update.version)) return;
-
-        this.rememberSeenRelease(update.version);
 
         const overlay = document.createElement('div');
         overlay.className = 'overlay';
@@ -121,7 +119,23 @@ class Portus {
         const notes = overlay.querySelector('#releaseNotes');
         notes.textContent = update.notes || 'No release notes were published for this version.';
 
-        const close = () => overlay.remove();
+        // Recorded on dismissal rather than on display. Closing it, opening the
+        // release or clicking away are all acknowledgements; quitting before any
+        // of those is not, and the whole point of this dialog is that it was read
+        // at least once. Being told twice is a smaller failure than never.
+        let onKey;
+        const close = () => {
+            if (onKey) document.removeEventListener('keydown', onKey);
+            this.rememberSeenRelease(update.version);
+            overlay.remove();
+        };
+
+        // Escape counts as dismissing it. The global handler in bindChrome removes
+        // any overlay on Escape without going through here, so this listens too —
+        // otherwise Escape would close the dialog and bring it back next launch.
+        onKey = (e) => { if (e.key === 'Escape') close(); };
+        document.addEventListener('keydown', onKey);
+
         overlay.querySelectorAll('[data-close]').forEach(el => el.addEventListener('click', close));
         overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
