@@ -442,12 +442,15 @@ All builds output to the `dist/` folder (git-ignored).
 ├── tests/
 │   ├── helpers/
 │   │   ├── harness.js   # Loads the real main.js with electron/fs/AWS stubbed out
+│   │   ├── renderer-harness.js  # Boots the real index.html + renderer.js in jsdom
 │   │   └── assert.js    # Pass/fail counter, deliberately not a framework
 │   ├── providers.test.js  # Credential providers, sign-in routing, session expiry
 │   ├── endpoints.test.js  # RDS / Aurora / ElastiCache discovery
 │   ├── injection.test.js  # Nothing hostile reaches a shell command
 │   ├── mfa.test.js        # mfa_serial prompting, caching and cancellation
 │   ├── release-check.test.js  # Version comparison and which links may be opened
+│   ├── renderer.test.js   # The UI, driven through the real markup
+│   ├── window.test.js     # Which platforms keep the application menu
 │   └── run.js           # Runs every suite, one process each
 ├── .github/workflows/
 │   ├── ci.yml           # Runs the tests on every push and pull request
@@ -456,10 +459,12 @@ All builds output to the `dist/` folder (git-ignored).
 └── README.md
 ```
 
-**Tests** exercise the shipped `main.js` rather than a copy of it: the harness
-replaces electron, `fs-extra`, `child_process` and the AWS SDK clients, then calls
-the same IPC handlers the renderer calls. Each suite runs in its own process,
-because those replacements are process-wide.
+**Tests** exercise the shipped code rather than a copy of it. For the main process
+the harness replaces electron, `fs-extra`, `child_process` and the AWS SDK clients,
+then calls the same IPC handlers the renderer calls. For the renderer it loads the
+real `index.html` and `renderer.js` into jsdom behind a stubbed `electronAPI`, so
+the assertions run against the actual markup and the actual class. Each suite runs
+in its own process, because those replacements are process-wide.
 
 ```bash
 npm test
