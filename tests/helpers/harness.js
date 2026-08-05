@@ -44,7 +44,8 @@ function loadMain(options = {}) {
   const state = {
     files: options.files || {},
     spawns: [],          // every child process main.js tried to start
-    sent: []             // every webContents.send, i.e. what reached the renderer
+    sent: [],            // every webContents.send, i.e. what reached the renderer
+    opened: []           // every URL handed to the operating system
   };
 
   const handlers = new Map();
@@ -74,7 +75,8 @@ function loadMain(options = {}) {
         isDestroyed() { return false; }
         static getAllWindows() { return []; }
       },
-      ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) }
+      ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) },
+      shell: { openExternal: url => state.opened.push(url) }
     },
 
     'fs-extra': {

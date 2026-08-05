@@ -57,6 +57,12 @@ class Portus {
 
         await this.applyAppVersion();
         this.checkRequiredTools();
+
+        // Started here rather than awaited, so a slow or unreachable GitHub
+        // cannot hold the splash open. Whatever it finds is shown once the app
+        // is on screen.
+        const updateCheck = window.electronAPI.checkForUpdate().catch(() => ({ available: false }));
+
         await this.loadProfiles();
 
         this.updateConnection(false);
@@ -71,6 +77,72 @@ class Portus {
         this.hideSplash();
 
         window.portus = this; // debugging aid only; nothing in the UI depends on it
+
+        this.announceRelease(await updateCheck);
+    }
+
+    // Shown once for a version and never again. Nothing is downloaded: the link
+    // goes to the releases page and the user installs it however they installed
+    // Portus in the first place.
+    announceRelease(update) {
+        if (!update || !update.available || !update.version) return;
+        if (this.releaseAlreadySeen(update.version)) return;
+
+        this.rememberSeenRelease(update.version);
+
+        const overlay = document.createElement('div');
+        overlay.className = 'overlay';
+        overlay.id = 'releaseOverlay';
+        overlay.innerHTML = `
+            <div class="dialog">
+                <div class="dialog-head">
+                    <h3>Portus ${this.escapeHtml(update.version)} is available</h3>
+                    <button type="button" class="icon-btn" data-close><i class="fas fa-times"></i></button>
+                </div>
+                <div class="dialog-body">
+                    <p class="dialog-note">
+                        You are running ${this.escapeHtml(update.current || '')}. Portus does not update
+                        itself — download the new version when it suits you.
+                    </p>
+                    <div class="release-notes" id="releaseNotes"></div>
+                </div>
+                <div class="dialog-foot">
+                    <button type="button" class="btn" data-close>Not now</button>
+                    <button type="button" class="btn btn-primary" id="releaseOpen">
+                        <i class="fas fa-arrow-up-right-from-square"></i> View release
+                    </button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        // textContent, not innerHTML: these notes arrive over the network, and
+        // markup in them must render as the characters it is, not as markup.
+        const notes = overlay.querySelector('#releaseNotes');
+        notes.textContent = update.notes || 'No release notes were published for this version.';
+
+        const close = () => overlay.remove();
+        overlay.querySelectorAll('[data-close]').forEach(el => el.addEventListener('click', close));
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+        overlay.querySelector('#releaseOpen').addEventListener('click', async () => {
+            await window.electronAPI.openReleasePage(update.url || update.releasesUrl);
+            close();
+        });
+
+        setTimeout(() => overlay.querySelector('#releaseOpen').focus(), 50);
+    }
+
+    releaseAlreadySeen(version) {
+        try {
+            return localStorage.getItem('portus.releaseSeen') === version;
+        } catch (error) {
+            return false;   // no storage: showing it again beats never showing it
+        }
+    }
+
+    rememberSeenRelease(version) {
+        try { localStorage.setItem('portus.releaseSeen', version); } catch (error) { /* ignore */ }
     }
 
     hideSplash() {

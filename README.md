@@ -75,6 +75,7 @@ for them on startup and tells you what is missing.
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
 - **Startup preflight** — missing external tools are reported up front with install instructions rather than failing later mid-connect, and provider-specific ones are only demanded when a profile actually uses them
 - **Session renewal** — Azure AD sessions are refreshed before they expire and an expired one is renewed and retried transparently, so you are not thrown back to the login screen mid-task. IAM Identity Center needs a browser approval, so it is never renewed on a timer — you get a warning shortly before it lapses and sign in when you are ready
+- **Release notifications** — on launch, Portus checks whether a newer version has been published and shows it once, with what changed and a link to the release. It never downloads or installs anything
 - **Light and dark themes**, a collapsible sidebar, an instance detail panel, state/OS filters and `Ctrl K` search — the session countdown and open tunnel count stay visible in the status bar
 - Smart buttons: connect actions are only offered when Systems Manager can actually reach the instance, and RDP only on running Windows instances
 - Cross-platform: Windows, macOS, Linux
@@ -126,6 +127,12 @@ Open tunnels get their own **Tunnels** view in the sidebar, listing each one wit
 local address and a live uptime, where you can copy the address or disconnect. The
 open count also shows in the status bar. They are closed automatically when Portus
 exits.
+
+On launch Portus makes **one** request to GitHub's public API — the same read as
+opening the [Releases page](https://github.com/khaledk95/portus/releases) in a
+browser — to see whether a newer version exists, and shows it once. Nothing about
+you, your profiles or your instances is sent, and nothing is downloaded or
+installed. If the request fails for any reason, no notification appears.
 
 ---
 
@@ -396,6 +403,19 @@ All builds output to the `dist/` folder (git-ignored).
 
   `build.buildVersion` in `package.json` has to match too.
 
+- **The tag message becomes the release notes**, and those notes are what users
+  see in the update dialog. Keep them to a short bulleted *what changed for you*:
+
+  ```
+  Portus v2.3.0
+
+  - Asks for the MFA code when a profile needs one, instead of stalling
+  - Tells you when a new release is out
+  ```
+
+  The reasoning — why a change was made, what it replaced, what broke before —
+  belongs in the commit message, which has a different audience.
+
   The workflow builds on all three runners, uploads into a draft, and publishes
   the release only once every platform has finished — so nobody can download a
   release that is missing an OS. The tag must match the version in
@@ -427,6 +447,7 @@ All builds output to the `dist/` folder (git-ignored).
 │   ├── endpoints.test.js  # RDS / Aurora / ElastiCache discovery
 │   ├── injection.test.js  # Nothing hostile reaches a shell command
 │   ├── mfa.test.js        # mfa_serial prompting, caching and cancellation
+│   ├── release-check.test.js  # Version comparison and which links may be opened
 │   └── run.js           # Runs every suite, one process each
 ├── .github/workflows/
 │   ├── ci.yml           # Runs the tests on every push and pull request
@@ -489,6 +510,7 @@ ie4uinit.exe -show
 | No profiles in the dropdown | Nothing readable in `~/.aws/config` or `~/.aws/credentials` |
 | A profile you just added is missing | Click **Refresh** in the dropdown (or in the Sign in dialog) — `~/.aws` is otherwise only read at startup |
 | App icon not updating (Windows) | Stale icon cache — run `ie4uinit.exe -show` or reinstall to a new path |
+| Never told about a new release | The check is a single call to GitHub's public API at launch and fails silently — offline, behind a proxy, or rate-limited all mean no notification. The [Releases page](https://github.com/khaledk95/portus/releases) is always authoritative |
 
 ---
 

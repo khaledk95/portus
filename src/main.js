@@ -3,12 +3,13 @@ if (!process.env.NODE_ENV) {
   process.env.NODE_ENV = 'production';
 }
 
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs-extra');
 const ini = require('ini');
 const os = require('os');
+const https = require('https');
 
 // AWS SDK imports (EC2 only - needed to list SSM/RDP targets)
 const { EC2Client, DescribeInstancesCommand } = require('@aws-sdk/client-ec2');
@@ -197,6 +198,103 @@ function describeDeniedAction(error) {
   if (isAuthorizationError(error)) return 'access denied';
 
   return message || 'request failed';
+}
+
+// ============================================================================
+// RELEASE NOTIFICATION
+// ============================================================================
+//
+// Portus tells you a newer version exists and links to it. It does not download
+// or install anything: the builds are unsigned, so Squirrel would refuse the
+// macOS update outright, and installing means quitting — which closes every open
+// tunnel. Being told is the whole feature.
+
+const UPDATE_CHECK_TIMEOUT_MS = 5000;
+
+// Compares two dot-separated versions. Anything after a dash — 2.3.0-beta.1 —
+// is ignored rather than half-understood; releases/latest excludes prereleases,
+// so it should never arrive in the first place.
+function compareVersions(left, right) {
+  const parts = value => String(value || '')
+    .replace(/^v/, '')
+    .split('-')[0]
+    .split('.')
+    .map(piece => parseInt(piece, 10) || 0);
+
+  const a = parts(left);
+  const b = parts(right);
+
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const difference = (a[index] || 0) - (b[index] || 0);
+    if (difference !== 0) return difference < 0 ? -1 : 1;
+  }
+
+  return 0;
+}
+
+function fetchLatestRelease(owner, repo) {
+  return new Promise((resolve, reject) => {
+    const request = https.get({
+      hostname: 'api.github.com',
+      path: `/repos/${owner}/${repo}/releases/latest`,
+      headers: {
+        // GitHub rejects requests without one
+        'User-Agent': `Portus/${app.getVersion()}`,
+        Accept: 'application/vnd.github+json'
+      },
+      timeout: UPDATE_CHECK_TIMEOUT_MS
+    }, response => {
+      // Redirects and errors are not worth following for something optional
+      if (response.statusCode !== 200) {
+        response.resume();
+        reject(new Error(`GitHub returned ${response.statusCode}`));
+        return;
+      }
+
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { body += chunk; });
+      response.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (error) {
+          reject(new Error('Could not read the release feed'));
+        }
+      });
+    });
+
+    request.on('timeout', () => request.destroy(new Error('The release check timed out')));
+    request.on('error', reject);
+  });
+}
+
+// Never throws and never blocks anything. Offline, rate-limited or GitHub down
+// all mean the same thing: no notification this time.
+async function checkForNewRelease() {
+  try {
+    const publish = require(path.join(__dirname, '..', 'package.json')).build.publish;
+    const release = await fetchLatestRelease(publish.owner, publish.repo);
+
+    const latest = String(release.tag_name || '').replace(/^v/, '');
+    const current = app.getVersion();
+
+    if (!latest || compareVersions(latest, current) <= 0) {
+      return { available: false, current };
+    }
+
+    return {
+      available: true,
+      current,
+      version: latest,
+      // Rendered as text by the renderer, never as markup — this string comes
+      // over the network.
+      notes: String(release.body || '').trim(),
+      url: release.html_url || `https://github.com/${publish.owner}/${publish.repo}/releases`,
+      releasesUrl: `https://github.com/${publish.owner}/${publish.repo}/releases`
+    };
+  } catch (error) {
+    return { available: false, error: error.message };
+  }
 }
 
 function createWindow() {
@@ -1248,6 +1346,24 @@ function setupIpcHandlers() {
   // Single source of truth for the version shown in the UI: package.json, via
   // Electron. Hardcoding it in the markup means it silently goes stale.
   ipcMain.handle('get-app-version', () => app.getVersion());
+
+  // Is there a newer release? Resolves to { available: false } on any failure.
+  ipcMain.handle('check-for-update', () => checkForNewRelease());
+
+  // Opening a link hands a string to the operating system, so this refuses
+  // anything that is not an https URL on the project's own release pages. A
+  // renderer bug should not be able to launch arbitrary things.
+  ipcMain.handle('open-release-page', (event, url) => {
+    const publish = require(path.join(__dirname, '..', 'package.json')).build.publish;
+    const allowedPrefix = `https://github.com/${publish.owner}/${publish.repo}/releases`;
+
+    if (typeof url !== 'string' || !url.startsWith(allowedPrefix)) {
+      return { success: false, error: 'Refused to open a link outside the project releases page.' };
+    }
+
+    shell.openExternal(url);
+    return { success: true };
+  });
 
   // Preflight: which external tools are present on this machine
   ipcMain.handle('check-required-tools', async () => {

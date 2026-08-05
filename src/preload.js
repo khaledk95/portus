@@ -4,6 +4,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // App metadata
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
 
+  // Is a newer release out? Notification only — nothing is downloaded or installed
+  checkForUpdate: () => ipcRenderer.invoke('check-for-update'),
+  openReleasePage: (url) => ipcRenderer.invoke('open-release-page', url),
+
   // Preflight for the external tools Portus shells out to
   checkRequiredTools: () => ipcRenderer.invoke('check-required-tools'),
 
