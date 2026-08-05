@@ -60,9 +60,17 @@ const LEGITIMATE_HOSTS = [
   const closeTunnel = handlers.get('close-tunnel');
 
   const closeAll = () => (listTunnels() || []).forEach(tunnel => closeTunnel({}, tunnel.id));
-  const lastCommand = () => (state.spawns.length
-    ? String(state.spawns[0].args[state.spawns[0].args.length - 1])
-    : '');
+
+  // The tunnel is wrapped differently per platform: Windows hands the command to
+  // `cmd /c`, POSIX to `bash -c "exec …"` so the shell is replaced rather than
+  // left hanging around as a parent. Both wrappers are stripped here, and the
+  // wrapper itself is asserted separately below.
+  const onWindows = process.platform === 'win32';
+  const lastCommand = () => {
+    if (!state.spawns.length) return '';
+    const spawned = state.spawns[0];
+    return String(spawned.args[spawned.args.length - 1]).replace(/^exec /, '');
+  };
 
   // ---------------------------------------------------------------------------
   suite.section('a hostile hostname never reaches a shell');
@@ -117,6 +125,29 @@ const LEGITIMATE_HOSTS = [
 
     closeAll();
   }
+
+  // ---------------------------------------------------------------------------
+  suite.section('the tunnel is wrapped the way each platform needs');
+  // Removing shell:true on Windows once broke RDP: Node escapes the quotes around
+  // --parameters as \" and cmd.exe misreads them. The wrapper is load-bearing.
+
+  state.spawns.length = 0;
+  await forward({}, 'demo', 'i-0abc', 'bastion',
+    { remoteHost: 'db.rds.amazonaws.com', remotePort: '5432', localPort: '' });
+
+  const spawned = state.spawns[0];
+
+  if (onWindows) {
+    suite.check('Windows runs it through cmd /c',
+      spawned.command === 'cmd' && spawned.args[0] === '/c', spawned);
+  } else {
+    suite.check('POSIX runs it through bash -c',
+      spawned.command === 'bash' && spawned.args[0] === '-c', spawned);
+    suite.check('POSIX execs so no shell is left as a parent',
+      String(spawned.args[1]).startsWith('exec aws ssm start-session '), String(spawned.args[1]).slice(0, 60));
+  }
+
+  closeAll();
 
   suite.done();
 })();
