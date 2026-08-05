@@ -45,7 +45,8 @@ function loadMain(options = {}) {
     files: options.files || {},
     spawns: [],          // every child process main.js tried to start
     sent: [],            // every webContents.send, i.e. what reached the renderer
-    opened: []           // every URL handed to the operating system
+    opened: [],          // every URL handed to the operating system
+    menusSet: []         // every Menu.setApplicationMenu call
   };
 
   const handlers = new Map();
@@ -76,7 +77,8 @@ function loadMain(options = {}) {
         static getAllWindows() { return []; }
       },
       ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) },
-      shell: { openExternal: url => state.opened.push(url) }
+      shell: { openExternal: url => state.opened.push(url) },
+      Menu: { setApplicationMenu: menu => state.menusSet.push(menu) }
     },
 
     'fs-extra': {

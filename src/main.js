@@ -3,7 +3,7 @@ if (!process.env.NODE_ENV) {
   process.env.NODE_ENV = 'production';
 }
 
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Menu } = require('electron');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs-extra');
@@ -304,6 +304,17 @@ async function checkForNewRelease() {
   } catch (error) {
     return { available: false, error: error.message };
   }
+}
+
+// Electron gives every app a File / Edit / View / Window / Help menu. Portus has
+// nothing to put in it, and on Windows and Linux it is drawn inside the window,
+// sitting above the app's own top bar.
+//
+// Not removed on macOS. There the menu lives in the system bar rather than the
+// window, so it costs nothing visually, and macOS routes Cmd+C, Cmd+V and Cmd+Q
+// through it — an app with no menu loses copy, paste and quit entirely.
+function applyApplicationMenu() {
+  if (process.platform !== 'darwin') Menu.setApplicationMenu(null);
 }
 
 function createWindow() {
@@ -2090,6 +2101,7 @@ function setupIpcHandlers() {
 }
 
 app.whenReady().then(() => {
+  applyApplicationMenu();
   createWindow();
   setupIpcHandlers();
 });
