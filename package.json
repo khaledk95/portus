@@ -54,12 +54,6 @@
   "build": {
     "appId": "io.github.khaledk95.portus",
     "productName": "Portus",
-    "publish": {
-      "provider": "github",
-      "owner": "khaledk95",
-      "repo": "portus",
-      "releaseType": "draft"
-    },
     "copyright": "Copyright © 2025 Portus contributors",
     "directories": {
       "output": "dist",

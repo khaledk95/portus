@@ -211,12 +211,13 @@ function describeDeniedAction(error) {
 
 const UPDATE_CHECK_TIMEOUT_MS = 5000;
 
-// Deliberately constants rather than read from package.json's build.publish.
-// electron-builder strips the build block when it packages the app — it is build
-// configuration, not runtime data — so build.publish is present in development
-// and undefined in every installed copy. Reading it there threw before the first
-// request was made, which is why v2.3.0 shipped an update check that could never
-// report an update, and why nothing caught it: the source tree still had the key.
+// Deliberately constants, and never read out of package.json. electron-builder
+// strips the whole build block when it packages the app — it is build
+// configuration, not runtime data — so anything under it exists in a checkout and
+// is undefined in every installed copy. v2.3.0 read the owner and repo from there
+// and shipped an update check that threw before making a request, which nothing
+// caught because the tests and the probe written to confirm the feature both ran
+// against the source tree, where the key was still present.
 const GITHUB_OWNER = 'khaledk95';
 const GITHUB_REPO = 'portus';
 const RELEASES_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}/releases`;
