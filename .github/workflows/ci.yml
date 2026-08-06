@@ -7,6 +7,11 @@ on:
     branches:
       - main
   pull_request:
+  # Runnable by hand. Without this there is no way to get an answer for a commit
+  # whose automatic run never happened — GitHub failed to allocate a runner for
+  # one push, reported "the job was not acquired by Runner of type hosted", and
+  # the commit after it got no run at all.
+  workflow_dispatch:
 
 # A newer push to the same branch makes the previous run's answer irrelevant
 concurrency:
