@@ -58,15 +58,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getSessionStatus: (profileName) => ipcRenderer.invoke('get-session-status', profileName),
   refreshSession: (profileName) => ipcRenderer.invoke('refresh-session', profileName),
 
-  // EC2 (target list for SSM / RDP)
-  getEc2Instances: (profileName) => ipcRenderer.invoke('get-ec2-instances', profileName),
+  // Regions this account has enabled, for the region picker
+  getRegions: (profileName) => ipcRenderer.invoke('get-regions', profileName),
+
+  // EC2 (target list for SSM / RDP). Region is the one picked in the UI; without
+  // it the profile's configured region is used.
+  getEc2Instances: (profileName, region) => ipcRenderer.invoke('get-ec2-instances', profileName, region),
 
   // Managed database endpoints suggested in the port forwarding dialog
-  getEndpoints: (profileName) => ipcRenderer.invoke('get-endpoints', profileName),
+  getEndpoints: (profileName, region) => ipcRenderer.invoke('get-endpoints', profileName, region),
 
   // SSM Connect
-  connectSSM: (profileName, instanceId) => ipcRenderer.invoke('connect-ssm', profileName, instanceId),
+  connectSSM: (profileName, instanceId, region) =>
+    ipcRenderer.invoke('connect-ssm', profileName, instanceId, region),
 
   // RDP over SSM Connect
-  connectRDPSSM: (profileName, instanceId, instanceName) => ipcRenderer.invoke('connect-rdp-ssm', profileName, instanceId, instanceName),
+  connectRDPSSM: (profileName, instanceId, instanceName, region) =>
+    ipcRenderer.invoke('connect-rdp-ssm', profileName, instanceId, instanceName, region),
 });

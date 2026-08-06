@@ -14,9 +14,17 @@ class Portus {
         this.tunnels = [];
 
         // Managed endpoints suggested in the port forwarding dialog, keyed by
-        // profile. Databases do not come and go between dialog openings, so this
-        // is only cleared when the profile changes or the user asks to refresh.
+        // profile and region — the same account holds different databases in
+        // different regions, so the key has to carry both.
         this.endpointCache = new Map();
+
+        // region
+        this.regions = [];               // what this account has enabled
+        this.currentRegion = null;       // what every request is made against
+        this.regionCache = new Map();    // keyed by profile; enabling a region is rare
+        this.regionComboOpen = false;
+        this.regionMatches = [];
+        this.regionIndex = 0;
 
         // view state
         this.view = 'instances';
@@ -49,6 +57,7 @@ class Portus {
         this.applyStoredRail();
         this.bindChrome();
         this.bindCombo();
+        this.bindRegionCombo();
         this.bindFilters();
         this.bindTunnelEvents();
         window.electronAPI.onSsoVerification(({ code }) => this.showSsoVerification(code));
@@ -384,13 +393,18 @@ class Portus {
             const label = document.getElementById('profileComboLabel');
             label.textContent = 'Select profile';
             label.classList.add('placeholder');
+
+            this.currentRegion = null;
+            this.regions = [];
             document.getElementById('statusRegion').textContent = '—';
+            this.updateRegionControls();
             this.updateConnection(false);
         } else if (this.currentProfile) {
-            // its region or provider may have been edited
+            // its provider may have been edited. The region is deliberately left
+            // alone: re-reading ~/.aws is not choosing a profile, and resetting it
+            // here would throw away a region the user switched to.
             this.selectedProfile = (this.profiles || []).find(p => p.name === this.currentProfile) || null;
-            document.getElementById('statusRegion').textContent =
-                (this.selectedProfile && this.selectedProfile.region) || '—';
+            this.renderRegionLabel();
         }
     }
 
@@ -412,6 +426,209 @@ class Portus {
         btn.title = available
             ? 'Sign in to a profile that supports it'
             : 'No profile in ~/.aws has a sign-in Portus can run';
+    }
+
+    // ==========================================================================
+    // REGION
+    // ==========================================================================
+
+    bindRegionCombo() {
+        const combo = document.getElementById('regionCombo');
+        const trigger = document.getElementById('regionComboTrigger');
+        const search = document.getElementById('regionComboSearch');
+
+        trigger.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.regionComboOpen ? this.closeRegionCombo() : this.openRegionCombo();
+        });
+
+        search.addEventListener('input', () => this.renderRegionOptions(search.value));
+
+        search.addEventListener('keydown', (e) => {
+            const count = this.regionMatches.length;
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                if (count) this.setRegionIndex((this.regionIndex + 1) % count);
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (count) this.setRegionIndex((this.regionIndex - 1 + count) % count);
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                const match = this.regionMatches[this.regionIndex];
+                if (match) this.chooseRegion(match.name);
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                this.closeRegionCombo();
+                trigger.focus();
+            }
+        });
+
+        document.addEventListener('click', (e) => {
+            if (this.regionComboOpen && !combo.contains(e.target)) this.closeRegionCombo();
+        });
+    }
+
+    openRegionCombo() {
+        const trigger = document.getElementById('regionComboTrigger');
+        if (trigger.disabled) return;
+
+        this.regionComboOpen = true;
+        document.getElementById('regionCombo').classList.add('open');
+        trigger.setAttribute('aria-expanded', 'true');
+
+        const search = document.getElementById('regionComboSearch');
+        search.value = '';
+        this.renderRegionOptions('');
+        setTimeout(() => search.focus(), 0);
+    }
+
+    closeRegionCombo() {
+        this.regionComboOpen = false;
+        document.getElementById('regionCombo').classList.remove('open');
+        document.getElementById('regionComboTrigger').setAttribute('aria-expanded', 'false');
+    }
+
+    renderRegionOptions(filter) {
+        const list = document.getElementById('regionComboList');
+        const count = document.getElementById('regionComboCount');
+        const note = document.getElementById('regionComboNote');
+        const all = this.regions || [];
+        const term = (filter || '').trim().toLowerCase();
+
+        // Searching by city as well as by code, since "Frankfurt" is what people
+        // actually know and "eu-central-1" is what they have to type today.
+        this.regionMatches = term
+            ? all.filter(region => region.name.toLowerCase().includes(term)
+                || (region.label || '').toLowerCase().includes(term))
+            : all.slice();
+
+        list.innerHTML = '';
+
+        if (!all.length) {
+            list.innerHTML = '<div class="combo-empty">Choose a profile first</div>';
+            count.textContent = '';
+            return;
+        }
+        if (!this.regionMatches.length) {
+            list.innerHTML = `<div class="combo-empty">No region matches &ldquo;${this.escapeHtml(filter)}&rdquo;</div>`;
+            count.textContent = `0 of ${all.length}`;
+            return;
+        }
+
+        this.regionMatches.forEach((region, index) => {
+            const option = document.createElement('div');
+            option.className = 'combo-option';
+            option.setAttribute('role', 'option');
+            if (region.name === this.currentRegion) {
+                option.classList.add('selected');
+                option.setAttribute('aria-selected', 'true');
+            }
+            option.innerHTML = `
+                <span class="opt-name">${region.label ? this.highlight(region.label, term) : this.highlight(region.name, term)}</span>
+                ${region.label ? `<span class="opt-region mono">${this.highlight(region.name, term)}</span>` : ''}
+                <i class="fas fa-check opt-check"></i>
+            `;
+            option.addEventListener('click', () => this.chooseRegion(region.name));
+            option.addEventListener('mousemove', () => this.setRegionIndex(index));
+            list.appendChild(option);
+        });
+
+        count.textContent = term ? `${this.regionMatches.length} of ${all.length}` : `${all.length} enabled`;
+        note.textContent = this.regionsLimited ? 'Only the profile’s own region could be read' : '';
+
+        const selected = this.regionMatches.findIndex(r => r.name === this.currentRegion);
+        this.setRegionIndex(selected >= 0 ? selected : 0);
+    }
+
+    setRegionIndex(index) {
+        const options = document.querySelectorAll('#regionComboList .combo-option');
+        if (!options.length) return;
+        this.regionIndex = index;
+        options.forEach((el, i) => el.classList.toggle('active', i === index));
+        if (options[index]) options[index].scrollIntoView({ block: 'nearest' });
+    }
+
+    // The picker shows the region in use; the label carries the city when there
+    // is one, because "Frankfurt" identifies a place and "eu-central-1" does not.
+    renderRegionLabel() {
+        const label = document.getElementById('regionComboLabel');
+        if (!label) return;
+
+        if (!this.currentRegion) {
+            label.textContent = '—';
+            label.classList.add('placeholder');
+            return;
+        }
+
+        const region = (this.regions || []).find(r => r.name === this.currentRegion);
+        label.textContent = region && region.label ? `${region.label} · ${region.name}` : this.currentRegion;
+        label.classList.remove('placeholder');
+
+        const statusRegion = document.getElementById('statusRegion');
+        if (statusRegion) statusRegion.textContent = this.currentRegion;
+    }
+
+    chooseRegion(name) {
+        this.closeRegionCombo();
+        if (!name || name === this.currentRegion) return;
+
+        this.currentRegion = name;
+        this.renderRegionLabel();
+
+        // Endpoints belong to a region, so the suggestions for the old one would
+        // be wrong here — and pointing a tunnel at a database in another region
+        // is a failure that looks like a network problem.
+        this.endpointCache.clear();
+
+        this.loadInstances();
+    }
+
+    // Endpoints are per account *and* per region: the same profile holds
+    // different databases in eu-central-1 than in us-east-1, so a key of profile
+    // alone would offer one region's hosts while connected to another.
+    endpointCacheKey() {
+        return `${this.currentProfile}|${this.currentRegion}`;
+    }
+
+    // Enabled regions for the current profile. The picker is usable immediately
+    // with the profile's own region, and grows to the full list once it arrives.
+    async loadRegions() {
+        const profileName = this.currentProfile;
+        if (!profileName) return;
+
+        const cached = this.regionCache.get(profileName);
+        if (cached) {
+            this.regions = cached.data;
+            this.regionsLimited = cached.limited;
+            this.updateRegionControls();
+            return;
+        }
+
+        try {
+            const result = await window.electronAPI.getRegions(profileName);
+            if (this.currentProfile !== profileName) return;   // switched while in flight
+
+            this.regions = (result && result.data) || [];
+            this.regionsLimited = !!(result && result.limited);
+            this.regionCache.set(profileName, { data: this.regions, limited: this.regionsLimited });
+        } catch (error) {
+            this.regions = this.currentRegion ? [{ name: this.currentRegion, label: null }] : [];
+            this.regionsLimited = true;
+        }
+
+        this.updateRegionControls();
+    }
+
+    updateRegionControls() {
+        const trigger = document.getElementById('regionComboTrigger');
+        if (!trigger) return;
+
+        trigger.disabled = !this.currentProfile || (this.regions || []).length === 0;
+        trigger.title = this.regionsLimited
+            ? 'Only this profile’s own region could be listed — ec2:DescribeRegions was not available'
+            : 'Switch region';
+
+        this.renderRegionLabel();
     }
 
     bindCombo() {
@@ -554,9 +771,19 @@ class Portus {
         const label = document.getElementById('profileComboLabel');
         label.textContent = name;
         label.classList.remove('placeholder');
-        document.getElementById('statusRegion').textContent =
-            (this.selectedProfile && this.selectedProfile.region) || '—';
 
+        // Selecting a profile starts from the region its config names. Carrying a
+        // region across profiles would silently point one account's request at a
+        // region chosen for another.
+        this.currentRegion = (this.selectedProfile && this.selectedProfile.region) || null;
+        this.regions = this.currentRegion ? [{ name: this.currentRegion, label: null }] : [];
+        this.regionsLimited = false;
+        this.endpointCache.clear();
+        this.updateRegionControls();
+
+        // Not awaited: the instance list is what the user is waiting for, and the
+        // picker is already usable with the profile's own region.
+        this.loadRegions();
         this.loadInstances();
     }
 
@@ -846,7 +1073,7 @@ class Portus {
         document.getElementById('refreshBtn').disabled = true;
 
         try {
-            const result = await window.electronAPI.getEc2Instances(this.currentProfile);
+            const result = await window.electronAPI.getEc2Instances(this.currentProfile, this.currentRegion);
 
             if (result && result.success) {
                 // A successful call is the proof that the profile works, whatever
@@ -1173,7 +1400,7 @@ class Portus {
     async connectSsm(instanceId, name) {
         this.toast(`Opening SSM session to ${name}…`, 'info');
         try {
-            const result = await window.electronAPI.connectSSM(this.currentProfile, instanceId);
+            const result = await window.electronAPI.connectSSM(this.currentProfile, instanceId, this.currentRegion);
             if (result && result.success) this.toast(`SSM session started for ${name}`, 'success');
             else throw new Error(result?.error || 'Failed to start SSM session');
         } catch (error) {
@@ -1184,7 +1411,7 @@ class Portus {
     async connectRdp(instanceId, name) {
         this.toast(`Establishing RDP tunnel to ${name}…`, 'info');
         try {
-            const result = await window.electronAPI.connectRDPSSM(this.currentProfile, instanceId, name);
+            const result = await window.electronAPI.connectRDPSSM(this.currentProfile, instanceId, name, this.currentRegion);
             if (result && result.success) {
                 this.toast(result.reused
                     ? `${name} is already tunnelled on port ${result.port}`
@@ -1334,7 +1561,7 @@ class Portus {
         const ensureEndpoints = async () => {
             if (loadState === 'loading' || loadState === 'ready') return;
 
-            const cached = this.endpointCache.get(this.currentProfile);
+            const cached = this.endpointCache.get(this.endpointCacheKey());
             if (cached) {
                 endpoints = cached;
                 loadState = 'ready';
@@ -1482,7 +1709,7 @@ class Portus {
         // app restart to show up
         overlay.querySelector('#pfHostRefresh').addEventListener('mousedown', (e) => {
             e.preventDefault();
-            this.endpointCache.delete(this.currentProfile);
+            this.endpointCache.delete(this.endpointCacheKey());
             endpoints = [];
             loadState = 'idle';
             if (!panelOpen) openPanel(); else { renderList(); ensureEndpoints(); }
@@ -1537,7 +1764,8 @@ class Portus {
             start.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Starting…';
 
             const result = await this.startPortForward(instanceId, name, {
-                remoteHost, remotePort: remote.value.trim(), localPort: local.value.trim()
+                remoteHost, remotePort: remote.value.trim(), localPort: local.value.trim(),
+                region: this.currentRegion
             });
 
             if (result && result.success) {
@@ -1559,7 +1787,7 @@ class Portus {
 
         this.setBusy(true);
         try {
-            const result = await window.electronAPI.getEndpoints(this.currentProfile);
+            const result = await window.electronAPI.getEndpoints(this.currentProfile, this.currentRegion);
 
             if (result && result.success) {
                 if (result.reauthenticated) {
@@ -1569,7 +1797,7 @@ class Portus {
                 }
 
                 const data = result.data || [];
-                this.endpointCache.set(this.currentProfile, data);
+                this.endpointCache.set(this.endpointCacheKey(), data);
 
                 // A permission gap on one service still leaves the others usable,
                 // so this is a note rather than a failure.

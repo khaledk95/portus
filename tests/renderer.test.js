@@ -386,6 +386,123 @@ const openPortDialog = async (app, remote = true) => {
   }
 
   // ---------------------------------------------------------------------------
+  suite.section('the region starts from the profile and can be switched');
+  {
+    const app = await boot();
+    const regionLabel = () => app.document.getElementById('regionComboLabel').textContent.trim();
+
+    suite.check('the picker is disabled before a profile is chosen',
+      app.document.getElementById('regionComboTrigger').disabled === true);
+
+    await pick(app, 'keys');
+    suite.check('it opens on the profile\'s own region',
+      app.portus.currentRegion === 'us-east-1', app.portus.currentRegion);
+    suite.check('the first instance request used it',
+      app.calls.instanceRegions[0] === 'us-east-1', app.calls.instanceRegions);
+    suite.check('the picker names the region', /us-east-1/.test(regionLabel()), regionLabel());
+    suite.check('the picker is now usable',
+      app.document.getElementById('regionComboTrigger').disabled === false);
+    suite.check('the status bar agrees',
+      app.document.getElementById('statusRegion').textContent === 'us-east-1');
+
+    // switch
+    app.document.getElementById('regionComboTrigger').click();
+    await settle(app.window, 40);
+    const options = [...app.document.querySelectorAll('#regionComboList .combo-option')];
+    suite.check('every enabled region is offered', options.length === 3, options.length);
+    suite.check('a known region shows its city',
+      options.some(o => /Frankfurt/.test(o.textContent)), options.map(o => o.textContent.trim()));
+
+    options.find(o => /eu-central-1/.test(o.textContent)).click();
+    await settle(app.window, 120);
+
+    suite.check('switching changes the region', app.portus.currentRegion === 'eu-central-1');
+    suite.check('and reloads instances against it',
+      app.calls.instanceRegions[app.calls.instanceRegions.length - 1] === 'eu-central-1',
+      app.calls.instanceRegions);
+    suite.check('the status bar follows',
+      app.document.getElementById('statusRegion').textContent === 'eu-central-1');
+
+    // a connect made after switching goes to the new region
+    app.document.querySelector('button[data-action="ssm"]').click();
+    await settle(app.window, 60);
+    suite.check('an SSM session opens in the chosen region',
+      app.calls.ssm[0] && app.calls.ssm[0].region === 'eu-central-1', app.calls.ssm);
+    app.window.close();
+  }
+
+  // ---------------------------------------------------------------------------
+  suite.section('switching profiles goes back to that profile\'s region');
+  {
+    const app = await boot();
+    await pick(app, 'keys');                       // configured us-east-1
+
+    // Deliberately a region no other profile is configured for, so a carried-over
+    // value cannot be mistaken for a correct reset.
+    app.portus.chooseRegion('eu-central-1');
+    await settle(app.window, 100);
+    suite.check('a region was chosen', app.portus.currentRegion === 'eu-central-1');
+
+    await pick(app, 'idc-prod');                   // configured eu-west-1
+    suite.check('the new profile starts from its own region, not the one just chosen',
+      app.portus.currentRegion === 'eu-west-1', app.portus.currentRegion);
+
+    await pick(app, 'vault');                      // configured ap-southeast-2
+    suite.check('and so does the next',
+      app.portus.currentRegion === 'ap-southeast-2', app.portus.currentRegion);
+
+    await pick(app, 'keys');
+    suite.check('returning to the first profile returns to its region',
+      app.portus.currentRegion === 'us-east-1', app.portus.currentRegion);
+    app.window.close();
+  }
+
+  // ---------------------------------------------------------------------------
+  suite.section('endpoints are looked up per region, not per profile');
+  {
+    const app = await boot();
+    await pick(app, 'keys');
+
+    await openPortDialog(app);
+    suite.check('endpoints fetched for the starting region',
+      app.calls.endpointRegions[0] === 'us-east-1', app.calls.endpointRegions);
+    app.document.querySelectorAll('.overlay').forEach(o => o.remove());
+
+    app.portus.chooseRegion('eu-central-1');
+    await settle(app.window, 120);
+
+    await openPortDialog(app);
+    suite.check('switching region re-fetches rather than reusing the old list',
+      app.calls.endpointChecks === 2, app.calls.endpointChecks);
+    suite.check('and asks for the new region',
+      app.calls.endpointRegions[1] === 'eu-central-1', app.calls.endpointRegions);
+    app.window.close();
+  }
+
+  // ---------------------------------------------------------------------------
+  suite.section('a region list that could not be read still leaves one usable');
+  {
+    const app = await boot();
+    app.state.regionsResult = {
+      success: true,
+      data: [{ name: 'us-east-1', label: 'N. Virginia' }],
+      configured: 'us-east-1',
+      limited: true,
+      reason: 'not authorized to perform ec2:DescribeRegions'
+    };
+    await pick(app, 'keys');
+
+    suite.check('the profile\'s region is still selected', app.portus.currentRegion === 'us-east-1');
+    suite.check('the picker is enabled with the one region',
+      app.document.getElementById('regionComboTrigger').disabled === false);
+    suite.check('and says why it is short',
+      /DescribeRegions/.test(app.document.getElementById('regionComboTrigger').title),
+      app.document.getElementById('regionComboTrigger').title);
+    suite.check('instances still loaded', app.portus.instances.length === 1);
+    app.window.close();
+  }
+
+  // ---------------------------------------------------------------------------
   suite.section('a failure leaves the app usable');
   {
     const app = await boot();

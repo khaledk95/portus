@@ -12,7 +12,7 @@ const os = require('os');
 const https = require('https');
 
 // AWS SDK imports (EC2 only - needed to list SSM/RDP targets)
-const { EC2Client, DescribeInstancesCommand } = require('@aws-sdk/client-ec2');
+const { EC2Client, DescribeInstancesCommand, DescribeRegionsCommand } = require('@aws-sdk/client-ec2');
 const { SSMClient, DescribeInstanceInformationCommand } = require('@aws-sdk/client-ssm');
 const { RDSClient, DescribeDBInstancesCommand, DescribeDBClustersCommand } = require('@aws-sdk/client-rds');
 const {
@@ -1331,6 +1331,55 @@ function toSsmStatus(info) {
 }
 
 // ============================================================================
+// REGIONS
+// ============================================================================
+//
+// Which regions an account may use is an account-level setting: everything after
+// the original set has to be opted into, and most accounts never opt into most of
+// them. DescribeRegions without AllRegions returns exactly the enabled ones, so
+// the picker offers what will actually work rather than a list of mostly-errors.
+
+// A region reaches the CLI on a command line, so it is checked the same way a
+// remote host is. Every real region — us-east-1, ap-southeast-4, us-gov-west-1,
+// cn-north-1 — fits inside this.
+const VALID_REGION = /^[a-z0-9-]{1,32}$/;
+
+// Region codes say where, not what. These are the names AWS uses for them, so a
+// picker can read "Frankfurt · eu-central-1" instead of asking people to
+// remember which number Frankfurt is. Unknown codes fall back to the code alone,
+// so a region added after this was written still works, just without the name.
+const REGION_NAMES = {
+  'us-east-1': 'N. Virginia', 'us-east-2': 'Ohio',
+  'us-west-1': 'N. California', 'us-west-2': 'Oregon',
+  'af-south-1': 'Cape Town',
+  'ap-east-1': 'Hong Kong',
+  'ap-south-1': 'Mumbai', 'ap-south-2': 'Hyderabad',
+  'ap-northeast-1': 'Tokyo', 'ap-northeast-2': 'Seoul', 'ap-northeast-3': 'Osaka',
+  'ap-southeast-1': 'Singapore', 'ap-southeast-2': 'Sydney',
+  'ap-southeast-3': 'Jakarta', 'ap-southeast-4': 'Melbourne',
+  'ca-central-1': 'Central Canada', 'ca-west-1': 'Calgary',
+  'eu-central-1': 'Frankfurt', 'eu-central-2': 'Zurich',
+  'eu-west-1': 'Ireland', 'eu-west-2': 'London', 'eu-west-3': 'Paris',
+  'eu-north-1': 'Stockholm', 'eu-south-1': 'Milan', 'eu-south-2': 'Spain',
+  'il-central-1': 'Tel Aviv',
+  'me-south-1': 'Bahrain', 'me-central-1': 'UAE',
+  'sa-east-1': 'São Paulo',
+  'us-gov-east-1': 'GovCloud East', 'us-gov-west-1': 'GovCloud West',
+  'cn-north-1': 'Beijing', 'cn-northwest-1': 'Ningxia'
+};
+
+// The region a request should use: what the user picked, or the profile's own.
+// An unrecognised value is discarded rather than passed on, so nothing shaped
+// like a command-line argument can arrive from the renderer and be appended to
+// one.
+async function regionFor(profileName, requested) {
+  if (requested && VALID_REGION.test(requested)) return requested;
+
+  const profile = await getProfileConfig(profileName);
+  return profile.region;
+}
+
+// ============================================================================
 // MANAGED ENDPOINT DISCOVERY
 // ============================================================================
 
@@ -1396,7 +1445,7 @@ function setupIpcHandlers() {
   // the instance to something else in the VPC (an RDS endpoint, for example),
   // which is otherwise unreachable because RDS cannot run an SSM agent.
   ipcMain.handle('start-port-forward', async (event, profileName, instanceId, instanceName, options) => {
-    const { remoteHost, remotePort, localPort } = options || {};
+    const { remoteHost, remotePort, localPort, region: requestedRegion } = options || {};
 
     const targetPort = parseInt(remotePort, 10);
     if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
@@ -1465,7 +1514,8 @@ function setupIpcHandlers() {
     }
 
     const profileFlag = credentialEnv ? '' : ` --profile ${profileName}`;
-    const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name ${documentName} --parameters "${parameters}"${profileFlag} --region ${profileConfig.region}`;
+    const region = await regionFor(profileName, requestedRegion);
+    const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name ${documentName} --parameters "${parameters}"${profileFlag} --region ${region}`;
 
     const result = await startSsmTunnel({
       ssmCommand,
@@ -1597,9 +1647,9 @@ function setupIpcHandlers() {
 
   // EC2 instances - the SSM/RDP target list
   // On expired credentials, silently re-run SSO login once and retry.
-  ipcMain.handle('get-ec2-instances', async (event, profileName) => {
+  ipcMain.handle('get-ec2-instances', async (event, profileName, region) => {
     try {
-      return await describeInstances(profileName);
+      return await describeInstances(profileName, region);
     } catch (error) {
       // An MFA failure looks like a credentials failure to isCredentialsError, but
       // re-running a sign-in cannot supply a code — it is reported as itself.
@@ -1629,7 +1679,7 @@ function setupIpcHandlers() {
       }
 
       try {
-        const result = await describeInstances(profileName);
+        const result = await describeInstances(profileName, region);
         return { ...result, reauthenticated: true };
       } catch (retryError) {
         return {
@@ -1642,12 +1692,12 @@ function setupIpcHandlers() {
   });
 
   // Raw EC2 describe — throws so the caller can decide how to handle failures
-  async function describeInstances(profileName) {
-    const profile = await getProfileConfig(profileName);
+  async function describeInstances(profileName, requestedRegion) {
+    const region = await regionFor(profileName, requestedRegion);
 
     const client = new EC2Client({
       credentials: awsCredentials(profileName),
-      region: profile.region
+      region
     });
 
     // DescribeInstances is paginated. Reading only the first page would silently
@@ -1687,7 +1737,7 @@ function setupIpcHandlers() {
     let ssmManaged = new Map();
     let ssmLookupFailed = false;
     try {
-      ssmManaged = await getSsmManagedInstances(profileName, profile.region);
+      ssmManaged = await getSsmManagedInstances(profileName, region);
     } catch (ssmError) {
       // Credential problems belong to the caller's re-auth path, not here
       if (isCredentialsError(ssmError)) throw ssmError;
@@ -1730,13 +1780,59 @@ function setupIpcHandlers() {
     return { success: true, data: instances, ssmLookupFailed };
   }
 
+  // The regions this account has enabled.
+  //
+  // Never fails in a way that empties the picker: without ec2:DescribeRegions the
+  // profile's own region is returned on its own, so the app behaves exactly as it
+  // did before regions could be switched.
+  ipcMain.handle('get-regions', async (event, profileName) => {
+    const profile = await getProfileConfig(profileName);
+    const configured = profile.region;
+
+    const fallback = (reason) => ({
+      success: true,
+      data: [{ name: configured, label: REGION_NAMES[configured] || null }],
+      configured,
+      limited: true,
+      reason
+    });
+
+    try {
+      const client = new EC2Client({ credentials: awsCredentials(profileName), region: configured });
+
+      // No AllRegions: this returns the enabled ones, which is the whole point
+      const response = await client.send(new DescribeRegionsCommand({}));
+
+      const regions = (response.Regions || [])
+        .map(region => region.RegionName)
+        .filter(name => name && VALID_REGION.test(name))
+        .sort()
+        .map(name => ({ name, label: REGION_NAMES[name] || null }));
+
+      if (!regions.length) return fallback('No regions were returned');
+
+      // The configured region belongs in the list even if DescribeRegions did not
+      // mention it — it is what the profile is set to, and hiding it would leave
+      // the picker disagreeing with the status bar.
+      if (!regions.some(region => region.name === configured)) {
+        regions.push({ name: configured, label: REGION_NAMES[configured] || null });
+        regions.sort((a, b) => a.name.localeCompare(b.name));
+      }
+
+      return { success: true, data: regions, configured, limited: false };
+    } catch (error) {
+      if (isMfaError(error)) return fallback('An MFA code is needed first');
+      return fallback(describeDeniedAction(error));
+    }
+  });
+
   // Managed database endpoints in the profile's region — the target list for
   // "a host reachable from it" in port forwarding.
   // Same re-auth path as the EC2 listing: expired credentials trigger one silent
   // SSO login and a single retry.
-  ipcMain.handle('get-endpoints', async (event, profileName) => {
+  ipcMain.handle('get-endpoints', async (event, profileName, region) => {
     try {
-      return await describeEndpoints(profileName);
+      return await describeEndpoints(profileName, region);
     } catch (error) {
       if (isMfaError(error)) {
         return { success: false, mfaRequired: true, error: error.message };
@@ -1764,7 +1860,7 @@ function setupIpcHandlers() {
       }
 
       try {
-        const result = await describeEndpoints(profileName);
+        const result = await describeEndpoints(profileName, region);
         return { ...result, reauthenticated: true };
       } catch (retryError) {
         return {
@@ -1781,9 +1877,9 @@ function setupIpcHandlers() {
   // Each of the four API calls is isolated: a missing rds:* or elasticache:*
   // permission must degrade to "fewer suggestions", never to a broken dialog,
   // because typing the host by hand still works.
-  async function describeEndpoints(profileName) {
-    const profile = await getProfileConfig(profileName);
-    const config = { credentials: awsCredentials(profileName), region: profile.region };
+  async function describeEndpoints(profileName, requestedRegion) {
+    const region = await regionFor(profileName, requestedRegion);
+    const config = { credentials: awsCredentials(profileName), region };
 
     const rds = new RDSClient(config);
     const elasticache = new ElastiCacheClient(config);
@@ -1961,17 +2057,17 @@ function setupIpcHandlers() {
 
     endpoints.sort((a, b) => a.name.localeCompare(b.name));
 
-    return { success: true, data: endpoints, region: profile.region, warnings };
+    return { success: true, data: endpoints, region, warnings };
   }
 
   // SSM Session - open a shell in a new terminal window
-  ipcMain.handle('connect-ssm', async (event, profileName, instanceId) => {
+  ipcMain.handle('connect-ssm', async (event, profileName, instanceId, requestedRegion) => {
     return new Promise((resolve, reject) => {
-      getProfileConfig(profileName).then(profile => {
+      regionFor(profileName, requestedRegion).then(region => {
         const platform = process.platform;
         let command, args;
 
-        const awsCommand = `aws ssm start-session --target ${instanceId} --profile ${profileName} --region ${profile.region}`;
+        const awsCommand = `aws ssm start-session --target ${instanceId} --profile ${profileName} --region ${region}`;
 
         if (platform === 'win32') {
           command = 'cmd';
@@ -2033,7 +2129,7 @@ function setupIpcHandlers() {
   // RDP over SSM - port-forward tunnel + launch RDP client.
   // The tunnel is registered so it can be listed in the UI and terminated on exit.
   // RDP over SSM: a 3389 port forward plus the platform's RDP client.
-  ipcMain.handle('connect-rdp-ssm', async (event, profileName, instanceId, instanceName) => {
+  ipcMain.handle('connect-rdp-ssm', async (event, profileName, instanceId, instanceName, requestedRegion) => {
     // Only an existing *RDP* tunnel can be reused. Without the kind check a port
     // forward on the same instance would be mistaken for an open RDP session.
     const existing = Array.from(activeTunnels.values()).find(tunnel =>
@@ -2058,8 +2154,6 @@ function setupIpcHandlers() {
       return { success: false, error: `Could not find an available local port: ${error.message}` };
     }
 
-    const profileConfig = await getProfileConfig(profileName);
-
     let credentialEnv;
     try {
       credentialEnv = await cliCredentialEnv(profileName);
@@ -2068,7 +2162,8 @@ function setupIpcHandlers() {
     }
 
     const profileFlag = credentialEnv ? '' : ` --profile ${profileName}`;
-    const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=3389,localPortNumber=${localPort}"${profileFlag} --region ${profileConfig.region}`;
+    const region = await regionFor(profileName, requestedRegion);
+    const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=3389,localPortNumber=${localPort}"${profileFlag} --region ${region}`;
 
     const result = await startSsmTunnel({
       ssmCommand,

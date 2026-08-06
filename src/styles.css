@@ -334,6 +334,11 @@ button { cursor: pointer; }
   font-size: 11px; color: var(--text-dim);
 }
 
+/* The region picker reuses the profile combobox wholesale. Only the panel is
+   narrower — a region is a city and a code, not a long profile name. */
+#regionCombo .combo-panel { width: 260px; }
+#regionComboNote { font-size: 10.5px; color: var(--text-dim); }
+
 /* ---------- endpoint combobox (port forwarding) ----------
    Editable rather than a picker: the input is both the filter and the value, so
    an endpoint that was never discovered can still be typed in full. */

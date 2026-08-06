@@ -96,6 +96,32 @@
                 </div>
             </div>
 
+            <div class="side-section">
+                <div class="side-label">Region</div>
+                <div class="profile-combo" id="regionCombo">
+                    <button type="button" id="regionComboTrigger" class="profile-picker"
+                            disabled aria-haspopup="listbox" aria-expanded="false"
+                            data-label="Region">
+                        <i class="fas fa-globe dim"></i>
+                        <span class="name placeholder" id="regionComboLabel">—</span>
+                        <i class="fas fa-chevron-down dim caret"></i>
+                    </button>
+                    <div class="combo-panel" id="regionComboPanel">
+                        <div class="combo-search">
+                            <i class="fas fa-search"></i>
+                            <input type="text" id="regionComboSearch" placeholder="Search regions…"
+                                   autocomplete="off" spellcheck="false">
+                        </div>
+                        <div class="combo-list" id="regionComboList" role="listbox"
+                             aria-label="Enabled AWS regions"></div>
+                        <div class="combo-foot">
+                            <span id="regionComboNote"></span>
+                            <span id="regionComboCount"></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <nav class="nav">
                 <button type="button" class="nav-item active" data-view="instances" data-label="Instances">
                     <i class="fas fa-server"></i>

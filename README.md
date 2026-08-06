@@ -67,11 +67,12 @@ for them on startup and tells you what is missing.
 - **Works with however you authenticate to AWS** — IAM Identity Center, Azure AD, `credential_process`, assume-role, static keys or environment credentials. Every profile in `~/.aws` is listed and selectable with no sign-in required first
 - **Sign in from the app** for IAM Identity Center (`aws sso login`, with the browser pairing code shown so you can confirm it) and Azure AD (`aws-azure-login`) — the session countdown reads from whichever store that provider uses
 - **EC2 instance browser** — live list per profile/region, searchable
+- **Region switcher** — starts on the region the profile's config names, and offers only the regions the account has actually enabled, searchable by city or code. Everything follows it: the instance list, endpoint discovery, SSM shells, RDP and port forwards
 - **SSM readiness at a glance** — per-instance agent status (Online / Connection lost / Not managed), so you never click Connect on an instance that can't accept a session
 - **One-click SSM shell** — opens `aws ssm start-session` in a new terminal window
 - **RDP over SSM** — auto port-forward tunnel + launches your RDP client (Windows-only instances)
 - **Port forwarding over SSM** — tunnel any TCP port to `localhost`, either on the instance itself or on a host it can reach (an RDS endpoint, for example), so you can use your own database or web client without a bastion or an inbound rule
-- **Endpoint discovery** — RDS, Aurora (writer endpoint) and ElastiCache endpoints in the profile's region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed
+- **Endpoint discovery** — RDS, Aurora (writer endpoint) and ElastiCache endpoints in the selected region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
 - **Startup preflight** — missing external tools are reported up front with install instructions rather than failing later mid-connect, and provider-specific ones are only demanded when a profile actually uses them
 - **Session renewal** — Azure AD sessions are refreshed before they expire and an expired one is renewed and retried transparently, so you are not thrown back to the login screen mid-task. IAM Identity Center needs a browser approval, so it is never renewed on a timer — you get a warning shortly before it lapses and sign in when you are ready
@@ -86,6 +87,7 @@ for them on startup and tells you what is missing.
 
 ```
 1. Select Profile   → pick any profile from ~/.aws (loads its EC2 instances)
+   Region           → starts on the profile's own; switch to any the account has enabled
 2. Sign in          → only if those credentials are missing or expired
                       (IAM Identity Center or Azure AD)
 3. Connect          → per instance row, choose:
@@ -106,7 +108,7 @@ reach — which is how you get to an **RDS endpoint**, since RDS cannot run an S
 | A reachable host | `AWS-StartPortForwardingSessionToRemoteHost` | RDS, ElastiCache, an internal load balancer… |
 
 For a reachable host, Portus lists the managed database and cache endpoints in the
-profile's region so the hostname does not have to be copied out of the console. Pick
+selected region so the hostname does not have to be copied out of the console. Pick
 one, or type any other host — the field accepts both.
 
 | Service | Listed |
@@ -171,6 +173,7 @@ and shows a banner naming anything missing, with its install command.
 | Action | Used for |
 |--------|----------|
 | `ec2:DescribeInstances` | Listing instances |
+| `ec2:DescribeRegions` | The region switcher. Without it only the profile's own region is offered — nothing else is affected |
 | `ssm:DescribeInstanceInformation` | The **SSM Agent** column (connection readiness) |
 | `ssm:StartSession` | SSM shells, RDP tunnels and port forwards |
 | `ssm:TerminateSession` / `ssm:ResumeSession` | Closing your own sessions cleanly |
@@ -453,6 +456,7 @@ All builds output to the `dist/` folder (git-ignored).
 │   ├── endpoints.test.js  # RDS / Aurora / ElastiCache discovery
 │   ├── injection.test.js  # Nothing hostile reaches a shell command
 │   ├── mfa.test.js        # mfa_serial prompting, caching and cancellation
+│   ├── regions.test.js    # Enabled regions, and the region reaching every request
 │   ├── release-check.test.js  # Version comparison and which links may be opened
 │   ├── renderer.test.js   # The UI, driven through the real markup
 │   ├── window.test.js     # Which platforms keep the application menu

@@ -72,7 +72,12 @@ async function bootRenderer(options = {}) {
     updateChecks: 0,
     ssm: [],
     rdp: [],
-    closedTunnels: []
+    closedTunnels: [],
+    regionLookups: [],
+    // every region a request was made against, so a test can assert what the
+    // main process would have received
+    instanceRegions: [],
+    endpointRegions: []
   };
 
   const state = {
@@ -81,6 +86,12 @@ async function bootRenderer(options = {}) {
     instances: options.instances || [],
     endpoints: options.endpoints || [],
     tunnels: options.tunnels || [],
+    regions: options.regions || [
+      { name: 'eu-central-1', label: 'Frankfurt' },
+      { name: 'eu-west-1', label: 'Ireland' },
+      { name: 'us-east-1', label: 'N. Virginia' }
+    ],
+    regionsResult: null,
     update: options.update || { available: false },
     instancesResult: null,        // set to force a failure
     endpointsResult: null,
@@ -97,6 +108,16 @@ async function bootRenderer(options = {}) {
 
     getProfiles: async () => ({ success: true, data: state.profiles }),
     getLoginTargets: async () => ({ success: true, data: state.loginTargets }),
+
+    getRegions: async (name) => {
+      calls.regionLookups.push(name);
+      return state.regionsResult || ({
+        success: true,
+        data: state.regions,
+        configured: (state.profiles.find(p => p.name === name) || {}).region,
+        limited: false
+      });
+    },
 
     signIn: async (name) => {
       calls.signIns.push(name);
@@ -115,15 +136,19 @@ async function bootRenderer(options = {}) {
     getSessionStatus: async () => ({ success: true, expiresInMs: 3600000 }),
     refreshSession: async () => ({ success: true }),
 
-    getEc2Instances: async () => state.instancesResult || ({ success: true, data: state.instances }),
-    getEndpoints: async () => {
+    getEc2Instances: async (p, region) => {
+      calls.instanceRegions.push(region);
+      return state.instancesResult || ({ success: true, data: state.instances });
+    },
+    getEndpoints: async (p, region) => {
       calls.endpointChecks += 1;
+      calls.endpointRegions.push(region);
       return state.endpointsResult
-        || ({ success: true, data: state.endpoints, region: 'eu-central-1', warnings: [] });
+        || ({ success: true, data: state.endpoints, region, warnings: [] });
     },
 
-    connectSSM: async (p, id) => { calls.ssm.push(id); return { success: true }; },
-    connectRDPSSM: async (p, id) => { calls.rdp.push(id); return { success: true }; },
+    connectSSM: async (p, id, region) => { calls.ssm.push({ id, region }); return { success: true }; },
+    connectRDPSSM: async (p, id, name, region) => { calls.rdp.push({ id, region }); return { success: true }; },
     startPortForward: async (p, id, name, opts) => {
       calls.forwards.push(opts);
       return { success: true, port: 50001, tunnelId: 't1' };
