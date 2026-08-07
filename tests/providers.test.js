@@ -11,9 +11,34 @@ const { createSuite } = require('./helpers/assert');
 const files = {};
 let spawnReply = { exit: 0 };
 
+// The SAML mechanics live in azure-saml.test.js. Here the module is stubbed so
+// these checks are about routing: which provider runs, with what, and silently or
+// not.
+let lastAssertionRequest = null;
+
+const ASSERTION_ROLES = [
+  {
+    roleArn: 'arn:aws:iam::123456789012:role/Corp',
+    principalArn: 'arn:aws:iam::123456789012:saml-provider/Azure'
+  },
+  {
+    roleArn: 'arn:aws:iam::123456789012:role/Other',
+    principalArn: 'arn:aws:iam::123456789012:saml-provider/Azure'
+  }
+];
+
 const { handlers, state, ready } = loadMain({
   files,
-  onSpawn: () => spawnReply
+  onSpawn: () => spawnReply,
+  modules: {
+    './azure-saml': {
+      requestAssertion: async (profile, options) => {
+        lastAssertionRequest = { profile: profile.name, options };
+        return { samlResponse: 'PHNhbWw+', roles: ASSERTION_ROLES };
+      },
+      forgetSession: async () => {}
+    }
+  }
 });
 
 const suite = createSuite('Credential providers');
@@ -304,11 +329,15 @@ aws_secret_access_key = x
 
   state.spawns.length = 0;
   state.sent.length = 0;
-  await signIn({}, 'azure-corp');
-  suite.check('Azure runs aws-azure-login',
-    state.spawns.some(spawn => spawn.command === 'aws-azure-login'), state.spawns);
+  const azureResult = await signIn({}, 'azure-corp');
+  suite.check('Azure signs in without spawning anything',
+    state.spawns.length === 0, state.spawns);
+  suite.check('and assumes the role the profile names',
+    azureResult.roleArn === 'arn:aws:iam::123456789012:role/Corp', azureResult);
   suite.check('no pairing code for Azure',
     !state.sent.some(message => message.channel === 'sso-verification'));
+  suite.check('the sign-in was interactive, not silent',
+    lastAssertionRequest && lastAssertionRequest.options.silent === false, lastAssertionRequest);
 
   const refuses = async (profileName, pattern) => {
     try {
@@ -343,9 +372,11 @@ aws_secret_access_key = x
 
   state.spawns.length = 0;
   const azureRenew = await refreshSession({}, 'azure-corp');
-  suite.check('an Azure renewal still runs silently',
-    azureRenew.success === true && state.spawns.some(spawn => spawn.command === 'aws-azure-login'),
+  suite.check('an Azure renewal still succeeds without showing anything',
+    azureRenew.success === true && state.spawns.length === 0,
     { azureRenew, spawns: state.spawns });
+  suite.check('and it asked for a silent attempt',
+    lastAssertionRequest && lastAssertionRequest.options.silent === true, lastAssertionRequest);
 
   // ---------------------------------------------------------------------------
   suite.section('the countdown reads the store that provider uses');
@@ -376,9 +407,12 @@ aws_secret_access_key = x
   status = await sessionStatus({}, 'idc-legacy');
   suite.check('a portal with no cached token reports no expiry', status.expiresInMs === null, status);
 
+  // azure-corp was signed into above, so Portus now holds its credentials and
+  // knows exactly when they lapse — better than anything read out of a file.
   status = await sessionStatus({}, 'azure-corp');
-  suite.check('Azure expiry still comes from ~/.aws/credentials',
-    status.expiresAt && status.expiresAt.startsWith('2099'), status);
+  const azureHoursLeft = status.expiresInMs / 3600000;
+  suite.check('Azure expiry comes from the credentials Portus holds',
+    azureHoursLeft > 0.9 && azureHoursLeft < 1.1, { azureHoursLeft, status });
 
   status = await sessionStatus({}, 'keys');
   suite.check('access keys report no expiry', status.expiresInMs === null, status);
@@ -389,12 +423,15 @@ aws_secret_access_key = x
     status.success === true && status.expiresInMs === null, status);
 
   // ---------------------------------------------------------------------------
-  suite.section('only the tools a profile actually needs are demanded');
+  suite.section('an Azure profile asks for nothing extra to be installed');
   setConfig(FULL_CONFIG, FULL_CREDENTIALS);
 
   let tools = await preflight({});
-  suite.check('an Azure profile means aws-azure-login is checked',
-    tools.tools.some(tool => tool.id === 'aws-azure-login'), tools.tools.map(t => t.id));
+  suite.check('the preflight is the same with an Azure profile as without',
+    tools.tools.length === 2, tools.tools.map(t => t.id));
+  suite.check('only the AWS CLI and the Session Manager plugin are checked',
+    tools.tools.map(t => t.id).sort().join(',') === 'aws-cli,session-manager-plugin',
+    tools.tools.map(t => t.id));
 
   setConfig(`
 [profile idc-prod]
@@ -402,10 +439,9 @@ sso_session = mycompany
 region = eu-central-1
 `, '');
   tools = await preflight({});
-  suite.check('without one, aws-azure-login is not demanded',
-    !tools.tools.some(tool => tool.id === 'aws-azure-login'), tools.tools.map(t => t.id));
-  suite.check('the AWS CLI is always demanded, since sso login needs it',
-    tools.tools.some(tool => tool.id === 'aws-cli'), tools.tools.map(t => t.id));
+  suite.check('and the same two for anyone else',
+    tools.tools.map(t => t.id).sort().join(',') === 'aws-cli,session-manager-plugin',
+    tools.tools.map(t => t.id));
 
   // ---------------------------------------------------------------------------
   suite.section('a damaged ~/.aws degrades rather than fails');

@@ -20,7 +20,9 @@ const {
   DescribeReplicationGroupsCommand,
   DescribeCacheClustersCommand
 } = require('@aws-sdk/client-elasticache');
+const { STSClient, AssumeRoleWithSAMLCommand, AssumeRoleCommand } = require('@aws-sdk/client-sts');
 const { fromIni } = require('@aws-sdk/credential-providers');
+const azureSaml = require('./azure-saml');
 
 let mainWindow;
 
@@ -82,42 +84,121 @@ function settleMfaRequest(id, code) {
   return true;
 }
 
-// Credentials resolved after an MFA prompt, kept until they expire.
+// Credentials Portus resolved itself, kept until they expire.
 //
-// This cache exists only for profiles that need a code. The SDK provider is
-// rebuilt for every client, so without it the user would be asked again for the
-// instance list, again for the SSM inventory, and again for every refresh.
-const mfaCredentialCache = new Map();
+// Two things land here: what an Azure sign-in produced, and what an MFA prompt
+// produced. Neither is written to ~/.aws/credentials, and the SDK provider is
+// rebuilt for every client, so without this cache the user would be asked again
+// for the instance list, again for the SSM inventory, and again for every refresh.
+const sessionCredentialCache = new Map();
 
 // A minute of headroom, so credentials are not handed to a tunnel that outlives them
-const MFA_CREDENTIAL_SKEW_MS = 60000;
+const CREDENTIAL_SKEW_MS = 60000;
 
-function cachedMfaCredentials(profileName) {
-  const entry = mfaCredentialCache.get(profileName);
+function cachedSessionCredentials(profileName) {
+  const entry = sessionCredentialCache.get(profileName);
   if (!entry) return null;
 
-  if (entry.expiration && entry.expiration.getTime() - Date.now() < MFA_CREDENTIAL_SKEW_MS) {
-    mfaCredentialCache.delete(profileName);
+  if (entry.expiration && entry.expiration.getTime() - Date.now() < CREDENTIAL_SKEW_MS) {
+    sessionCredentialCache.delete(profileName);
     return null;
   }
 
   return entry;
 }
 
+// The nearest profile up a source_profile chain whose credentials Portus is
+// holding, or null. Cheap enough to ask before every call.
+async function cachedAncestorOf(profileName) {
+  const all = await describeProfiles();
+  const byName = new Map(all.map(profile => [profile.name, profile]));
+
+  const chain = sourceProfileChain(profileName, byName);
+  const index = chain.findIndex(name => cachedSessionCredentials(name));
+
+  return index === -1 ? null : { chain, index, byName };
+}
+
+// Assume-role chains that start at a profile Portus signed in itself.
+//
+// The SDK cannot do this one: chaining reads the source profile's credentials out
+// of ~/.aws/credentials, and an Azure sign-in deliberately never writes them
+// there. So the hops are walked here instead, from the signed-in profile down to
+// the one that was asked for. The tool this replaced got the same result by
+// writing keys to disk, which is exactly what we are not doing.
+async function credentialsFromCachedAncestor(profileName) {
+  const found = await cachedAncestorOf(profileName);
+  if (!found) return null;
+
+  const { chain, index, byName } = found;
+
+  let credentials = cachedSessionCredentials(chain[index]).credentials;
+
+  // Back down the chain: the ancestor's child first, the asked-for profile last
+  const hops = [...chain.slice(0, index).reverse(), profileName];
+
+  for (const name of hops) {
+    const hop = byName.get(name);
+
+    // Not an assume-role hop, so there is nothing here to walk. Falling through
+    // to the SDK is right: it may still resolve this profile some other way.
+    if (!hop || !hop.roleArn) return null;
+
+    const sts = new STSClient({ region: hop.region || 'us-east-1', credentials });
+    const response = await sts.send(new AssumeRoleCommand({
+      RoleArn: hop.roleArn,
+      RoleSessionName: hop.roleSessionName || 'portus',
+      ...(hop.durationSeconds ? { DurationSeconds: hop.durationSeconds } : {}),
+      ...(hop.externalId ? { ExternalId: hop.externalId } : {}),
+      ...(hop.mfaSerial ? {
+        SerialNumber: hop.mfaSerial,
+        TokenCode: await askRendererForMfaCode(name)
+      } : {})
+    }));
+
+    const issued = response.Credentials;
+    if (!issued) throw new Error(`AWS returned no credentials for ${hop.roleArn}.`);
+
+    credentials = {
+      accessKeyId: issued.AccessKeyId,
+      secretAccessKey: issued.SecretAccessKey,
+      sessionToken: issued.SessionToken,
+      expiration: issued.Expiration ? new Date(issued.Expiration) : null
+    };
+
+    // Every hop is cached, not only the last: a sibling profile assuming from the
+    // same intermediate reuses it instead of repeating the chain, and an MFA code
+    // is asked for once rather than once per profile.
+    sessionCredentialCache.set(name, { credentials, expiration: credentials.expiration });
+  }
+
+  return credentials;
+}
+
 // IMPORTANT: the AWS SDK caches ~/.aws/config and ~/.aws/credentials in-process
 // (@smithy/shared-ini-file-loader slurpFile keeps a module-level promise hash).
-// aws-azure-login rewrites those files on every login, so without ignoreCache the
-// app keeps using stale/expired credentials until the process restarts.
+// Anything that edits them while Portus runs — `aws sso login`, `aws configure`,
+// a hand edit, the Refresh button's whole reason for existing — is invisible
+// without ignoreCache, and the app keeps using stale or expired credentials until
+// the process restarts.
 //
 // Resolved credentials are deliberately NOT cached for ordinary profiles, for the
 // same reason: a fresh login has to take effect immediately. Only the MFA case
 // caches, because there the alternative is prompting on every single call.
 function awsCredentials(profileName) {
   return async () => {
-    const cached = cachedMfaCredentials(profileName);
+    const cached = cachedSessionCredentials(profileName);
     if (cached) return cached.credentials;
 
     const profile = await findProfile(profileName);
+
+    // Only a profile that chains can be reached this way, and checking costs a
+    // read of ~/.aws — so the ones that cannot are not asked about.
+    if (profile && profile.sourceProfile) {
+      const chained = await credentialsFromCachedAncestor(profileName);
+      if (chained) return chained;
+    }
+
     const needsMfa = !!(profile && profile.mfaSerial);
 
     const credentials = await fromIni({
@@ -127,7 +208,7 @@ function awsCredentials(profileName) {
     })();
 
     if (needsMfa) {
-      mfaCredentialCache.set(profileName, {
+      sessionCredentialCache.set(profileName, {
         credentials,
         expiration: credentials.expiration ? new Date(credentials.expiration) : null
       });
@@ -137,13 +218,26 @@ function awsCredentials(profileName) {
   };
 }
 
-// The AWS CLI would prompt for the code itself, on a stdin nothing is attached to.
-// For an MFA profile the credentials are resolved here instead — asking once, in a
-// window the user can see — and passed to the CLI through the environment, so it
-// has nothing left to ask for.
+// Credentials the CLI cannot find for itself, handed over in the environment.
+//
+// Three cases need this. An MFA profile, where the CLI would otherwise prompt for
+// a code on a stdin nothing is attached to. An Azure profile signed in through
+// Portus, where the credentials were never written to ~/.aws/credentials at all.
+// And a profile that assumes a role from one of those, which the CLI cannot chain
+// for the same reason.
+//
+// Returns null when there is nothing to hand over, which is what keeps profiles
+// signed in by some other tool working exactly as they always did: no environment,
+// the --profile flag stays, and the CLI reads the files itself.
 async function cliCredentialEnv(profileName) {
   const profile = await findProfile(profileName);
-  if (!profile || !profile.mfaSerial) return null;
+  if (!profile) return null;
+
+  const cached = cachedSessionCredentials(profileName);
+  const needsResolving = cached
+    || profile.mfaSerial
+    || (profile.sourceProfile && await cachedAncestorOf(profileName));
+  if (!needsResolving) return null;
 
   const credentials = await awsCredentials(profileName)();
 
@@ -370,17 +464,7 @@ const REQUIRED_TOOLS = [
     purpose: 'Required by the AWS CLI to start a session',
     install: 'https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html'
   },
-  {
-    id: 'aws-azure-login',
-    name: 'aws-azure-login',
-    command: 'aws-azure-login',
-    purpose: 'Performs the Azure AD SSO sign-in',
-    install: 'npm install -g aws-azure-login',
-    // Only meaningful to someone who actually has an Azure profile. Demanding it
-    // of everyone put a red banner in front of every other kind of AWS user for
-    // a tool they will never install.
-    neededFor: 'azure'
-  }
+  // Azure AD needs nothing here: that sign-in runs in the app, see src/azure-saml.js
 ];
 
 // Resolve a command on PATH. Presence is checked rather than `--version`, because
@@ -579,6 +663,44 @@ async function launchRdpClient(tunnelId, localPort) {
     success: false,
     error: 'No RDP client found. Please install remmina, xfreerdp, or rdesktop.'
   };
+}
+
+// A private script that exports credentials and then becomes the AWS CLI.
+//
+// Only macOS needs this. Terminal.app is already running and does not inherit a
+// spawned process's environment, so the credentials have to travel some other
+// way, and the obvious one — writing them into the `do script` string — types
+// them into the visible window and leaves them in shell history.
+//
+// Written 0600 inside a 0700 directory, and removed once the shell has read it.
+async function writeCredentialScript(awsCommand, credentialEnv) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'portus-'), { mode: 0o700 });
+  const scriptPath = path.join(directory, 'session.sh');
+
+  // A single-quoted string ends at the first quote inside it, so an unexpected
+  // one would leave the rest of the value as shell. STS does not put quotes in
+  // credentials, but this file becomes a shell script and is quoted accordingly.
+  const quote = value => `'${String(value).replace(/'/g, `'\\''`)}'`;
+
+  // exec, so the CLI replaces the shell and closing the session closes the window
+  const body = [
+    '#!/bin/sh',
+    ...Object.entries(credentialEnv).map(([key, value]) => `export ${key}=${quote(value)}`),
+    `exec ${awsCommand}`,
+    ''
+  ].join('\n');
+
+  await fs.writeFile(scriptPath, body, { mode: 0o700 });
+
+  return scriptPath;
+}
+
+// The shell reads the script once, at startup, so it can go immediately after.
+// The delay is only to let that happen; the session itself is unaffected.
+function scheduleScriptRemoval(scriptPath, delayMs = 5000) {
+  setTimeout(() => {
+    fs.remove(path.dirname(scriptPath)).catch(() => { /* temp dir; nothing to do */ });
+  }, delayMs).unref();
 }
 
 // Shared tunnel launcher for port forwarding. Resolves once the CLI reports the
@@ -790,14 +912,16 @@ const CREDENTIAL_PROVIDERS = [
 // refreshed from inside the app, the way access keys have nothing to refresh.
 // Adding `aws sso login` here is what turns Identity Center from "works if you
 // already logged in through the CLI" into "works from the button".
-// Each runner receives the resolved profile, not just its name, because what the
-// command should target differs: aws-azure-login takes the profile, while
-// `aws sso login` should take the session when the profile names one.
+// Each runner receives the resolved profile, not just its name, because what a
+// login needs differs: the Azure flow reads the tenant and app id off the profile,
+// while `aws sso login` should target the session when the profile names one.
 // `interactive` means the login cannot complete without the user doing something
 // in another window. Those are never started on a timer: silently opening a
 // browser at someone mid-task is worse than letting the session lapse and saying so.
 const LOGIN_RUNNERS = {
-  azure: { run: profile => runAzureLogin(profile.name), interactive: false },
+  // Azure is not interactive in the sense that matters here: a renewal is
+  // attempted without showing anything, and only asks when Microsoft would.
+  azure: { run: (profile, options) => runAzureLogin(profile, options), interactive: false },
   sso: { run: profile => runSsoLogin(profile), interactive: true }
 };
 
@@ -884,9 +1008,21 @@ async function describeProfiles() {
         // the device AWS wants a code from before it will assume the role
         mfaSerial: settings.mfa_serial || null,
         requiresMfa: !!settings.mfa_serial,
+        // what the SAML request needs. The tenant and app id identify the
+        // organisation, so they stay here rather than crossing to the renderer.
+        azureTenantId: settings.azure_tenant_id || null,
+        azureAppIdUri: settings.azure_app_id_uri || settings.azure_app_id || null,
+        azureDefaultRoleArn: settings.azure_default_role_arn || null,
+        azureDurationHours: parseInt(settings.azure_default_duration_hours, 10) || null,
         // the profile this one assumes a role from; a sign-in to that profile is
         // what makes this one work
         sourceProfile: settings.source_profile || null,
+        // the assume-role hop itself, needed when Portus has to walk the chain
+        // rather than leave it to the SDK
+        roleArn: settings.role_arn || null,
+        roleSessionName: settings.role_session_name || null,
+        externalId: settings.external_id || null,
+        durationSeconds: parseInt(settings.duration_seconds, 10) || null,
         ssoSession: sessionName,
         ssoStartUrl,
         ssoRegion
@@ -920,9 +1056,10 @@ async function findProfile(profileName) {
 // per profile would offer the same login several times over, each appearing to do
 // something different. They are grouped by session instead.
 //
-// aws-azure-login really is per profile, and an older Identity Center profile with
-// an inline sso_start_url has no session name to group under, so both stay
-// individual entries.
+// An Azure sign-in really is per profile — the tenant, the app and the role all
+// come off the profile — and an older Identity Center profile with an inline
+// sso_start_url has no session name to group under, so both stay individual
+// entries.
 async function readLoginTargets() {
   const all = await describeProfiles();
   const byName = new Map(all.map(profile => [profile.name, profile]));
@@ -969,9 +1106,9 @@ async function readLoginTargets() {
   });
 
   // Profiles that assume a role from one of the above are made usable by that
-  // same sign-in — the SDK reads the source profile's freshly written credentials
-  // and calls AssumeRole with them. This is how one aws-azure-login covers a whole
-  // set of accounts, so those profiles belong in the count.
+  // same sign-in — see credentialsFromCachedAncestor, which walks the hops. This
+  // is how one Azure sign-in covers a whole set of accounts, so those profiles
+  // belong in the count.
   all.forEach(profile => {
     if (ownerOf.has(profile.name)) return;   // signs itself in; already counted
 
@@ -1009,7 +1146,7 @@ function sourceProfileChain(name, byName, maxDepth = 10) {
 // Start whatever login the profile's provider declares, and remember it so the
 // session can later be refreshed without asking again. Throws when the provider
 // has no login — which is not a failure state, only a thing this cannot do.
-async function runLoginFor(profileName) {
+async function runLoginFor(profileName, options = {}) {
   const profile = (await describeProfiles()).find(p => p.name === profileName);
   if (!profile) throw new Error(`Profile "${profileName}" was not found in ~/.aws`);
 
@@ -1018,78 +1155,111 @@ async function runLoginFor(profileName) {
     throw new Error(`${profile.providerLabel} profiles have no sign-in for Portus to run.`);
   }
 
-  const result = await runner.run(profile);
+  const result = await runner.run(profile, options);
   lastSsoProfile = profileName;
 
   return { ...result, provider: profile.provider, providerLabel: profile.providerLabel };
 }
 
-// Run aws-azure-login for a profile. Resolves on success, rejects with { error }.
-function runAzureLogin(profileName, timeoutMs = 25000) {
+// ============================================================================
+// AZURE AD SIGN-IN
+// ============================================================================
+//
+// The SAML flow itself lives in src/azure-saml.js.
+//
+// The credentials this produces are never written to ~/.aws/credentials. They
+// live in the same in-memory cache the MFA path uses and reach the CLI through
+// the environment, so signing in leaves nothing on disk.
+
+let pendingRoleChoice = null;
+
+// Asks which role to assume when the assertion offers more than one and the
+// profile does not name a default.
+function askRendererToChooseRole(profileName, roles) {
   return new Promise((resolve, reject) => {
-    const platform = process.platform;
-    const command = 'aws-azure-login';
-    const args = ['--profile', profileName];
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      reject(new Error('There is no window to choose a role in.'));
+      return;
+    }
 
-    const spawnOptions = platform === 'win32'
-      ? { stdio: 'pipe', shell: true, windowsHide: true }
-      : {
-          stdio: 'pipe',
-          shell: true,
-          env: { ...process.env, PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin' }
-        };
+    const id = `role-${Date.now()}`;
+    pendingRoleChoice = { id, resolve, reject };
 
-    const azureAwsLogin = spawn(command, args, spawnOptions);
-
-    let output = '';
-    let errorOutput = '';
-    let hasResponded = false;
-
-    const timeout = setTimeout(() => {
-      if (!hasResponded) {
-        hasResponded = true;
-        azureAwsLogin.kill();
-        reject({ success: false, error: `Authentication process timed out after ${Math.round(timeoutMs / 1000)} seconds` });
-      }
-    }, timeoutMs);
-
-    azureAwsLogin.stdout.on('data', (data) => { output += data.toString(); });
-    azureAwsLogin.stderr.on('data', (data) => { errorOutput += data.toString(); });
-
-    azureAwsLogin.on('close', (code) => {
-      if (!hasResponded) {
-        hasResponded = true;
-        clearTimeout(timeout);
-        if (code === 0) {
-          resolve({ success: true, output });
-        } else {
-          const errorMsg = errorOutput || `Process exited with code ${code}`;
-          reject({ success: false, error: `Authentication failed: ${errorMsg}` });
-        }
-      }
-    });
-
-    azureAwsLogin.on('error', (error) => {
-      if (!hasResponded) {
-        hasResponded = true;
-        clearTimeout(timeout);
-        if (error.code === 'ENOENT') {
-          const installMessage = platform === 'win32'
-            ? 'aws-azure-login command not found. Please ensure it is installed and accessible:\n\nnpm install -g aws-azure-login\n\nThen restart the application.'
-            : 'aws-azure-login command not found. Please ensure it is installed:\n\nnpm install -g aws-azure-login\n\nOr via Homebrew:\nbrew install aws-azure-login';
-          reject({ success: false, error: installMessage });
-        } else {
-          reject({ success: false, error: `Command execution failed: ${error.message}` });
-        }
-      }
+    mainWindow.webContents.send('role-choice-required', {
+      id,
+      profileName,
+      // Only the role ARNs. The principal is an implementation detail the
+      // renderer has no use for.
+      roles: roles.map(role => role.roleArn)
     });
   });
 }
 
+function settleRoleChoice(id, roleArn) {
+  if (!pendingRoleChoice || pendingRoleChoice.id !== id) return false;
+
+  const { resolve, reject } = pendingRoleChoice;
+  pendingRoleChoice = null;
+
+  if (roleArn) resolve(roleArn);
+  else reject(new Error('Role selection was cancelled.'));
+
+  return true;
+}
+
+async function runAzureLogin(profile, { silent = false } = {}) {
+  const { samlResponse, roles } = await azureSaml.requestAssertion(profile, {
+    silent,
+    parent: mainWindow
+  });
+
+  // A profile naming its role is the normal case, and the reason a renewal can
+  // complete without asking anything.
+  let chosen = profile.azureDefaultRoleArn
+    ? roles.find(role => role.roleArn === profile.azureDefaultRoleArn)
+    : null;
+
+  if (!chosen) {
+    if (roles.length === 1) {
+      chosen = roles[0];
+    } else if (silent) {
+      throw new Error('More than one role is available and the profile names no default.');
+    } else {
+      const roleArn = await askRendererToChooseRole(profile.name, roles);
+      chosen = roles.find(role => role.roleArn === roleArn);
+      if (!chosen) throw new Error('That role was not in the assertion.');
+    }
+  }
+
+  const sts = new STSClient({ region: profile.region || 'us-east-1' });
+  const response = await sts.send(new AssumeRoleWithSAMLCommand({
+    RoleArn: chosen.roleArn,
+    PrincipalArn: chosen.principalArn,
+    SAMLAssertion: samlResponse,
+    ...(profile.azureDurationHours ? { DurationSeconds: profile.azureDurationHours * 3600 } : {})
+  }));
+
+  const credentials = response.Credentials;
+  if (!credentials) throw new Error('AWS returned no credentials for that role.');
+
+  sessionCredentialCache.set(profile.name, {
+    credentials: {
+      accessKeyId: credentials.AccessKeyId,
+      secretAccessKey: credentials.SecretAccessKey,
+      sessionToken: credentials.SessionToken,
+      expiration: credentials.Expiration ? new Date(credentials.Expiration) : null
+    },
+    expiration: credentials.Expiration ? new Date(credentials.Expiration) : null
+  });
+
+  return { success: true, roleArn: chosen.roleArn };
+}
+
+
 // Run `aws sso login` for an IAM Identity Center profile.
 //
-// Unlike aws-azure-login this is a browser flow: the CLI opens the portal and then
-// blocks until the user approves, so the timeout is minutes rather than seconds.
+// This one leaves the app: the CLI opens the portal in the user's browser and
+// blocks until they approve, so the timeout is minutes rather than seconds.
 // The CLI prints a verification code that AWS asks the user to confirm in the
 // browser; it is forwarded to the renderer as soon as it appears, because a code
 // the user cannot see is a code they cannot check.
@@ -1190,7 +1360,12 @@ function runSsoLogin(profile, timeoutMs = 180000) {
   });
 }
 
-// Read the session expiry that aws-azure-login writes into ~/.aws/credentials.
+// Read a session expiry out of ~/.aws/credentials, for profiles signed in by
+// something other than Portus — an external SAML tool, a credential helper, a
+// script — all of which write one of these keys next to the temporary keys they
+// issue. Portus's own sign-ins never reach here; their expiry comes from the
+// credentials it is holding.
+//
 // Only the profiles actually in use are considered, in priority order — scanning
 // every section would pick up stale profiles from old logins whose expiry is long
 // past, which would look like a permanently expired session.
@@ -1271,6 +1446,11 @@ async function getSsoExpiry(startUrl) {
 // When the session for a profile runs out, whichever store its provider uses.
 async function getExpiryForProfile(profileName) {
   if (!profileName) return null;
+
+  // Credentials Portus holds itself know exactly when they lapse, which beats
+  // anything inferred from a file. This is the Azure and MFA case.
+  const cached = cachedSessionCredentials(profileName);
+  if (cached && cached.expiration) return cached.expiration;
 
   const profile = (await describeProfiles()).find(p => p.name === profileName);
   if (!profile) return null;
@@ -1564,6 +1744,41 @@ function setupIpcHandlers() {
     return { success: settleMfaRequest(id, trimmed || null) };
   });
 
+  // The answer to a role-choice-required message, when an Azure assertion offers
+  // more than one role and the profile names no default.
+  ipcMain.handle('submit-role-choice', (event, { id, roleArn } = {}) => {
+    return { success: settleRoleChoice(id, roleArn || null) };
+  });
+
+  // Forgets the Microsoft session for a profile's tenant, so the next sign-in
+  // starts from a clean login rather than a remembered one.
+  ipcMain.handle('forget-azure-session', async (event, profileName) => {
+    try {
+      const profile = await findProfile(profileName);
+      if (!profile || !profile.azureTenantId) {
+        return { success: false, error: 'That profile has no Azure tenant to forget.' };
+      }
+
+      await azureSaml.forgetSession(profile.azureTenantId);
+
+      // The AWS credentials that sign-in produced go too, along with any assumed
+      // from it — leaving those behind means "forget" forgets nothing usable.
+      const all = await describeProfiles();
+      const byName = new Map(all.map(entry => [entry.name, entry]));
+
+      sessionCredentialCache.delete(profileName);
+      all.forEach(entry => {
+        if (sourceProfileChain(entry.name, byName).includes(profileName)) {
+          sessionCredentialCache.delete(entry.name);
+        }
+      });
+
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  });
+
   // What the sign-in dialog offers: Identity Center grouped by portal session,
   // everything else per profile.
   ipcMain.handle('get-login-targets', async () => {
@@ -1638,7 +1853,10 @@ function setupIpcHandlers() {
     }
 
     try {
-      await runLoginFor(target);
+      // silent: an Azure renewal reuses the Microsoft session in a window that is
+      // never shown. If Microsoft would ask something, it fails here rather than
+      // putting a login in front of someone mid-task.
+      await runLoginFor(target, { silent: true });
       return { success: true, ssoProfile: target };
     } catch (error) {
       return { success: false, error: error.error || error.message || 'Re-authentication failed' };
@@ -2061,20 +2279,54 @@ function setupIpcHandlers() {
   }
 
   // SSM Session - open a shell in a new terminal window
+  //
+  // Unlike the tunnels, this hands the command to a terminal the user can see.
+  // It still needs the credentials Portus is holding: a profile signed in through
+  // Azure has nothing on disk for the CLI to find, and a chain rooted at one
+  // resolves to whatever stale keys an older tool left behind — which surfaces as
+  // "ExpiredToken … AssumeRole" in a terminal that just opened.
   ipcMain.handle('connect-ssm', async (event, profileName, instanceId, requestedRegion) => {
-    return new Promise((resolve, reject) => {
-      regionFor(profileName, requestedRegion).then(region => {
+    let credentialEnv;
+    try {
+      credentialEnv = await cliCredentialEnv(profileName);
+    } catch (error) {
+      return { success: false, error: `Could not get credentials for ${profileName}: ${error.message}` };
+    }
+
+    let region;
+    try {
+      region = await regionFor(profileName, requestedRegion);
+    } catch (error) {
+      return { success: false, error: `Failed to get profile config: ${error.message}` };
+    }
+
+    const profileFlag = credentialEnv ? '' : ` --profile ${profileName}`;
+    const awsCommand = `aws ssm start-session --target ${instanceId}${profileFlag} --region ${region}`;
+
+    // macOS is the awkward one: Terminal.app is already running, so it does not
+    // inherit anything from a process spawned here, and putting the keys in the
+    // `do script` string would type them into the window and into shell history.
+    // A private script file keeps them out of both.
+    let scriptPath = null;
+    if (credentialEnv && process.platform === 'darwin') {
+      try {
+        scriptPath = await writeCredentialScript(awsCommand, credentialEnv);
+      } catch (error) {
+        return { success: false, error: `Could not prepare the session: ${error.message}` };
+      }
+    }
+
+    return new Promise((resolve) => {
+      {
         const platform = process.platform;
         let command, args;
-
-        const awsCommand = `aws ssm start-session --target ${instanceId} --profile ${profileName} --region ${region}`;
 
         if (platform === 'win32') {
           command = 'cmd';
           args = ['/c', 'start', 'cmd', '/k', awsCommand];
         } else if (platform === 'darwin') {
           command = 'osascript';
-          args = ['-e', `tell application "Terminal" to do script "${awsCommand}"`];
+          args = ['-e', `tell application "Terminal" to do script "${scriptPath || awsCommand}"`];
         } else {
           const terminals = ['gnome-terminal', 'konsole', 'xterm', 'x-terminal-emulator'];
           let terminalFound = false;
@@ -2099,10 +2351,21 @@ function setupIpcHandlers() {
           }
         }
 
-        const terminalProcess = spawn(command, args, { detached: true, stdio: 'ignore' });
+        // On Windows and Linux the terminal is a child of this spawn, so it
+        // inherits the environment. On macOS it is not, which is what the script
+        // file above exists for — passing the environment there is harmless but
+        // reaches nothing.
+        const terminalProcess = spawn(command, args, {
+          detached: true,
+          stdio: 'ignore',
+          env: { ...process.env, ...(credentialEnv || {}) }
+        });
 
         terminalProcess.on('spawn', () => {
           terminalProcess.unref();
+          // The script has been read by the shell by the time it is running, so
+          // removing it takes the credentials off disk while the session lives on.
+          if (scriptPath) scheduleScriptRemoval(scriptPath);
           resolve({ success: true, message: 'SSM session started in new terminal window' });
         });
 
@@ -2118,10 +2381,10 @@ function setupIpcHandlers() {
           } else {
             resolve({ success: false, error: `Failed to open terminal: ${error.message}` });
           }
+
+          if (scriptPath) scheduleScriptRemoval(scriptPath, 0);
         });
-      }).catch(error => {
-        resolve({ success: false, error: `Failed to get profile config: ${error.message}` });
-      });
+      }
     });
   });
 

@@ -65,7 +65,7 @@ for them on startup and tells you what is missing.
 ## Features
 
 - **Works with however you authenticate to AWS** — IAM Identity Center, Azure AD, `credential_process`, assume-role, static keys or environment credentials. Every profile in `~/.aws` is listed and selectable with no sign-in required first
-- **Sign in from the app** for IAM Identity Center (`aws sso login`, with the browser pairing code shown so you can confirm it) and Azure AD (`aws-azure-login`) — the session countdown reads from whichever store that provider uses
+- **Sign in from the app** — Identity Center opens your browser and shows the pairing code to confirm; Azure AD opens Microsoft's login page in a window, with passkeys and Windows Hello working and no extra tool to install
 - **EC2 instance browser** — live list per profile/region, searchable
 - **Region switcher** — starts on the region the profile's config names, and offers only the regions the account has actually enabled, searchable by city or code. Everything follows it: the instance list, endpoint discovery, SSM shells, RDP and port forwards
 - **SSM readiness at a glance** — per-instance agent status (Online / Connection lost / Not managed), so you never click Connect on an instance that can't accept a session
@@ -75,7 +75,7 @@ for them on startup and tells you what is missing.
 - **Endpoint discovery** — RDS, Aurora (writer endpoint) and ElastiCache endpoints in the selected region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
 - **Startup preflight** — missing external tools are reported up front with install instructions rather than failing later mid-connect, and provider-specific ones are only demanded when a profile actually uses them
-- **Session renewal** — Azure AD sessions are refreshed before they expire and an expired one is renewed and retried transparently, so you are not thrown back to the login screen mid-task. IAM Identity Center needs a browser approval, so it is never renewed on a timer — you get a warning shortly before it lapses and sign in when you are ready
+- **Session renewal** — Azure AD sessions are refreshed before they expire, without interrupting you. Identity Center needs a browser approval, so it is never renewed on a timer; you get a warning shortly before it lapses and sign in when you are ready
 - **Release notifications** — on launch, Portus checks whether a newer version has been published and shows it once, with what changed and a link to the release. It never downloads or installs anything
 - **Light and dark themes**, a collapsible sidebar, an instance detail panel, state/OS filters and `Ctrl K` search — the session countdown and open tunnel count stay visible in the status bar
 - Smart buttons: connect actions are only offered when Systems Manager can actually reach the instance, and RDP only on running Windows instances
@@ -144,7 +144,7 @@ installed. If the request fails for any reason, no notification appears.
 
 | Requirement | Version | Why | Install |
 |-------------|---------|-----|---------|
-| **Node.js** | 18 LTS or newer | Run & build the app | <https://nodejs.org> |
+| **Node.js** | 22 | Run & build the app — what CI and the release builds use | <https://nodejs.org> |
 | **npm** | comes with Node | Dependency management | (bundled with Node) |
 | **Git** | any recent | Clone the repo | <https://git-scm.com> |
 | **Python** (macOS builds only) | 3.11 | Some native build deps (`dmg-license`) | <https://python.org> |
@@ -158,7 +158,6 @@ and shows a banner naming anything missing, with its install command.
 |------|-----|---------|
 | **AWS CLI v2** | Runs `aws ssm start-session` for SSM & RDP | <https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html> |
 | **AWS Session Manager plugin** | Required by `aws ssm start-session` | <https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html> |
-| **aws-azure-login** | Only for Azure AD profiles — not checked unless you have one | `npm install -g aws-azure-login` |
 | **RDP client** | Needed only for RDP-over-SSM | Windows: `mstsc` (built-in) · macOS: [Microsoft Remote Desktop](https://apps.apple.com/app/microsoft-remote-desktop/id1295203466) · Linux: `remmina`, `xfreerdp`, or `rdesktop` |
 
 ### AWS-side requirements (per target instance)
@@ -208,38 +207,54 @@ can Portus, because it hands the profile name to the same SDK the CLI uses.
 | Provider | Recognised by | Sign-in button |
 |----------|---------------|----------------|
 | **Identity Center** | `sso_session` or `sso_start_url` | yes — runs `aws sso login --sso-session <name>`, your browser opens and Portus shows the pairing code to confirm |
-| **Azure AD** | any `azure_*` field | yes, runs `aws-azure-login` |
+| **Azure AD** | any `azure_*` field | yes — Microsoft's sign-in page opens in the app, and the assertion it returns is exchanged for AWS credentials |
 | **Credential process** | `credential_process` | none needed |
 | **Assume role** | `role_arn` | none needed — with `mfa_serial`, Portus asks for the code when it needs one |
 | **Access keys** | `aws_access_key_id` | none needed, they do not expire |
 
 Environment credentials (`AWS_ACCESS_KEY_ID`, an EC2 instance role) work too.
 
-The sidebar dropdown lists every profile. The **Sign in** dialog lists only what
-Portus can actually start a login for, and lists it by the right unit: an Identity
-Center token belongs to the portal session, so all the profiles sharing an
-`[sso-session]` appear as **one** row that signs you into all of them at once.
-Azure AD, and older Identity Center profiles with an inline `sso_start_url`, stay
-one row per profile because that is genuinely how they log in.
+The sidebar dropdown lists every profile. The **Sign in** dialog lists only the
+logins Portus can start. Profiles sharing an `[sso-session]` appear as one row,
+since a single `aws sso login` covers all of them; Azure AD profiles get a row
+each.
 
-Each row says how many profiles that one sign-in makes usable — the profiles it
-signs in directly, plus any that reach them through `source_profile`. So an Azure
-AD profile that three other profiles assume a role from reads *4 profiles*:
+Each row shows how many profiles that sign-in makes usable, counting the ones
+that reach it through `source_profile`. So an Azure AD profile that three others
+assume a role from reads *4 profiles*.
 
-```ini
-[profile azure-corp]          # the sign-in
-azure_tenant_id = ...
+Both the dropdown and the Sign in dialog have a **Refresh** that re-reads `~/.aws`,
+so a profile you just added shows up without restarting the app.
 
-[profile prod]                # usable after signing in to azure-corp
-role_arn = arn:aws:iam::111111111111:role/Admin
-source_profile = azure-corp
-```
+### Azure AD sign-in
 
-Both the dropdown and the Sign in dialog have a **Refresh** that re-reads
-`~/.aws/config` and `~/.aws/credentials`, so a profile added or edited while
-Portus is running shows up without restarting it. If the profile you had selected
-disappears, the selection is cleared; if its region changed, the status bar
-follows.
+Click **Sign in** and Microsoft's login page opens in a window. Answer whatever
+your tenant asks for — password, push, passkey, compliant device — and Portus
+exchanges the result for AWS credentials. No third-party tool to install, and no
+password is seen or stored by Portus.
+
+**Passkeys and Windows Hello work.** They are not on the first screen: look under
+**Sign-in options**, or **Other ways to sign in** after your username. What is
+offered depends on your tenant's policy and what you have registered.
+
+The credentials stay in memory and are passed to the AWS CLI directly — nothing is
+written to `~/.aws/credentials`. Profiles that assume a role from the Azure profile
+(`role_arn` + `source_profile`) work as usual.
+
+Your Microsoft session is remembered per tenant, so renewals happen without
+interrupting you. That stores a session cookie, the same as staying signed in to
+Microsoft in a browser.
+
+Settings, in `~/.aws/config`:
+
+| Setting | Required | What it does |
+|---------|----------|--------------|
+| `azure_tenant_id` | yes | The tenant to sign in against |
+| `azure_app_id_uri` | yes | The AWS app in that tenant, usually `https://signin.aws.amazon.com/saml` |
+| `azure_default_role_arn` | no | Which role to assume when you have several. Without it, Portus asks |
+| `azure_default_duration_hours` | no | Session length, up to the role's own maximum |
+
+`azure_default_username` is not used — Microsoft's page handles that.
 
 Example `~/.aws/config`:
 
@@ -256,17 +271,17 @@ sso_role_name = Developer
 region = me-central-1
 
 # --- Azure AD (signs in from the app) ---
-[profile my-sso]
+[profile my-azure]
 azure_tenant_id = 00000000-0000-0000-0000-000000000000
 azure_app_id_uri = https://signin.aws.amazon.com/saml
-azure_default_username = you@company.com
-azure_default_role_arn = arn:aws:iam::123456789012:role/YourRole
+azure_default_role_arn = arn:aws:iam::123456789012:role/YourRole   # optional; skips the role picker
+azure_default_duration_hours = 4                                   # optional; the role's max applies
 region = me-central-1
 
 # --- Assume role from a base profile ---
 [profile my-account]
 role_arn = arn:aws:iam::123456789012:role/YourRole
-source_profile = my-sso
+source_profile = my-azure
 region = me-central-1
 
 # --- Credentials from an external helper (1Password, Vault, aws-vault…) ---
@@ -306,9 +321,8 @@ mfa_serial = arn:aws:iam::123456789012:mfa/you
 region = me-central-1
 ```
 
-The code is asked for once. The credentials it produces are reused until they
-expire, and are handed to the AWS CLI directly so a tunnel never stops to ask
-again on a prompt you cannot see.
+The code is asked for once, and the credentials it produces are reused until they
+expire.
 
 > Tip: whatever the provider, the profile should already work from your terminal —
 > `aws sts get-caller-identity --profile <name>` — before you rely on it in the app.
@@ -418,16 +432,14 @@ All builds output to the `dist/` folder (git-ignored).
   - Tells you when a new release is out
   ```
 
-  The reasoning — why a change was made, what it replaced, what broke before —
-  belongs in the commit message, which has a different audience.
+  The reasoning behind a change belongs in the commit message instead — different
+  audience.
 
-  The workflow runs the tests first and stops there if they fail. Each runner
-  builds its own platform and uploads the installers as workflow artifacts —
-  none of them publishes. A single job then collects all three, refuses to
-  continue unless an installer for every platform is present, and creates one
-  release. That last part is deliberate: when the runners published for
-  themselves they raced, and v2.2.0 came out as three separate releases with a
-  platform each.
+  The workflow runs the tests first and stops if they fail. Each runner builds its
+  own platform and uploads the installers as artifacts; a single job then collects
+  all three and creates one release, refusing to continue if any platform is
+  missing. Publishing from one job is deliberate — when the runners each published
+  for themselves they raced, and v2.2.0 came out as three separate releases.
 - Builds are **unsigned** — see [Installing a release](#installing-a-release).
 
 ---
@@ -438,6 +450,7 @@ All builds output to the `dist/` folder (git-ignored).
 .
 ├── src/
 │   ├── main.js          # Electron main process — IPC handlers, AWS SDK, CLI spawns
+│   ├── azure-saml.js    # Azure AD sign-in: SAML request, Microsoft's page, the assertion
 │   ├── preload.js       # contextBridge — exposes the safe electronAPI to the renderer
 │   ├── renderer.js      # UI logic (Portus class): profiles, instances, tunnels
 │   ├── index.html       # App markup
@@ -453,6 +466,8 @@ All builds output to the `dist/` folder (git-ignored).
 │   │   ├── renderer-harness.js  # Boots the real index.html + renderer.js in jsdom
 │   │   └── assert.js    # Pass/fail counter, deliberately not a framework
 │   ├── providers.test.js  # Credential providers, sign-in routing, session expiry
+│   ├── azure-saml.test.js   # The SAML request, the assertion, the persisted session
+│   ├── azure-chain.test.js  # Assume-role chains rooted at an Azure sign-in
 │   ├── endpoints.test.js  # RDS / Aurora / ElastiCache discovery
 │   ├── injection.test.js  # Nothing hostile reaches a shell command
 │   ├── mfa.test.js        # mfa_serial prompting, caching and cancellation
@@ -462,7 +477,7 @@ All builds output to the `dist/` folder (git-ignored).
 │   ├── window.test.js     # Which platforms keep the application menu
 │   └── run.js           # Runs every suite, one process each
 ├── .github/workflows/
-│   ├── ci.yml           # Runs the tests on every push and pull request
+│   ├── ci.yml           # Runs the tests on every push and pull request, or on demand
 │   └── release.yml      # Tests, then builds all three platforms on a v* tag
 ├── package.json         # Scripts + electron-builder config
 └── README.md
@@ -478,9 +493,6 @@ in its own process, because those replacements are process-wide.
 ```bash
 npm test
 ```
-
-A tag that fails its tests never reaches the build step, so no release can be cut
-from a broken commit.
 
 **Architecture:** standard Electron 3-process model. The renderer never touches Node
 or AWS directly — it calls `window.electronAPI.*`, which forwards over IPC to handlers
@@ -506,7 +518,12 @@ ie4uinit.exe -show
 
 | Symptom | Cause / fix |
 |---------|-------------|
-| `aws-azure-login command not found` | `npm install -g aws-azure-login`, then restart the app |
+| `ExpiredToken ... when calling the AssumeRole operation` | Old temporary keys sitting in `~/.aws/credentials`. Delete the stale `[profile]` sections holding `aws_session_token` / `aws_expiration` |
+| Azure sign-in says the Microsoft session expired | Click **Sign in** and answer the login page once |
+| `This profile is missing azure_tenant_id or azure_app_id_uri` | Both are required. `azure_app_id_uri` is usually `https://signin.aws.amazon.com/saml` |
+| `Microsoft returned an assertion with no AWS roles in it` | Your account has no AWS roles assigned in that tenant — an Azure-side change |
+| Asked to pick a role on every Azure sign-in | Set `azure_default_role_arn` on the profile |
+| No passkey or Windows Hello option | Look under **Sign-in options**, or **Other ways to sign in** after your username. If it is missing there too, none is registered on your account (`myaccount.microsoft.com` → Security info) or your tenant has FIDO2 turned off |
 | SSM session window opens then closes / errors | AWS CLI v2 and/or **Session Manager plugin** not installed, or instance has no SSM agent/IAM role |
 | `AWS CLI not found` | Install AWS CLI v2 and ensure it's on your `PATH` |
 | RDP button missing on an instance | RDP only appears for **running Windows** instances |
@@ -532,11 +549,11 @@ ie4uinit.exe -show
 
 - **Electron 37** (electron-builder 24 for packaging)
 - **AWS SDK v3** — `@aws-sdk/client-ec2`, `@aws-sdk/client-ssm`, `@aws-sdk/client-rds`,
-  `@aws-sdk/client-elasticache`, `@aws-sdk/credential-providers`
+  `@aws-sdk/client-elasticache`, `@aws-sdk/client-sts`, `@aws-sdk/credential-providers`
 - `fs-extra`, `ini` (read `~/.aws` config)
 - `jsdom` (development only — the renderer tests run the real UI without a display)
-- External CLIs at runtime: **AWS CLI v2** and the **Session Manager plugin** always;
-  **aws-azure-login** only if you have an Azure AD profile
+- External CLIs at runtime: **AWS CLI v2** and the **Session Manager plugin**. Nothing else —
+  Azure AD sign-in is done in the app
 
 ---
 

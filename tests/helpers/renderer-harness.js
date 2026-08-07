@@ -68,6 +68,8 @@ async function bootRenderer(options = {}) {
     forwards: [],
     opened: [],
     mfaAnswers: [],
+    roleAnswers: [],
+    forgotten: [],
     endpointChecks: 0,
     updateChecks: 0,
     ssm: [],
@@ -132,6 +134,10 @@ async function bootRenderer(options = {}) {
     onMfaRequired: (cb) => { listeners.mfa = cb; return () => {}; },
     onMfaCancelled: (cb) => { listeners.mfaCancelled = cb; return () => {}; },
     submitMfaCode: async (id, code) => { calls.mfaAnswers.push({ id, code }); return { success: true }; },
+
+    onRoleChoiceRequired: (cb) => { listeners.roleChoice = cb; return () => {}; },
+    submitRoleChoice: async (id, roleArn) => { calls.roleAnswers.push({ id, roleArn }); return { success: true }; },
+    forgetAzureSession: async (name) => { calls.forgotten.push(name); return { success: true }; },
 
     getSessionStatus: async () => ({ success: true, expiresInMs: 3600000 }),
     refreshSession: async () => ({ success: true }),

@@ -263,6 +263,74 @@ const openPortDialog = async (app, remote = true) => {
   }
 
   // ---------------------------------------------------------------------------
+  suite.section('the Azure role picker answers every way it can be closed');
+  // The sign-in is blocked on this answer in the main process, so a dialog that
+  // closes without sending one leaves the whole login hanging.
+  {
+    const app = await boot();
+    const answers = app.calls.roleAnswers;
+
+    app.listeners.roleChoice({
+      id: 'role-1',
+      profileName: 'azure-prod',
+      roles: [
+        'arn:aws:iam::111111111111:role/Admin',
+        'arn:aws:iam::222222222222:role/team/ReadOnly'
+      ]
+    });
+    await settle(app.window, 60);
+
+    const overlay = () => app.document.getElementById('roleChoiceOverlay');
+    suite.check('the picker appears', !!overlay());
+    suite.check('it names the profile', /azure-prod/.test(overlay().textContent));
+
+    const items = overlay().querySelectorAll('.profile-item');
+    suite.check('every role is offered', items.length === 2, items.length);
+    suite.check('the role name is shown rather than the whole ARN',
+      items[0].querySelector('.pi-name').textContent === 'Admin',
+      items[0].querySelector('.pi-name').textContent);
+    suite.check('a path in the ARN does not become the name',
+      items[1].querySelector('.pi-name').textContent === 'ReadOnly',
+      items[1].querySelector('.pi-name').textContent);
+    suite.check('the account is shown, since that is what distinguishes them',
+      items[1].querySelector('.pi-meta').textContent === '222222222222',
+      items[1].querySelector('.pi-meta').textContent);
+
+    items[1].click();
+    await settle(app.window, 60);
+    suite.check('the full ARN goes back with its request id',
+      answers.length === 1
+        && answers[0].id === 'role-1'
+        && answers[0].roleArn === 'arn:aws:iam::222222222222:role/team/ReadOnly', answers);
+    suite.check('choosing closes the picker', !overlay());
+
+    app.listeners.roleChoice({ id: 'role-2', profileName: 'azure-prod', roles: ['arn:aws:iam::1:role/A'] });
+    await settle(app.window, 40);
+    app.document.querySelector('#roleChoiceOverlay [data-cancel]').click();
+    await settle(app.window, 60);
+    suite.check('cancelling sends a null answer',
+      answers.length === 2 && answers[1].roleArn === null, answers[1]);
+
+    app.listeners.roleChoice({ id: 'role-3', profileName: 'azure-prod', roles: ['arn:aws:iam::1:role/A'] });
+    await settle(app.window, 40);
+    app.document.querySelector('#roleChoiceOverlay .profile-item')
+      .dispatchEvent(new app.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await settle(app.window, 60);
+    suite.check('Escape answers too', answers.length === 3 && answers[2].roleArn === null, answers[2]);
+
+    // one click, one answer — a double click must not settle a request twice
+    app.listeners.roleChoice({ id: 'role-4', profileName: 'azure-prod', roles: ['arn:aws:iam::1:role/A'] });
+    await settle(app.window, 40);
+    const only = app.document.querySelector('#roleChoiceOverlay .profile-item');
+    only.click();
+    only.click();
+    await settle(app.window, 60);
+    suite.check('a second click on the same item is ignored', answers.length === 4, answers.length);
+
+    app.window.close();
+  }
+
+  // ---------------------------------------------------------------------------
   suite.section('endpoint discovery fills the port from the endpoint');
   {
     const app = await boot();

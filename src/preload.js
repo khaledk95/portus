@@ -54,6 +54,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   submitMfaCode: (id, code) => ipcRenderer.invoke('submit-mfa-code', { id, code }),
 
+  // An Azure assertion can carry several roles. When the profile names no
+  // default, which one to assume is the user's call.
+  onRoleChoiceRequired: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('role-choice-required', listener);
+    return () => ipcRenderer.removeListener('role-choice-required', listener);
+  },
+  submitRoleChoice: (id, roleArn) => ipcRenderer.invoke('submit-role-choice', { id, roleArn }),
+
+  // Drops the remembered Microsoft session for a profile's tenant
+  forgetAzureSession: (profileName) => ipcRenderer.invoke('forget-azure-session', profileName),
+
   // Session lifecycle
   getSessionStatus: (profileName) => ipcRenderer.invoke('get-session-status', profileName),
   refreshSession: (profileName) => ipcRenderer.invoke('refresh-session', profileName),

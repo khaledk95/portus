@@ -63,6 +63,7 @@ class Portus {
         window.electronAPI.onSsoVerification(({ code }) => this.showSsoVerification(code));
         window.electronAPI.onMfaRequired(request => this.showMfaPrompt(request));
         window.electronAPI.onMfaCancelled(({ id }) => this.dismissMfaPrompt(id));
+        window.electronAPI.onRoleChoiceRequired(request => this.showRoleChoice(request));
 
         await this.applyAppVersion();
         this.checkRequiredTools();
@@ -988,6 +989,93 @@ class Portus {
         if (!existing) return;
         if (id && existing.dataset.requestId !== id) return;
         existing.remove();
+    }
+
+    // arn:aws:iam::123456789012:role/some/path/Admin -> { name: 'Admin', account: '123456789012' }
+    describeRoleArn(roleArn) {
+        const parts = String(roleArn).split(':');
+        const path = parts.slice(5).join(':');
+
+        return {
+            name: path.replace(/^role\//, '').split('/').pop() || roleArn,
+            account: parts[4] || ''
+        };
+    }
+
+    // An Azure assertion can grant several roles. Which one to assume is a real
+    // decision — it is the account and the permissions the session will have —
+    // so it is asked rather than guessed, and the sign-in waits on the answer.
+    // Cancelling is an outcome the main process needs, so one is always sent.
+    showRoleChoice({ id, profileName, roles }) {
+        const existing = document.getElementById('roleChoiceOverlay');
+        if (existing) existing.remove();
+
+        const overlay = document.createElement('div');
+        overlay.className = 'overlay';
+        overlay.id = 'roleChoiceOverlay';
+        overlay.dataset.requestId = id;
+        overlay.innerHTML = `
+            <div class="dialog">
+                <div class="dialog-head"><h3>Choose a role</h3></div>
+                <div class="dialog-body">
+                    <p class="dialog-note">
+                        Microsoft signed <strong>${this.escapeHtml(profileName)}</strong> in for more
+                        than one AWS role. Pick the one this session should use.
+                    </p>
+                    <div class="profile-list" id="roleChoiceList">
+                        ${(roles || []).map(roleArn => {
+                            const { name, account } = this.describeRoleArn(roleArn);
+                            return `
+                                <div class="profile-item" tabindex="0" data-role="${this.escapeHtml(roleArn)}">
+                                    <i class="fas fa-user-shield dim"></i>
+                                    <div class="pi-body">
+                                        <div class="pi-name">${this.escapeHtml(name)}</div>
+                                        <div class="pi-meta mono">${this.escapeHtml(account)}</div>
+                                    </div>
+                                    <i class="fas fa-chevron-right dim"></i>
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+                    <div class="hint">
+                        <i class="fas fa-circle-info"></i>
+                        <span>Set <span class="mono">azure_default_role_arn</span> on the profile to
+                              skip this and let renewals happen without asking.</span>
+                    </div>
+                </div>
+                <div class="dialog-foot">
+                    <button type="button" class="btn" data-cancel>Cancel</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        let answered = false;
+        const answer = async (roleArn) => {
+            if (answered) return;
+            answered = true;
+            overlay.remove();
+            await window.electronAPI.submitRoleChoice(id, roleArn);
+        };
+
+        overlay.querySelectorAll('.profile-item').forEach(item => {
+            const go = () => answer(item.dataset.role);
+            item.addEventListener('click', go);
+            item.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+            });
+        });
+
+        overlay.querySelector('[data-cancel]').addEventListener('click', () => answer(null));
+        // Clicking outside is not treated as a choice, but Escape is a cancel
+        overlay.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); answer(null); }
+        });
+
+        setTimeout(() => {
+            const first = overlay.querySelector('.profile-item');
+            if (first) first.focus();
+        }, 50);
     }
 
     async authenticate(profileName) {

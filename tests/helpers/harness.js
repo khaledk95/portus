@@ -46,7 +46,13 @@ function loadMain(options = {}) {
     spawns: [],          // every child process main.js tried to start
     sent: [],            // every webContents.send, i.e. what reached the renderer
     opened: [],          // every URL handed to the operating system
-    menusSet: []         // every Menu.setApplicationMenu call
+    menusSet: [],        // every Menu.setApplicationMenu call
+    partitions: [],      // every session partition asked for
+    storageCleared: [],  // every partition whose storage was cleared
+    sts: [],             // every STS call, in order
+    tempDirs: [],        // every temp directory created
+    written: [],         // every file written outside ~/.aws
+    removed: []          // every path removed
   };
 
   const handlers = new Map();
@@ -78,7 +84,17 @@ function loadMain(options = {}) {
       },
       ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) },
       shell: { openExternal: url => state.opened.push(url) },
-      Menu: { setApplicationMenu: menu => state.menusSet.push(menu) }
+      Menu: { setApplicationMenu: menu => state.menusSet.push(menu) },
+      // The Azure sign-in opens a window in its own persisted partition
+      session: {
+        fromPartition: name => {
+          state.partitions.push(name);
+          return {
+            webRequest: { onBeforeRequest: () => {} },
+            clearStorageData: async () => { state.storageCleared.push(name); }
+          };
+        }
+      }
     },
 
     'fs-extra': {
@@ -96,6 +112,16 @@ function loadMain(options = {}) {
         }
         return state.files[key];
       },
+      // The macOS SSM shell writes a short-lived credential script
+      mkdtemp: async (prefix) => {
+        const directory = `${prefix}test`;
+        state.tempDirs.push(directory);
+        return directory;
+      },
+      writeFile: async (filePath, contents, options) => {
+        state.written.push({ path: filePath, contents, options });
+      },
+      remove: async (target) => { state.removed.push(target); },
       readdir: async (dirPath) => {
         const prefix = `${awsRelative(dirPath)}/`;
         return Object.keys(state.files)
@@ -124,6 +150,10 @@ function loadMain(options = {}) {
         proc.unref = () => {};
 
         setImmediate(() => {
+          // Node emits this once the child is running. connect-ssm resolves on it,
+          // so without it a terminal launch never returns.
+          proc.emit('spawn');
+
           if (reply.stdout) proc.stdout.emit('data', Buffer.from(reply.stdout));
           if (reply.stderr) proc.stderr.emit('data', Buffer.from(reply.stderr));
           // keepOpen models a tunnel: the listener reports itself up and stays up
@@ -136,6 +166,31 @@ function loadMain(options = {}) {
     },
 
     '@aws-sdk/credential-providers': { fromIni: () => async () => ({}) },
+    '@aws-sdk/client-sts': {
+      STSClient: class {
+        constructor(config) { this.config = config; }
+        async send(command) {
+          // Recorded so a test can assert what was assumed, in what order, and
+          // with which credentials — which is the whole of an assume-role chain
+          state.sts.push({
+            command: command.constructor.name,
+            input: command.input,
+            credentials: this.config && this.config.credentials
+          });
+
+          return {
+            Credentials: {
+              AccessKeyId: 'ASIAFAKEFAKEFAKEFAKE',
+              SecretAccessKey: 'fake-secret',
+              SessionToken: `token-for-${(command.input.RoleArn || '').split('/').pop()}`,
+              Expiration: new Date(Date.now() + 3600000)
+            }
+          };
+        }
+      },
+      AssumeRoleWithSAMLCommand: class { constructor(input) { this.input = input; } },
+      AssumeRoleCommand: class { constructor(input) { this.input = input; } }
+    },
     '@aws-sdk/client-ec2': { EC2Client: inertClient(), DescribeInstancesCommand: inertCommand() },
     '@aws-sdk/client-ssm': { SSMClient: inertClient(), DescribeInstanceInformationCommand: inertCommand() },
     '@aws-sdk/client-rds': {
