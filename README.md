@@ -75,7 +75,7 @@ for them on startup and tells you what is missing.
 - **Port forwarding over SSM** — tunnel any TCP port to `localhost`, either on the instance itself or on a host it can reach (an RDS endpoint, for example), so you can use your own database or web client without a bastion or an inbound rule
 - **Endpoint discovery** — RDS, Aurora (writer endpoint) and ElastiCache endpoints in the selected region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
-- **Startup preflight** — missing external tools are reported up front with install instructions rather than failing later mid-connect, and provider-specific ones are only demanded when a profile actually uses them
+- **Startup preflight** — the AWS CLI and Session Manager plugin are checked at launch and anything missing is named up front, with its install command, rather than failing later mid-connect
 - **Session renewal** — Azure AD sessions are refreshed before they expire, without interrupting you. Identity Center needs a browser approval, so it is never renewed on a timer; you get a warning shortly before it lapses and sign in when you are ready
 - **Release notifications** — on launch, Portus checks whether a newer version has been published and shows it once, with what changed and a link to the release. It never downloads or installs anything
 - **Light and dark themes**, a collapsible sidebar, an instance detail panel, state/OS filters and `Ctrl K` search — the session countdown and open tunnel count stay visible in the status bar
@@ -186,14 +186,17 @@ installed. If the request fails for any reason, no notification appears.
 
 ### Runtime (needed on any machine that *uses* the app)
 
-These are external tools Portus calls at runtime. The app checks for them on startup
-and shows a banner naming anything missing, with its install command.
+These are external tools Portus calls at runtime.
 
-| Tool | Why | Install |
-|------|-----|---------|
-| **AWS CLI v2** | Runs `aws ssm start-session` for SSM & RDP | <https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html> |
-| **AWS Session Manager plugin** | Required by `aws ssm start-session` | <https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html> |
-| **RDP client** | Needed only for RDP-over-SSM | Windows: `mstsc` (built-in) · macOS: [Microsoft Remote Desktop](https://apps.apple.com/app/microsoft-remote-desktop/id1295203466) · Linux: `remmina`, `xfreerdp`, or `rdesktop` |
+| Tool | Why | Checked | Install |
+|------|-----|---------|---------|
+| **AWS CLI v2** | Runs `aws ssm start-session` for SSM & RDP | on startup | <https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html> |
+| **AWS Session Manager plugin** | Required by `aws ssm start-session` | on startup | <https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html> |
+| **RDP client** | Needed only for RDP-over-SSM | when you use RDP | Windows: `mstsc` (built-in) · macOS: [Microsoft Remote Desktop](https://apps.apple.com/app/microsoft-remote-desktop/id1295203466) · Linux: `remmina`, `xfreerdp`, or `rdesktop` |
+
+The first two are checked at launch, and a banner names anything missing with its
+install command. The RDP client is looked for only when you start an RDP session,
+since most people never do.
 
 ### AWS-side requirements (per target instance)
 
@@ -213,6 +216,7 @@ and shows a banner naming anything missing, with its install command.
 | `ssm:TerminateSession` / `ssm:ResumeSession` | Closing your own sessions cleanly |
 | `rds:DescribeDBInstances` / `rds:DescribeDBClusters` | Suggesting database endpoints in **Forward a port** |
 | `elasticache:DescribeReplicationGroups` / `elasticache:DescribeCacheClusters` | Suggesting Redis endpoints in **Forward a port** |
+| `sts:AssumeRole` | Only for `role_arn` profiles — the target role's trust policy has to allow the profile it chains from |
 
 If your policy restricts `ssm:StartSession` by resource, it must also allow the
 documents used for tunnelling, otherwise RDP and port forwarding are denied while
@@ -447,9 +451,9 @@ All builds output to the `dist/` folder (git-ignored).
 - **Releasing is automatic.** Bump the version, tag it, push the tag:
 
   ```bash
-  npm version 2.4.0 --no-git-tag-version   # or edit package.json by hand
-  git commit -am "Release v2.4.0"
-  git tag -a v2.4.0 -F notes.md            # annotated: -a or -F, never a bare tag
+  npm version 2.6.0 --no-git-tag-version   # or edit package.json by hand
+  git commit -am "Release v2.6.0"
+  git tag -a v2.6.0 -F notes.md            # annotated: -a or -F, never a bare tag
   git push origin main --follow-tags
   ```
 
@@ -495,6 +499,7 @@ All builds output to the `dist/` folder (git-ignored).
 ├── build/
 │   ├── portus.png       # Source icon (macOS/Linux; electron-builder generates sizes)
 │   └── portus.ico       # Multi-size Windows icon (16–256 px)
+├── screenshots/         # The images in this README; not shipped in installers
 ├── tests/
 │   ├── helpers/
 │   │   ├── harness.js   # Loads the real main.js with electron/fs/AWS stubbed out
