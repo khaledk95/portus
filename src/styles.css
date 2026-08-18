@@ -429,6 +429,22 @@ tbody td {
   font-size: 12.5px; white-space: nowrap;
 }
 
+/* Instance IDs and private addresses are things people copy, so the cell is the
+   button. The icon only appears on hover or focus — a copy glyph on every row of
+   a long table is noise, and the value itself has to stay the thing you read. */
+.copy-cell {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 0; border: 0; background: none;
+  font: inherit; color: inherit; cursor: pointer;
+}
+.copy-cell i {
+  font-size: 10px; color: var(--text-dim);
+  opacity: 0; transition: opacity .12s ease;
+}
+.copy-cell:hover i, .copy-cell:focus-visible i { opacity: 1; }
+.copy-cell:hover { color: var(--accent); }
+.copy-cell:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+
 /* Column rules. Data grids read far better with them: the eye can follow a
    column down without drifting into the neighbouring one. */
 thead th, tbody td { border-right: 1px solid var(--border); }

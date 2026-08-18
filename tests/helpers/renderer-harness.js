@@ -70,6 +70,7 @@ async function bootRenderer(options = {}) {
     mfaAnswers: [],
     roleAnswers: [],
     forgotten: [],
+    copied: [],
     endpointChecks: 0,
     updateChecks: 0,
     ssm: [],
@@ -189,6 +190,13 @@ async function bootRenderer(options = {}) {
   // jsdom has no layout, so scrolling an element into view is not implemented.
   // The combobox calls it whenever the highlighted option moves.
   window.Element.prototype.scrollIntoView = function scrollIntoView() {};
+
+  // jsdom has no clipboard either. Recorded rather than discarded, so a test can
+  // assert what a copy control actually put there.
+  Object.defineProperty(window.navigator, 'clipboard', {
+    value: { writeText: async (text) => { calls.copied.push(text); } },
+    configurable: true
+  });
 
   window.electronAPI = api;
 

@@ -331,6 +331,53 @@ const openPortDialog = async (app, remote = true) => {
   }
 
   // ---------------------------------------------------------------------------
+  suite.section('the name, ID and address can be copied from the row');
+  {
+    const app = await boot({
+      instances: [
+        instance({ instanceName: 'bastion', instanceId: 'i-0abc123', privateIp: '10.0.1.24' }),
+        instance({ instanceName: null, instanceId: 'i-0def456', privateIp: null })
+      ]
+    });
+    await pick(app, 'keys');
+
+    const copied = app.calls.copied;
+    const rows = app.document.querySelectorAll('#instanceTableWrap tbody tr');
+    const copyButtons = rows[0].querySelectorAll('button[data-copy]');
+
+    suite.check('all three values are copyable', copyButtons.length === 3, copyButtons.length);
+    suite.check('the cell still reads as the value, not as a control',
+      copyButtons[0].textContent.trim() === 'bastion', copyButtons[0].textContent);
+
+    for (const [index, expected] of [[0, 'bastion'], [1, 'i-0abc123'], [2, '10.0.1.24']]) {
+      copyButtons[index].click();
+      await settle(app.window, 40);
+      suite.check(`${expected} reaches the clipboard`,
+        copied[copied.length - 1] === expected, copied[copied.length - 1]);
+    }
+
+    // The row opens the detail panel; copying from it must not also do that
+    suite.check('copying does not select the row',
+      app.portus.selectedInstanceId === null, app.portus.selectedInstanceId);
+
+    rows[0].click();
+    await settle(app.window, 40);
+    suite.check('the row itself still selects', app.portus.selectedInstanceId === 'i-0abc123');
+
+    // Nothing to copy means nothing offered, and the dash stays a plain dash
+    const secondRow = app.document.querySelectorAll('#instanceTableWrap tbody tr')[1];
+    suite.check('a row missing a name and an address offers only the id',
+      secondRow.querySelectorAll('button[data-copy]').length === 1,
+      secondRow.querySelectorAll('button[data-copy]').length);
+    suite.check('and shows a dash where each missing value would be',
+      secondRow.cells[0].textContent.trim() === '—'
+        && secondRow.cells[5].textContent.trim() === '—',
+      [secondRow.cells[0].textContent.trim(), secondRow.cells[5].textContent.trim()]);
+
+    app.window.close();
+  }
+
+  // ---------------------------------------------------------------------------
   suite.section('endpoint discovery fills the port from the endpoint');
   {
     const app = await boot();
@@ -422,7 +469,9 @@ const openPortDialog = async (app, remote = true) => {
     const app = await boot({
       profiles: [profile(XSS, { source: 'credentials' })],
       loginTargets: [],
-      instances: [instance({ instanceName: XSS, instanceId: 'i-xss' })],
+      // The id and the address land inside attributes on the copy control, so a
+      // quote in either would break out of it rather than just render oddly
+      instances: [instance({ instanceName: XSS, instanceId: XSS, privateIp: XSS })],
       endpoints: [{ id: 'x', name: XSS, host: `${XSS}.rds.amazonaws.com`, port: 5432,
                     service: 'postgresql', kind: 'RDS instance', tls: false }],
       update: { available: true, current: '2.3.2', version: '9.9.9',
@@ -444,6 +493,14 @@ const openPortDialog = async (app, remote = true) => {
     await pick(app, XSS);
     suite.check('an instance name is escaped',
       !app.document.querySelector('#instanceTableWrap tbody').querySelector('img'));
+
+    // The value goes into data-copy, title and aria-label as well as the text
+    const copyControl = app.document.querySelector('#instanceTableWrap button[data-copy]');
+    suite.check('a hostile id does not break out of the copy attribute',
+      copyControl && copyControl.dataset.copy === XSS, copyControl && copyControl.dataset.copy);
+    suite.check('and copies back exactly what AWS reported, payload and all',
+      (copyControl.click(), app.calls.copied[app.calls.copied.length - 1] === XSS),
+      app.calls.copied[app.calls.copied.length - 1]);
 
     await openPortDialog(app);
     suite.check('an endpoint name is escaped',

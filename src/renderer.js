@@ -1334,12 +1334,12 @@ class Portus {
         }
 
         row.innerHTML = `
-            <td class="name-cell">${this.escapeHtml(item.instanceName || '—')}</td>
-            <td class="mono">${this.escapeHtml(item.instanceId)}</td>
+            <td class="name-cell">${this.copyableCell(item.instanceName)}</td>
+            <td class="mono">${this.copyableCell(item.instanceId)}</td>
             <td class="muted">${this.escapeHtml(item.instanceType || '')}</td>
             <td>${this.stateCell(item.state)}</td>
             <td>${this.ssmCell(item)}</td>
-            <td class="mono">${this.escapeHtml(item.privateIp || '—')}</td>
+            <td class="mono">${this.copyableCell(item.privateIp)}</td>
             <td class="muted">${isWindows ? 'Windows' : 'Linux'}</td>
             <td class="actions"><div class="row-actions">${actions}</div></td>
         `;
@@ -1352,7 +1352,28 @@ class Portus {
             });
         });
 
+        // Copying is not selecting: without this the row opens the detail panel
+        // underneath, which is not what someone reaching for an ID wanted.
+        row.querySelectorAll('button[data-copy]').forEach(button => {
+            button.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.copy(button.dataset.copy);
+            });
+        });
+
         return row;
+    }
+
+    // A name, an ID or an address is nearly always on its way somewhere else —
+    // a ticket, a terminal, a colleague. Values the row does not have stay plain
+    // text, since there is nothing to copy.
+    copyableCell(value) {
+        if (!value) return '—';
+
+        const safe = this.escapeHtml(value);
+        return `<button type="button" class="copy-cell" data-copy="${safe}"
+                        title="Copy ${safe}" aria-label="Copy ${safe}">${safe}<i
+                        class="fas fa-copy" aria-hidden="true"></i></button>`;
     }
 
     stateCell(state) {

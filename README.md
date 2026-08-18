@@ -67,7 +67,7 @@ for them on startup and tells you what is missing.
 
 - **Works with however you authenticate to AWS** — IAM Identity Center, Azure AD, `credential_process`, assume-role, static keys or environment credentials. Every profile in `~/.aws` is listed and selectable with no sign-in required first
 - **Sign in from the app** — Identity Center opens your browser and shows the pairing code to confirm; Azure AD opens Microsoft's login page in a window, with passkeys and Windows Hello working and no extra tool to install
-- **EC2 instance browser** — live list per profile/region, searchable
+- **EC2 instance browser** — live list per profile/region, searchable, with the name, instance ID and private IP copyable straight from the row
 - **Region switcher** — starts on the region the profile's config names, and offers only the regions the account has actually enabled, searchable by city or code. Everything follows it: the instance list, endpoint discovery, SSM shells, RDP and port forwards
 - **SSM readiness at a glance** — per-instance agent status (Online / Connection lost / Not managed), so you never click Connect on an instance that can't accept a session
 - **One-click SSM shell** — opens `aws ssm start-session` in a new terminal window
@@ -101,7 +101,8 @@ sign-in covers.
 
 **3. Instances** — the fleet for the selected profile and region, with SSM
 readiness per instance. Connect buttons only appear where Systems Manager can
-actually reach the instance.
+actually reach the instance. Selecting a row opens its details, and the name,
+instance ID and private IP can be copied from the row itself.
 
 ![The instance list showing state, SSM status and connect actions](screenshots/03-instances.png)
 
