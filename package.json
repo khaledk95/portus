@@ -75,15 +75,6 @@
       "!README.md",
       "!.gitignore"
     ],
-    "extraResources": [
-      {
-        "from": "build/",
-        "to": "build/",
-        "filter": [
-          "**/*"
-        ]
-      }
-    ],
     "win": {
       "target": [
         {
