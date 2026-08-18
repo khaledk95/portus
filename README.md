@@ -23,16 +23,17 @@ It works with however you already authenticate to AWS — IAM Identity Center, A
 
 1. [Download](#download)
 2. [Features](#features)
-3. [How it works](#how-it-works)
-4. [Prerequisites](#prerequisites)
-5. [Authentication and AWS profiles](#authentication-and-aws-profiles)
-6. [Installing a release](#installing-a-release)
-7. [Running from source](#running-from-source)
-8. [Building installers](#building-installers)
-9. [Project structure](#project-structure)
-10. [Branding / icons](#branding--icons)
-11. [Troubleshooting](#troubleshooting)
-12. [Tech stack](#tech-stack)
+3. [Screenshots](#screenshots)
+4. [How it works](#how-it-works)
+5. [Prerequisites](#prerequisites)
+6. [Authentication and AWS profiles](#authentication-and-aws-profiles)
+7. [Installing a release](#installing-a-release)
+8. [Running from source](#running-from-source)
+9. [Building installers](#building-installers)
+10. [Project structure](#project-structure)
+11. [Branding / icons](#branding--icons)
+12. [Troubleshooting](#troubleshooting)
+13. [Tech stack](#tech-stack)
 
 ---
 
@@ -80,6 +81,40 @@ for them on startup and tells you what is missing.
 - **Light and dark themes**, a collapsible sidebar, an instance detail panel, state/OS filters and `Ctrl K` search — the session countdown and open tunnel count stay visible in the status bar
 - Smart buttons: connect actions are only offered when Systems Manager can actually reach the instance, and RDP only on running Windows instances
 - Cross-platform: Windows, macOS, Linux — on Windows and Linux the stock Electron menu bar is removed, since Portus never used it
+
+---
+
+## Screenshots
+
+Dark theme, on Windows. The accounts, instances and endpoints below are made up.
+
+**1. First run** — every profile in `~/.aws` is listed, and nothing is loaded until
+you pick one.
+
+![Portus on first run, with no profile selected](screenshots/01-main-page.png)
+
+**2. Sign in** — only the logins Portus can actually start. Profiles sharing an
+Identity Center session appear as one row; each row says how many profiles that
+sign-in covers.
+
+![The Sign in dialog listing an Azure AD and an Identity Center login](screenshots/02-sign-in.png)
+
+**3. Instances** — the fleet for the selected profile and region, with SSM
+readiness per instance. Connect buttons only appear where Systems Manager can
+actually reach the instance.
+
+![The instance list showing state, SSM status and connect actions](screenshots/03-instances.png)
+
+**4. Forward a port** — tunnel to the instance itself or to a host it can reach.
+Managed database and cache endpoints in the region are offered directly, with the
+real port filled in.
+
+![The Forward a port dialog with service presets and endpoint discovery](screenshots/04-ports.png)
+
+**5. Tunnels** — everything open, with its local address and live uptime. Copy the
+address or disconnect from here; they are all closed when Portus exits.
+
+![The Tunnels view listing an open port forward and an RDP tunnel](screenshots/05-tunnels.png)
 
 ---
 
