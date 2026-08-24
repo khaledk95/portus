@@ -51,7 +51,11 @@ const fromIniCalls = [];
 
 const { handlers, state, ready } = loadMain({
   files: { config: CONFIG, credentials: CREDENTIALS },
-  onSpawn: () => ({ stdout: 'Port forwarding started', keepOpen: true }),
+  // `where` probes which shell the Windows terminals should use; answering it
+  // avoids a five second timeout per launch
+  onSpawn: ({ command, args }) => (command === 'where'
+    ? { exit: args[0] === 'pwsh' ? 0 : 1 }
+    : { stdout: 'Port forwarding started', keepOpen: true }),
   modules: {
     './azure-saml': {
       requestAssertion: async () => ({

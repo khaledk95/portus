@@ -56,6 +56,8 @@ const LEGITIMATE_HOSTS = [
   await ready();
 
   const forward = handlers.get('start-port-forward');
+  const ssm = handlers.get('connect-ssm');
+  const rdp = handlers.get('connect-rdp-ssm');
   const listTunnels = handlers.get('list-tunnels');
   const closeTunnel = handlers.get('close-tunnel');
 
@@ -85,6 +87,46 @@ const LEGITIMATE_HOSTS = [
       result.success === false && state.spawns.length === 0,
       { success: result.success, spawns: state.spawns.length });
   }
+
+  // ---------------------------------------------------------------------------
+  suite.section('a hostile instance id never reaches a shell either');
+  // The id arrives over IPC and lands on a command line. EC2 only ever returns
+  // `i-` and hex, so nothing real is rejected — but the Windows terminal is
+  // PowerShell now, where ; $() and backticks are syntax that cmd ignored.
+
+  const HOSTILE_IDS = [
+    'i-0abc; calc.exe',
+    'i-0abc && calc.exe',
+    'i-0abc | calc.exe',
+    'i-0abc`calc.exe`',
+    'i-0abc$(calc.exe)',
+    'i-0abc\ncalc.exe',
+    '"; calc.exe; "',
+    ''
+  ];
+
+  for (const id of HOSTILE_IDS) {
+    for (const [name, call] of [
+      ['port forward', () => forward({}, 'demo', id, 'bastion',
+        { remoteHost: 'db.example.internal', remotePort: '5432', localPort: '' })],
+      ['SSM shell', () => ssm({}, 'demo', id, 'eu-central-1')],
+      ['RDP', () => rdp({}, 'demo', id, 'jump', 'eu-central-1')]
+    ]) {
+      state.spawns.length = 0;
+      const result = await call();
+
+      const label = (id || '(empty)').replace(/\n/g, '\\n').slice(0, 24);
+      suite.check(`${name} rejected: ${label}`,
+        result.success === false && state.spawns.length === 0,
+        { success: result.success, spawns: state.spawns.length });
+    }
+  }
+
+  // A real one still works, or the guard is just breaking the app
+  state.spawns.length = 0;
+  suite.check('a genuine instance id is still accepted',
+    (await forward({}, 'demo', 'i-0a1b2c3d4e5f60011', 'bastion',
+      { remoteHost: 'db.example.internal', remotePort: '5432', localPort: '' })).success === true);
 
   // ---------------------------------------------------------------------------
   suite.section('a hostile port is neutralised rather than refused');

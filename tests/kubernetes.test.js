@@ -66,7 +66,12 @@ const eksStub = {
 
 const { handlers, state, ready } = loadMain({
   files: { config: CONFIG, credentials: CREDENTIALS },
-  onSpawn: () => ({ stdout: 'Port forwarding started', keepOpen: true }),
+  // `where` is the shell probe behind the Windows terminals. Answering it here
+  // keeps the tests on the PowerShell path rather than timing out into the cmd
+  // fallback, and keeps them quick.
+  onSpawn: ({ command, args }) => (command === 'where'
+    ? { exit: args[0] === 'pwsh' ? 0 : 1 }
+    : { stdout: 'Port forwarding started', keepOpen: true }),
   modules: {
     '@aws-sdk/client-eks': eksStub,
     './azure-saml': {
@@ -214,6 +219,39 @@ const { handlers, state, ready } = loadMain({
 
   suite.check('a tunnel with no cluster is refused',
     (await kubectl({}, 'no-such-tunnel')).success === false);
+
+  // detached becomes CREATE_NEW_PROCESS_GROUP on Windows, which disables Ctrl+C
+  // for the window and everything in it — `kubectl logs -f` then cannot be
+  // interrupted and the terminal looks hung. `cmd /c start` already outlives
+  // Portus, so there is nothing to trade for it.
+  const realPlatform = process.platform;
+  const asPlatform = (v) => Object.defineProperty(process, 'platform', { value: v });
+
+  state.spawns.length = 0;
+  asPlatform('win32');
+  await kubectl({}, tunnel.id);
+  const onWindows = state.spawns[state.spawns.length - 1];
+
+  state.spawns.length = 0;
+  asPlatform('linux');
+  await kubectl({}, tunnel.id);
+  const onLinux = state.spawns[state.spawns.length - 1];
+  asPlatform(realPlatform);
+
+  suite.check('the Windows terminal is not put in its own process group, so Ctrl+C works',
+    onWindows.options.detached === false, onWindows.options.detached);
+  suite.check('and it still opens through start, which outlives the app',
+    onWindows.args.includes('start'), onWindows.args.join(' '));
+
+  // cmd's tab completion cycles blindly through matches, which is painful with
+  // the long names these sessions deal in
+  suite.check('the Windows terminal is PowerShell, not cmd',
+    onWindows.args.includes('pwsh') && !onWindows.args.includes('/k'),
+    onWindows.args.join(' '));
+  suite.check('and is left at a prompt afterwards',
+    onWindows.args.includes('-NoExit'), onWindows.args.join(' '));
+  suite.check('elsewhere the terminal is a real child, so detached stays',
+    onLinux.options.detached === true, onLinux.options.detached);
 
   // -------------------------------------------------------------------------
   suite.section('a plain host forward is untouched by any of this');

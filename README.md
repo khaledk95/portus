@@ -70,7 +70,7 @@ for them on startup and tells you what is missing.
 - **EC2 instance browser** — live list per profile/region, searchable, with the name, instance ID and private IP copyable straight from the row
 - **Region switcher** — starts on the region the profile's config names, and offers only the regions the account has actually enabled, searchable by city or code. Everything follows it: the instance list, endpoint discovery, SSM shells, RDP and port forwards
 - **SSM readiness at a glance** — per-instance agent status (Online / Connection lost / Not managed), so you never click Connect on an instance that can't accept a session
-- **One-click SSM shell** — opens `aws ssm start-session` in a new terminal window
+- **One-click SSM shell** — opens `aws ssm start-session` in a new terminal window. On Windows that is PowerShell, for its tab completion; macOS and Linux use Terminal and your usual emulator
 - **RDP over SSM** — auto port-forward tunnel + launches your RDP client (Windows-only instances)
 - **Port forwarding over SSM** — tunnel any TCP port to `localhost`, either on the instance itself or on a host it can reach (an RDS endpoint, for example), so you can use your own database or web client without a bastion or an inbound rule
 - **Endpoint discovery** — RDS, Aurora (writer endpoint), ElastiCache and EKS endpoints in the selected region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed

@@ -596,6 +596,20 @@ async function findKubePort() {
 // host from somewhere other than the dialog, such as a saved bookmark or a deep link.
 const VALID_HOST = /^[A-Za-z0-9._:-]+$/;
 
+// An instance id ends up on a command line too. EC2 only ever returns `i-` and
+// hex, so this rejects nothing real — but the value arrives over IPC, and the
+// shell it lands in is now PowerShell, which treats ; $ and ` as syntax where
+// cmd did not. Validated for the same reason the host is: so that a caller other
+// than the dialog cannot turn one into a command.
+const VALID_INSTANCE_ID = /^[A-Za-z0-9-]{1,64}$/;
+
+function validateInstanceId(instanceId) {
+  if (!instanceId || !VALID_INSTANCE_ID.test(instanceId)) {
+    return { valid: false, error: 'That does not look like an EC2 instance ID.' };
+  }
+  return { valid: true };
+}
+
 function validateRemoteHost(host) {
   if (!host) return { valid: true };
 
@@ -807,6 +821,39 @@ users:
   return { path: file, context, endpointHost };
 }
 
+// Which shell the Windows terminals open in.
+//
+// PowerShell rather than cmd, because cmd's Tab completion cycles blindly
+// through matches and is close to unusable for the long resource names these
+// sessions deal in. PowerShell 7 first where it exists, then the Windows
+// PowerShell every machine already has, and cmd only if neither answers.
+//
+// Resolved once: it cannot change while the app runs, and `where` on every
+// terminal launch is a needless wait.
+let windowsShellPromise = null;
+
+function windowsShell() {
+  if (!windowsShellPromise) {
+    windowsShellPromise = (async () => {
+      for (const shell of ['pwsh', 'powershell']) {
+        if (await isCommandAvailable(shell)) return shell;
+      }
+      return 'cmd';
+    })();
+  }
+  return windowsShellPromise;
+}
+
+// -NoExit is PowerShell's /k: run this, then leave me a prompt.
+function windowsTerminalArgs(shell, command) {
+  if (shell === 'cmd') {
+    return command ? ['/c', 'start', 'cmd', '/k', command] : ['/c', 'start', 'cmd', '/k'];
+  }
+  return command
+    ? ['/c', 'start', shell, '-NoExit', '-Command', command]
+    : ['/c', 'start', shell, '-NoExit'];
+}
+
 // Opens a terminal the user can see, carrying an environment they cannot.
 //
 // Shared by the SSM shell and the kubectl session, which differ only in what
@@ -814,17 +861,21 @@ users:
 // interactive shell behind. Everything awkward is the same for both — Terminal
 // on macOS inherits nothing from a spawn, Linux has no single terminal to
 // assume, and Windows needs `start` to get a window at all.
-function openTerminal({ command, env, interactive = false, scriptPath = null, message }) {
+async function openTerminal({ command, env, interactive = false, scriptPath = null, message }) {
+  const platform = process.platform;
+
+  // Resolved before the promise: picking a shell is the one asynchronous part,
+  // and everything after it is synchronous spawn plumbing.
+  const shell = platform === 'win32' ? await windowsShell() : null;
+
   return new Promise((resolve) => {
-    const platform = process.platform;
     let launcher, args;
 
     if (platform === 'win32') {
-      // /k keeps the window open afterwards, which is the point in both cases
+      // `start` is what gets a console window at all — an Electron process
+      // spawning a console app gets none otherwise.
       launcher = 'cmd';
-      args = interactive && !command
-        ? ['/c', 'start', 'cmd', '/k']
-        : ['/c', 'start', 'cmd', '/k', command];
+      args = windowsTerminalArgs(shell, interactive && !command ? null : command);
     } else if (platform === 'darwin') {
       launcher = 'osascript';
       args = ['-e', `tell application "Terminal" to do script "${scriptPath || command}"`];
@@ -836,8 +887,17 @@ function openTerminal({ command, env, interactive = false, scriptPath = null, me
       args = ['--', 'bash', '-c', shell];
     }
 
+    // detached is deliberately off on Windows. libuv turns it into
+    // CREATE_NEW_PROCESS_GROUP, and Windows disables Ctrl+C for a new process
+    // group and everything it spawns — so `kubectl logs -f` could not be
+    // interrupted and the window looked hung. Nothing is lost by dropping it:
+    // `cmd /c start` already opens an independent console that outlives Portus,
+    // which is the only thing detached was there for.
+    //
+    // On the other platforms the terminal really is a child of this spawn, so it
+    // stays.
     const terminalProcess = spawn(launcher, args, {
-      detached: true,
+      detached: process.platform !== 'win32',
       stdio: 'ignore',
       env: { ...process.env, ...(env || {}) }
     });
@@ -1832,6 +1892,9 @@ function setupIpcHandlers() {
     const { remoteHost, remotePort, localPort, region: requestedRegion, kubernetes } = options || {};
     const clusterName = kubernetes && kubernetes.clusterName ? String(kubernetes.clusterName) : null;
 
+    const idCheck = validateInstanceId(instanceId);
+    if (!idCheck.valid) return { success: false, error: idCheck.error };
+
     const targetPort = parseInt(remotePort, 10);
     if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
       return { success: false, error: 'Remote port must be a number between 1 and 65535.' };
@@ -2575,6 +2638,8 @@ function setupIpcHandlers() {
   // resolves to whatever stale keys an older tool left behind — which surfaces as
   // "ExpiredToken … AssumeRole" in a terminal that just opened.
   ipcMain.handle('connect-ssm', async (event, profileName, instanceId, requestedRegion) => {
+    const idCheck = validateInstanceId(instanceId);
+    if (!idCheck.valid) return { success: false, error: idCheck.error };
     let credentialEnv;
     try {
       credentialEnv = await cliCredentialEnv(profileName);
@@ -2659,6 +2724,8 @@ function setupIpcHandlers() {
   // The tunnel is registered so it can be listed in the UI and terminated on exit.
   // RDP over SSM: a 3389 port forward plus the platform's RDP client.
   ipcMain.handle('connect-rdp-ssm', async (event, profileName, instanceId, instanceName, requestedRegion) => {
+    const idCheck = validateInstanceId(instanceId);
+    if (!idCheck.valid) return { success: false, error: idCheck.error };
     // Only an existing *RDP* tunnel can be reused. Without the kind check a port
     // forward on the same instance would be mistaken for an open RDP session.
     const existing = Array.from(activeTunnels.values()).find(tunnel =>
