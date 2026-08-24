@@ -1540,7 +1540,8 @@ class Portus {
             { label: 'SQL Server', port: 1433, service: 'sqlserver' },
             { label: 'PostgreSQL', port: 5432, service: 'postgresql' },
             { label: 'MySQL', port: 3306, service: 'mysql' },
-            { label: 'Redis', port: 6379, service: 'redis' }
+            { label: 'Redis', port: 6379, service: 'redis' },
+            { label: 'Kubernetes', port: 443, service: 'kubernetes' }
         ];
 
         const overlay = document.createElement('div');
@@ -1640,6 +1641,9 @@ class Portus {
         // cached on the instance so reopening the dialog does not re-query AWS.
         let loadState = 'idle';       // idle | loading | ready | error
         let loadError = '';
+        // Set when a discovered EKS cluster is picked, cleared the moment the host
+        // is edited by hand: a typed host is not the cluster we described.
+        let chosenKubernetes = null;
         let endpoints = [];
         let matches = [];
         let activeIndex = -1;
@@ -1770,6 +1774,7 @@ class Portus {
 
         const selectEndpoint = (endpoint) => {
             host.value = endpoint.host;
+            chosenKubernetes = endpoint.kubernetes || null;
 
             // The port the API reported wins over the service preset — a database
             // on a non-standard port is otherwise silently wrong.
@@ -1779,8 +1784,10 @@ class Portus {
             }
 
             // Encrypted Redis presents a certificate for its real hostname, which
-            // will not match the localhost the client connects to.
-            if (endpoint.tls) {
+            // will not match the localhost the client connects to. A cluster has
+            // the same mismatch and no such problem: the generated kubeconfig
+            // sets tls-server-name, so verification stays on and stays correct.
+            if (endpoint.tls && !endpoint.kubernetes) {
                 this.toast(`${endpoint.name} has encryption in transit — your client must skip hostname verification`, 'info');
             }
 
@@ -1826,6 +1833,9 @@ class Portus {
 
         host.addEventListener('focus', () => openPanel());
         host.addEventListener('input', () => {
+            // Typing means the host is no longer the cluster that was picked, so
+            // no kubeconfig should be written for whatever it is now.
+            chosenKubernetes = null;
             if (!panelOpen) openPanel(); else renderList();
         });
         host.addEventListener('blur', () => closePanel());
@@ -1874,7 +1884,8 @@ class Portus {
 
             const result = await this.startPortForward(instanceId, name, {
                 remoteHost, remotePort: remote.value.trim(), localPort: local.value.trim(),
-                region: this.currentRegion
+                region: this.currentRegion,
+                ...(chosenKubernetes ? { kubernetes: chosenKubernetes } : {})
             });
 
             if (result && result.success) {
@@ -2025,6 +2036,7 @@ class Portus {
                 <td class="mono muted">${this.escapeHtml(target)}</td>
                 <td class="muted num" data-started-at="${startedAt}">${this.uptime(startedAt)}</td>
                 <td class="actions"><div class="row-actions">
+                    ${tunnel.kubernetes ? '<button class="act primary" data-kubectl>kubectl</button>' : ''}
                     <button class="act" data-copy>Copy</button>
                     <button class="act" data-close>Disconnect</button>
                 </div></td>
@@ -2033,6 +2045,20 @@ class Portus {
                 e.stopPropagation();
                 this.copy(`localhost:${tunnel.port}`);
             });
+
+            // Opens a shell with KUBECONFIG already pointing at the generated
+            // file, so kubectl works without anyone editing ~/.kube/config
+            const kubectl = row.querySelector('[data-kubectl]');
+            if (kubectl) {
+                kubectl.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    const result = await window.electronAPI.openKubectlTerminal(tunnel.id);
+                    this.toast(result && result.success
+                        ? result.message
+                        : (result && result.error) || 'Could not open a kubectl terminal',
+                        result && result.success ? 'success' : 'error');
+                });
+            }
             row.querySelector('[data-close]').addEventListener('click', async (e) => {
                 e.stopPropagation();
                 await window.electronAPI.closeTunnel(tunnel.id);

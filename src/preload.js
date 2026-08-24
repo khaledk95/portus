@@ -15,6 +15,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   startPortForward: (profileName, instanceId, instanceName, options) =>
     ipcRenderer.invoke('start-port-forward', profileName, instanceId, instanceName, options),
 
+  // A terminal with KUBECONFIG and credentials set, for a tunnel to an EKS cluster
+  openKubectlTerminal: (tunnelId) => ipcRenderer.invoke('open-kubectl-terminal', tunnelId),
+
   // Active tunnels
   listTunnels: () => ipcRenderer.invoke('list-tunnels'),
   closeTunnel: (tunnelId) => ipcRenderer.invoke('close-tunnel', tunnelId),

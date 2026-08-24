@@ -73,7 +73,8 @@ for them on startup and tells you what is missing.
 - **One-click SSM shell** — opens `aws ssm start-session` in a new terminal window
 - **RDP over SSM** — auto port-forward tunnel + launches your RDP client (Windows-only instances)
 - **Port forwarding over SSM** — tunnel any TCP port to `localhost`, either on the instance itself or on a host it can reach (an RDS endpoint, for example), so you can use your own database or web client without a bastion or an inbound rule
-- **Endpoint discovery** — RDS, Aurora (writer endpoint) and ElastiCache endpoints in the selected region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed
+- **Endpoint discovery** — RDS, Aurora (writer endpoint), ElastiCache and EKS endpoints in the selected region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed
+- **Private EKS clusters** — tunnel to a cluster's API server through an instance in its VPC, and Portus writes a kubeconfig and opens a terminal with `kubectl` pointed at it. Your own `~/.kube/config` is never touched
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
 - **Startup preflight** — the AWS CLI and Session Manager plugin are checked at launch and anything missing is named up front, with its install command, rather than failing later mid-connect
 - **Session renewal** — Azure AD sessions are refreshed before they expire, without interrupting you. Identity Center needs a browser approval, so it is never renewed on a timer; you get a warning shortly before it lapses and sign in when you are ready
@@ -154,6 +155,7 @@ one, or type any other host — the field accepts both.
 | PostgreSQL | RDS instances, and the **writer endpoint** of Aurora PostgreSQL clusters |
 | MySQL | RDS instances, and the **writer endpoint** of Aurora MySQL clusters |
 | Redis | ElastiCache primary / configuration endpoints, and standalone nodes |
+| Kubernetes | EKS cluster API servers — see [Private EKS clusters](#private-eks-clusters) |
 
 The port comes from the endpoint itself rather than the service preset, so a database
 on a non-standard port connects without being corrected by hand.
@@ -165,6 +167,42 @@ Open tunnels get their own **Tunnels** view in the sidebar, listing each one wit
 local address and a live uptime, where you can copy the address or disconnect. The
 open count also shows in the status bar. They are closed automatically when Portus
 exits.
+
+### Private EKS clusters
+
+A cluster with private endpoint access answers only on an address inside its VPC,
+so reaching it means going through an instance that already sits there — the same
+route a database takes. Pick **Kubernetes** in the port-forward dialog, choose the
+cluster, and start the tunnel. Nothing needs installing on the instance.
+
+The tunnel alone is not enough. `kubectl` would be pointed at `localhost` while
+the cluster's certificate is issued for its real endpoint name, and the handshake
+fails. Portus writes a kubeconfig that sets `tls-server-name`, which fixes the
+name used for SNI and certificate verification independently of the URL:
+
+```yaml
+server: https://localhost:6443
+tls-server-name: ABCD1234.gr7.eu-west-1.eks.amazonaws.com
+```
+
+Verification stays fully on. Nothing is skipped and no certificate is ignored.
+
+The **kubectl** button on the tunnel row opens a terminal with `KUBECONFIG`
+already pointing at that file, so nothing has to be exported by hand.
+
+| | |
+|---|---|
+| Where the file goes | `<userData>/kube/<cluster>.yaml`, one per cluster |
+| Your `~/.kube/config` | never read, never written |
+| What is in it | the address, the cluster's public CA, and an `aws eks get-token` stanza — no credentials |
+| Local port | 6443 when free, so the file usually does not change between sessions |
+| On reconnect | rewritten with the new port; `kubectl` re-reads it per command, so an open terminal keeps working |
+| On quit | removed, along with the tunnels they point at |
+
+The instance still has to be allowed to reach the cluster on 443, exactly as it
+does for a database. And an SSM tunnel is not a fast link: `get`, `describe` and
+`apply` are comfortable, while `logs -f`, `exec` and `cp` are noticeably slower
+than they would be inside the VPC.
 
 On launch Portus makes **one** request to GitHub's public API — the same read as
 opening the [Releases page](https://github.com/khaledk95/portus/releases) in a
@@ -194,6 +232,7 @@ These are external tools Portus calls at runtime.
 | **AWS CLI v2** | Runs `aws ssm start-session` for SSM & RDP | on startup | <https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html> |
 | **AWS Session Manager plugin** | Required by `aws ssm start-session` | on startup | <https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html> |
 | **RDP client** | Needed only for RDP-over-SSM | when you use RDP | Windows: `mstsc` (built-in) · macOS: [Microsoft Remote Desktop](https://apps.apple.com/app/microsoft-remote-desktop/id1295203466) · Linux: `remmina`, `xfreerdp`, or `rdesktop` |
+| **kubectl** | Needed only for EKS clusters | never — the terminal is opened either way | <https://kubernetes.io/docs/tasks/tools/> |
 
 The first two are checked at launch, and a banner names anything missing with its
 install command. The RDP client is looked for only when you start an RDP session,
@@ -217,6 +256,7 @@ since most people never do.
 | `ssm:TerminateSession` / `ssm:ResumeSession` | Closing your own sessions cleanly |
 | `rds:DescribeDBInstances` / `rds:DescribeDBClusters` | Suggesting database endpoints in **Forward a port** |
 | `elasticache:DescribeReplicationGroups` / `elasticache:DescribeCacheClusters` | Suggesting Redis endpoints in **Forward a port** |
+| `eks:ListClusters` / `eks:DescribeCluster` | Listing EKS clusters in **Forward a port**, and writing the kubeconfig. Optional — without them, no clusters are suggested |
 | `sts:AssumeRole` | Only for `role_arn` profiles — the target role's trust policy has to allow the profile it chains from |
 
 If your policy restricts `ssm:StartSession` by resource, it must also allow the
@@ -573,6 +613,10 @@ ie4uinit.exe -show
 | `Local port ... is already in use` | Something else holds that port. Leave **Local port** blank to have one picked automatically |
 | Port forward to an RDS endpoint fails | Use **A host reachable from it** (not *This instance*), and check the instance's security group is allowed to reach the database |
 | Endpoint list is empty or missing a database | Your credentials lack the `rds:*` / `elasticache:*` describe actions, or the database is in another region. Type the host manually — nothing is blocked |
+| `kubectl` says the certificate is not valid for `localhost` | The kubeconfig lost its `tls-server-name`, or you are using your own config rather than the one Portus generated. Use the **kubectl** button, or point `KUBECONFIG` at the file it wrote |
+| `kubectl` reports `connection refused` on localhost | The tunnel is gone. Reopen it from the port dialog — the kubeconfig is rewritten and any terminal you left open picks it up |
+| No clusters listed under **Kubernetes** | Your credentials lack `eks:ListClusters` / `eks:DescribeCluster`, or the cluster is in another region. The endpoint can still be typed by hand, but no kubeconfig is written for it |
+| `kubectl` cannot get a token | The terminal needs credentials `aws eks get-token` can use. Open it with the **kubectl** button rather than a fresh shell, so Portus passes them through |
 | Redis connects but the TLS handshake fails | The cluster has encryption in transit, and its certificate names the real host, not `localhost`. Point your client at the real SNI name or disable hostname verification |
 | RDP client doesn't launch | Windows: ensure `mstsc` available · macOS: install Microsoft Remote Desktop · Linux: install `remmina`/`xfreerdp`/`rdesktop` |
 | Sign-in button disabled | No profile in `~/.aws` has a login Portus can run. Pick a profile directly instead — its credentials are used as-is |
@@ -590,7 +634,8 @@ ie4uinit.exe -show
 
 - **Electron 37** (electron-builder 24 for packaging)
 - **AWS SDK v3** — `@aws-sdk/client-ec2`, `@aws-sdk/client-ssm`, `@aws-sdk/client-rds`,
-  `@aws-sdk/client-elasticache`, `@aws-sdk/client-sts`, `@aws-sdk/credential-providers`
+  `@aws-sdk/client-elasticache`, `@aws-sdk/client-eks`, `@aws-sdk/client-sts`,
+  `@aws-sdk/credential-providers`
 - `fs-extra`, `ini` (read `~/.aws` config)
 - `jsdom` (development only — the renderer tests run the real UI without a display)
 - External CLIs at runtime: **AWS CLI v2** and the **Session Manager plugin**. Nothing else —

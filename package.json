@@ -43,12 +43,13 @@
     "dmg-license": "^1.0.11"
   },
   "dependencies": {
-    "@aws-sdk/client-ec2": "^3.1112.0",
-    "@aws-sdk/client-elasticache": "^3.1112.0",
-    "@aws-sdk/client-rds": "^3.1112.0",
-    "@aws-sdk/client-ssm": "^3.1112.0",
-    "@aws-sdk/client-sts": "^3.1112.0",
-    "@aws-sdk/credential-providers": "^3.1112.0",
+    "@aws-sdk/client-ec2": "^3.1116.0",
+    "@aws-sdk/client-eks": "^3.1116.0",
+    "@aws-sdk/client-elasticache": "^3.1116.0",
+    "@aws-sdk/client-rds": "^3.1116.0",
+    "@aws-sdk/client-ssm": "^3.1116.0",
+    "@aws-sdk/client-sts": "^3.1116.0",
+    "@aws-sdk/credential-providers": "^3.1116.0",
     "fs-extra": "^11.1.1",
     "ini": "^4.1.1"
   },

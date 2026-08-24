@@ -20,6 +20,7 @@ const {
   DescribeReplicationGroupsCommand,
   DescribeCacheClustersCommand
 } = require('@aws-sdk/client-elasticache');
+const { EKSClient, ListClustersCommand, DescribeClusterCommand } = require('@aws-sdk/client-eks');
 const { STSClient, AssumeRoleWithSAMLCommand, AssumeRoleCommand } = require('@aws-sdk/client-sts');
 const { fromIni } = require('@aws-sdk/credential-providers');
 const azureSaml = require('./azure-saml');
@@ -538,7 +539,10 @@ function listTunnels() {
     port: tunnel.port,
     remoteHost: tunnel.remoteHost || null,
     remotePort: tunnel.remotePort || null,
-    startedAt: tunnel.startedAt
+    startedAt: tunnel.startedAt,
+    // Present only on a tunnel to a cluster; it is what puts a kubectl action on
+    // the row rather than just an address to copy.
+    kubernetes: tunnel.kubernetes || null
   }));
 }
 
@@ -567,6 +571,22 @@ function ensurePortFree(port) {
     )));
     server.listen(port, () => server.close(() => resolve(port)));
   });
+}
+
+// Kubernetes tunnels prefer a settled port so the generated kubeconfig usually
+// does not change between sessions, which in turn means an already-open terminal
+// keeps working. Any of these being taken is not an error — the kubeconfig is
+// rewritten with whatever was actually bound, so correctness never depends on
+// getting the preferred one.
+const KUBE_PORTS = [6443, 6444, 6445, 6446, 6447];
+
+async function findKubePort() {
+  for (const port of KUBE_PORTS) {
+    try {
+      return await ensurePortFree(port);
+    } catch (error) { /* taken; try the next */ }
+  }
+  return findFreePort();
 }
 
 // The tunnel command is handed to a shell, which is unavoidable on Windows: it is
@@ -663,6 +683,190 @@ async function launchRdpClient(tunnelId, localPort) {
     success: false,
     error: 'No RDP client found. Please install remmina, xfreerdp, or rdesktop.'
   };
+}
+
+// ============================================================================
+// KUBERNETES
+// ============================================================================
+//
+// A private EKS cluster answers on an address only reachable inside the VPC, so
+// the tunnel is the same one a database gets. The part that needs explaining is
+// the kubeconfig.
+//
+// kubectl is pointed at localhost, but the cluster's certificate is issued for
+// its real endpoint name. Rather than turn verification off, the generated file
+// sets tls-server-name, which fixes the name used for SNI and validation
+// independently of the URL. Verification stays fully on.
+//
+// The file is written per cluster at a stable path and rewritten whenever the
+// tunnel reopens. kubectl re-reads it on every invocation, so a terminal opened
+// an hour ago keeps working after a reconnect on a different local port.
+//
+// Nothing secret goes in it: an address, the cluster's public CA, and an exec
+// stanza that calls out for a token. Credentials stay in memory, as everywhere
+// else.
+
+// new URL().hostname lowercases, and an EKS endpoint id is genuinely mixed case.
+// DNS and certificate name matching are both case-insensitive, so lowercasing
+// would almost certainly work — but tls-server-name is the single line this whole
+// approach rests on, and there is no reason to hand it anything other than
+// exactly what AWS returned.
+function hostnameOf(endpoint) {
+  return String(endpoint).replace(/^https?:\/\//i, '').replace(/[:/].*$/, '');
+}
+
+function kubeconfigDir() {
+  return path.join(app.getPath('userData'), 'kube');
+}
+
+// Every kubeconfig written this run, so exit can clear them.
+//
+// Only these are removed — not the directory, and not anything else that might
+// be sitting in it. The directory belongs to Portus, but deleting by pattern
+// would mean trusting that forever; deleting a list we built ourselves cannot
+// take a file we did not create.
+const writtenKubeconfigs = new Set();
+
+function clearKubeconfigs() {
+  for (const file of writtenKubeconfigs) {
+    // Synchronous on purpose: this also runs from the process 'exit' handler,
+    // where anything async would never get the chance to run.
+    try { fs.removeSync(file); } catch (error) { /* already gone */ }
+  }
+  writtenKubeconfigs.clear();
+}
+
+function kubeconfigPathFor(clusterName) {
+  const safe = String(clusterName).replace(/[^A-Za-z0-9._-]/g, '_');
+  return path.join(kubeconfigDir(), `${safe}.yaml`);
+}
+
+// Values are quoted rather than trusted: cluster names are tame, but an endpoint
+// and a CA blob both end up in a file another program parses.
+const yamlString = (value) => `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+
+async function writeKubeconfig({ clusterName, region, localPort, profileName, useEnvCredentials }) {
+  const config = { credentials: awsCredentials(profileName), region };
+  const { cluster } = await new EKSClient(config).send(new DescribeClusterCommand({ name: clusterName }));
+
+  if (!cluster || !cluster.endpoint) throw new Error(`${clusterName} has no API endpoint.`);
+
+  const endpointHost = hostnameOf(cluster.endpoint);
+  const caData = (cluster.certificateAuthority || {}).data || '';
+  const context = `portus:${clusterName}`;
+
+  // AWS_PROFILE is pinned only when the CLI can resolve that profile by itself.
+  // When Portus is holding the credentials — an Azure sign-in, an MFA session, a
+  // chain rooted at either — they arrive in the environment instead, and naming
+  // a profile here would send `aws eks get-token` looking on disk for something
+  // that was deliberately never written there.
+  const env = useEnvCredentials ? '' : `
+      env:
+        - name: AWS_PROFILE
+          value: ${yamlString(profileName)}`;
+
+  const body = `# Written by Portus. Regenerated whenever the tunnel reopens.
+# Points at the local end of an SSM tunnel; tls-server-name keeps certificate
+# verification honest against the cluster's real endpoint name.
+apiVersion: v1
+kind: Config
+current-context: ${yamlString(context)}
+clusters:
+  - name: ${yamlString(clusterName)}
+    cluster:
+      server: ${yamlString(`https://localhost:${localPort}`)}
+      tls-server-name: ${yamlString(endpointHost)}
+      certificate-authority-data: ${yamlString(caData)}
+contexts:
+  - name: ${yamlString(context)}
+    context:
+      cluster: ${yamlString(clusterName)}
+      user: ${yamlString(clusterName)}
+users:
+  - name: ${yamlString(clusterName)}
+    user:
+      exec:
+        apiVersion: client.authentication.k8s.io/v1beta1
+        command: aws
+        args:
+          - --region
+          - ${yamlString(region)}
+          - eks
+          - get-token
+          - --cluster-name
+          - ${yamlString(clusterName)}
+          - --output
+          - json${env}
+`;
+
+  const file = kubeconfigPathFor(clusterName);
+  await fs.ensureDir(kubeconfigDir());
+  await fs.writeFile(file, body, { mode: 0o600 });
+  writtenKubeconfigs.add(file);
+
+  return { path: file, context, endpointHost };
+}
+
+// Opens a terminal the user can see, carrying an environment they cannot.
+//
+// Shared by the SSM shell and the kubectl session, which differ only in what
+// they run: one execs a single command and ends with it, the other leaves an
+// interactive shell behind. Everything awkward is the same for both — Terminal
+// on macOS inherits nothing from a spawn, Linux has no single terminal to
+// assume, and Windows needs `start` to get a window at all.
+function openTerminal({ command, env, interactive = false, scriptPath = null, message }) {
+  return new Promise((resolve) => {
+    const platform = process.platform;
+    let launcher, args;
+
+    if (platform === 'win32') {
+      // /k keeps the window open afterwards, which is the point in both cases
+      launcher = 'cmd';
+      args = interactive && !command
+        ? ['/c', 'start', 'cmd', '/k']
+        : ['/c', 'start', 'cmd', '/k', command];
+    } else if (platform === 'darwin') {
+      launcher = 'osascript';
+      args = ['-e', `tell application "Terminal" to do script "${scriptPath || command}"`];
+    } else {
+      const shell = interactive && !command ? 'exec bash' : `${command}; exec bash`;
+      const terminals = ['gnome-terminal', 'konsole', 'xterm', 'x-terminal-emulator'];
+
+      launcher = terminals[0];
+      args = ['--', 'bash', '-c', shell];
+    }
+
+    const terminalProcess = spawn(launcher, args, {
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, ...(env || {}) }
+    });
+
+    terminalProcess.on('spawn', () => {
+      terminalProcess.unref();
+      // The shell has read the script by the time it is running, so removing it
+      // takes the credentials off disk while the session lives on.
+      if (scriptPath) scheduleScriptRemoval(scriptPath);
+      resolve({ success: true, message });
+    });
+
+    terminalProcess.on('error', (error) => {
+      if (error.code === 'ENOENT') {
+        resolve({
+          success: false,
+          error: platform === 'win32'
+            ? 'Could not open Command Prompt. Please ensure cmd.exe is available.'
+            : platform === 'darwin'
+              ? 'Could not open Terminal. Please ensure Terminal.app is available.'
+              : 'No suitable terminal emulator found. Please install gnome-terminal, konsole, or xterm.'
+        });
+      } else {
+        resolve({ success: false, error: `Failed to open terminal: ${error.message}` });
+      }
+
+      if (scriptPath) scheduleScriptRemoval(scriptPath, 0);
+    });
+  });
 }
 
 // A private script that exports credentials and then becomes the AWS CLI.
@@ -1625,7 +1829,8 @@ function setupIpcHandlers() {
   // the instance to something else in the VPC (an RDS endpoint, for example),
   // which is otherwise unreachable because RDS cannot run an SSM agent.
   ipcMain.handle('start-port-forward', async (event, profileName, instanceId, instanceName, options) => {
-    const { remoteHost, remotePort, localPort, region: requestedRegion } = options || {};
+    const { remoteHost, remotePort, localPort, region: requestedRegion, kubernetes } = options || {};
+    const clusterName = kubernetes && kubernetes.clusterName ? String(kubernetes.clusterName) : null;
 
     const targetPort = parseInt(remotePort, 10);
     if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
@@ -1669,7 +1874,7 @@ function setupIpcHandlers() {
     try {
       resolvedLocalPort = requestedLocalPort
         ? await ensurePortFree(requestedLocalPort)
-        : await findFreePort();
+        : (clusterName ? await findKubePort() : await findFreePort());
     } catch (error) {
       return { success: false, error: error.message };
     }
@@ -1711,11 +1916,43 @@ function setupIpcHandlers() {
 
     if (!result.success) return result;
 
+    // The kubeconfig is written after the listener is up, so the port in it is
+    // the one that was actually bound. A failure here loses kubectl, not the
+    // tunnel — the forward still works, and the reason is reported.
+    let kube = null;
+    if (clusterName) {
+      try {
+        kube = await writeKubeconfig({
+          clusterName,
+          region,
+          localPort: resolvedLocalPort,
+          profileName,
+          useEnvCredentials: !!credentialEnv
+        });
+
+        const tunnel = activeTunnels.get(result.tunnelId);
+        if (tunnel) {
+          tunnel.kubernetes = { clusterName, kubeconfig: kube.path, context: kube.context };
+          broadcastTunnels();
+        }
+      } catch (error) {
+        return {
+          success: true,
+          port: resolvedLocalPort,
+          remoteHost: targetHost || null,
+          remotePort: targetPort,
+          kubeconfigError: `Tunnel is up, but the kubeconfig could not be written: ${error.message}`,
+          message: `Forwarding localhost:${resolvedLocalPort} to ${targetHost}:${targetPort}`
+        };
+      }
+    }
+
     return {
       success: true,
       port: resolvedLocalPort,
       remoteHost: targetHost || null,
       remotePort: targetPort,
+      ...(kube ? { kubeconfig: kube.path, clusterName } : {}),
       message: `Forwarding localhost:${resolvedLocalPort} to ${targetHost || 'this instance'}:${targetPort}`
     };
   });
@@ -2101,6 +2338,7 @@ function setupIpcHandlers() {
 
     const rds = new RDSClient(config);
     const elasticache = new ElastiCacheClient(config);
+    const eks = new EKSClient(config);
 
     const endpoints = [];
     const warnings = [];
@@ -2273,6 +2511,57 @@ function setupIpcHandlers() {
       });
     });
 
+    // --- EKS clusters --------------------------------------------------------
+    // A private cluster's API server is only an HTTPS endpoint on a private
+    // address, so it is reachable the same way a database is: through an
+    // instance that sits in the VPC. What makes it more than a port forward is
+    // the kubeconfig, written once the tunnel is up — see writeKubeconfig.
+    await collect('EKS clusters', async () => {
+      const listed = [];
+      let nextToken;
+      let page = 0;
+
+      do {
+        const response = await eks.send(new ListClustersCommand({ maxResults: 100, nextToken }));
+        listed.push(...(response.clusters || []));
+        nextToken = response.nextToken;
+        page += 1;
+      } while (nextToken && page < MAX_PAGES);
+
+      // DescribeCluster per cluster is the only way to get the endpoint, and the
+      // list is normally short. One that fails is skipped rather than losing the
+      // rest — a cluster being deleted mid-listing should not empty the dialog.
+      for (const name of listed) {
+        try {
+          const { cluster } = await eks.send(new DescribeClusterCommand({ name }));
+          if (!cluster || !cluster.endpoint) continue;
+
+          const host = hostnameOf(cluster.endpoint);
+
+          endpoints.push({
+            id: `eks:${name}`,
+            name,
+            host,
+            port: 443,
+            service: 'kubernetes',
+            kind: 'EKS cluster',
+            engine: 'kubernetes',
+            engineVersion: cluster.version || null,
+            status: cluster.status || null,
+            tls: true,
+            // Marks it as more than a host: the renderer offers the kubectl flow
+            // for these, and the tunnel writes a kubeconfig. The CA and the ARN
+            // stay here — they are re-read when the file is written, so nothing
+            // large crosses to the renderer.
+            kubernetes: { clusterName: name }
+          });
+        } catch (error) {
+          if (isCredentialsError(error) && !isAuthorizationError(error)) throw error;
+          warnings.push(`EKS ${name}: ${describeDeniedAction(error)}`);
+        }
+      }
+    });
+
     endpoints.sort((a, b) => a.name.localeCompare(b.name));
 
     return { success: true, data: endpoints, region, warnings };
@@ -2316,75 +2605,52 @@ function setupIpcHandlers() {
       }
     }
 
-    return new Promise((resolve) => {
-      {
-        const platform = process.platform;
-        let command, args;
+    return openTerminal({
+      command: awsCommand,
+      env: credentialEnv,
+      scriptPath,
+      message: 'SSM session started in new terminal window'
+    });
+  });
 
-        if (platform === 'win32') {
-          command = 'cmd';
-          args = ['/c', 'start', 'cmd', '/k', awsCommand];
-        } else if (platform === 'darwin') {
-          command = 'osascript';
-          args = ['-e', `tell application "Terminal" to do script "${scriptPath || awsCommand}"`];
-        } else {
-          const terminals = ['gnome-terminal', 'konsole', 'xterm', 'x-terminal-emulator'];
-          let terminalFound = false;
-          for (const terminal of terminals) {
-            try {
-              if (terminal === 'gnome-terminal') {
-                command = terminal;
-                args = ['--', 'bash', '-c', `${awsCommand}; exec bash`];
-              } else {
-                command = terminal;
-                args = ['-e', 'bash', '-c', `${awsCommand}; exec bash`];
-              }
-              terminalFound = true;
-              break;
-            } catch (e) {
-              continue;
-            }
-          }
-          if (!terminalFound) {
-            resolve({ success: false, error: 'No suitable terminal emulator found. Please install gnome-terminal, konsole, or xterm.' });
-            return;
-          }
-        }
+  // A terminal pointed at the cluster behind a tunnel.
+  //
+  // KUBECONFIG points at the generated file rather than ~/.kube/config, which is
+  // never touched. The credentials go in the environment for the same reason the
+  // SSM shell needs them: `aws eks get-token` runs out here, and for a profile
+  // signed in through Portus there is nothing on disk for it to find.
+  ipcMain.handle('open-kubectl-terminal', async (event, tunnelId) => {
+    const tunnel = activeTunnels.get(tunnelId);
+    if (!tunnel || !tunnel.kubernetes) {
+      return { success: false, error: 'That tunnel has no cluster attached.' };
+    }
 
-        // On Windows and Linux the terminal is a child of this spawn, so it
-        // inherits the environment. On macOS it is not, which is what the script
-        // file above exists for — passing the environment there is harmless but
-        // reaches nothing.
-        const terminalProcess = spawn(command, args, {
-          detached: true,
-          stdio: 'ignore',
-          env: { ...process.env, ...(credentialEnv || {}) }
-        });
+    let credentialEnv;
+    try {
+      credentialEnv = await cliCredentialEnv(tunnel.profileName);
+    } catch (error) {
+      return { success: false, error: `Could not get credentials for ${tunnel.profileName}: ${error.message}` };
+    }
 
-        terminalProcess.on('spawn', () => {
-          terminalProcess.unref();
-          // The script has been read by the shell by the time it is running, so
-          // removing it takes the credentials off disk while the session lives on.
-          if (scriptPath) scheduleScriptRemoval(scriptPath);
-          resolve({ success: true, message: 'SSM session started in new terminal window' });
-        });
+    const env = { ...(credentialEnv || {}), KUBECONFIG: tunnel.kubernetes.kubeconfig };
 
-        terminalProcess.on('error', (error) => {
-          if (error.code === 'ENOENT') {
-            if (platform === 'win32') {
-              resolve({ success: false, error: 'Could not open Command Prompt. Please ensure cmd.exe is available.' });
-            } else if (platform === 'darwin') {
-              resolve({ success: false, error: 'Could not open Terminal. Please ensure Terminal.app is available.' });
-            } else {
-              resolve({ success: false, error: 'Could not open terminal. Please install a terminal emulator.' });
-            }
-          } else {
-            resolve({ success: false, error: `Failed to open terminal: ${error.message}` });
-          }
-
-          if (scriptPath) scheduleScriptRemoval(scriptPath, 0);
-        });
+    // Terminal.app inherits nothing from this spawn, so on macOS the environment
+    // travels in a private script that then becomes an interactive shell.
+    let scriptPath = null;
+    if (process.platform === 'darwin') {
+      try {
+        scriptPath = await writeCredentialScript('${SHELL:-/bin/bash} -l', env);
+      } catch (error) {
+        return { success: false, error: `Could not prepare the session: ${error.message}` };
       }
+    }
+
+    return openTerminal({
+      command: null,
+      interactive: true,
+      env,
+      scriptPath,
+      message: `kubectl is pointed at ${tunnel.kubernetes.clusterName}`
     });
   });
 
@@ -2466,10 +2732,14 @@ app.whenReady().then(() => {
 });
 
 // Tunnels are child processes that outlive the app unless they are terminated
-// explicitly, so every exit path closes them.
-app.on('before-quit', closeAllTunnels);
-app.on('will-quit', closeAllTunnels);
-process.on('exit', closeAllTunnels);
+// explicitly, so every exit path closes them. The kubeconfigs go at the same
+// time: each one points at a local port that dies with its tunnel, so leaving
+// them behind leaves files that describe a cluster nothing can reach.
+const shutDown = () => { closeAllTunnels(); clearKubeconfigs(); };
+
+app.on('before-quit', shutDown);
+app.on('will-quit', shutDown);
+process.on('exit', shutDown);
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

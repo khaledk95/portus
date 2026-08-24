@@ -52,7 +52,9 @@ function loadMain(options = {}) {
     sts: [],             // every STS call, in order
     tempDirs: [],        // every temp directory created
     written: [],         // every file written outside ~/.aws
-    removed: []          // every path removed
+    removed: [],         // every path removed
+    dirs: [],            // every directory created
+    appEvents: {}        // app.on handlers, so shutdown can be triggered
   };
 
   const handlers = new Map();
@@ -63,8 +65,11 @@ function loadMain(options = {}) {
     electron: {
       app: {
         whenReady: () => Promise.resolve(),
-        on: () => {},
+        // Captured so a test can fire shutdown and check what gets cleaned up
+        on: (event, handler) => { (state.appEvents[event] = state.appEvents[event] || []).push(handler); },
         getVersion: () => require(path.join(APP_ROOT, 'package.json')).version,
+        // Where the generated kubeconfigs live
+        getPath: (name) => `/portus-${name}`,
         quit: () => {}
       },
       BrowserWindow: class {
@@ -122,6 +127,8 @@ function loadMain(options = {}) {
         state.written.push({ path: filePath, contents, options });
       },
       remove: async (target) => { state.removed.push(target); },
+      removeSync: (target) => { state.removed.push(target); },
+      ensureDir: async (dir) => { state.dirs.push(dir); },
       readdir: async (dirPath) => {
         const prefix = `${awsRelative(dirPath)}/`;
         return Object.keys(state.files)
@@ -202,6 +209,11 @@ function loadMain(options = {}) {
       ElastiCacheClient: inertClient(),
       DescribeReplicationGroupsCommand: inertCommand(),
       DescribeCacheClustersCommand: inertCommand()
+    },
+    '@aws-sdk/client-eks': {
+      EKSClient: inertClient(),
+      ListClustersCommand: inertCommand(),
+      DescribeClusterCommand: inertCommand()
     },
 
     ...(options.modules || {})
