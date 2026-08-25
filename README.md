@@ -551,6 +551,7 @@ All builds output to the `dist/` folder (git-ignored).
 │   ├── azure-chain.test.js  # Assume-role chains rooted at an Azure sign-in
 │   ├── endpoints.test.js  # RDS / Aurora / ElastiCache discovery
 │   ├── injection.test.js  # Nothing hostile reaches a shell command
+│   ├── kubernetes.test.js  # EKS cluster discovery and the kubeconfig Portus writes
 │   ├── mfa.test.js        # mfa_serial prompting, caching and cancellation
 │   ├── regions.test.js    # Enabled regions, and the region reaching every request
 │   ├── release-check.test.js  # Version comparison and which links may be opened
