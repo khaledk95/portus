@@ -929,6 +929,21 @@ async function openTerminal({ command, env, interactive = false, scriptPath = nu
   });
 }
 
+// Every credential-script directory written this run, so exit can clear them.
+// The delayed removal below handles the normal path; this list catches the
+// rest — quitting inside the delay, or a removal that failed. Only directories
+// we created are ever removed, never a sweep of the temp directory by pattern.
+const writtenScriptDirs = new Set();
+
+function clearScriptDirs() {
+  for (const directory of writtenScriptDirs) {
+    // Synchronous on purpose: this also runs from the process 'exit' handler,
+    // where anything async would never get the chance to run.
+    try { fs.removeSync(directory); } catch (error) { /* already gone */ }
+  }
+  writtenScriptDirs.clear();
+}
+
 // A private script that exports credentials and then becomes the AWS CLI.
 //
 // Only macOS needs this. Terminal.app is already running and does not inherit a
@@ -939,6 +954,7 @@ async function openTerminal({ command, env, interactive = false, scriptPath = nu
 // Written 0600 inside a 0700 directory, and removed once the shell has read it.
 async function writeCredentialScript(awsCommand, credentialEnv) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'portus-'), { mode: 0o700 });
+  writtenScriptDirs.add(directory);
   const scriptPath = path.join(directory, 'session.sh');
 
   // A single-quoted string ends at the first quote inside it, so an unexpected
@@ -962,8 +978,13 @@ async function writeCredentialScript(awsCommand, credentialEnv) {
 // The shell reads the script once, at startup, so it can go immediately after.
 // The delay is only to let that happen; the session itself is unaffected.
 function scheduleScriptRemoval(scriptPath, delayMs = 5000) {
+  const directory = path.dirname(scriptPath);
   setTimeout(() => {
-    fs.remove(path.dirname(scriptPath)).catch(() => { /* temp dir; nothing to do */ });
+    fs.remove(directory)
+      // A successful removal takes the directory off the exit list; a failed
+      // one leaves it there, so the shutdown sweep gets another chance at it.
+      .then(() => writtenScriptDirs.delete(directory))
+      .catch(() => { /* temp dir; nothing to do */ });
   }, delayMs).unref();
 }
 
@@ -2801,8 +2822,10 @@ app.whenReady().then(() => {
 // Tunnels are child processes that outlive the app unless they are terminated
 // explicitly, so every exit path closes them. The kubeconfigs go at the same
 // time: each one points at a local port that dies with its tunnel, so leaving
-// them behind leaves files that describe a cluster nothing can reach.
-const shutDown = () => { closeAllTunnels(); clearKubeconfigs(); };
+// them behind leaves files that describe a cluster nothing can reach. The
+// credential scripts join them, so quitting inside their removal window does
+// not leave exported keys behind in the temp directory.
+const shutDown = () => { closeAllTunnels(); clearKubeconfigs(); clearScriptDirs(); };
 
 app.on('before-quit', shutDown);
 app.on('will-quit', shutDown);

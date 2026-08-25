@@ -266,6 +266,33 @@ const answerNextPrompt = async (submit, code) => {
     state.removed.length === 1, state.removed);
 
   // ---------------------------------------------------------------------------
+  suite.section('quitting inside that window still takes the script with it');
+  // The delayed removal is a five second guess carried by an unref'd timer, so
+  // quitting before it fires — or a removal that fails — would leave the
+  // exported keys sitting in the temp directory. The kubeconfigs get a shutdown
+  // sweep for exactly this reason (kubernetes.test.js does the same firing).
+  state.spawns.length = 0;
+  state.written.length = 0;
+  state.tempDirs.length = 0;
+  state.removed.length = 0;
+
+  asPlatform('darwin');
+  const quitting = await connectSsm({}, 'prod', 'i-0abc', 'eu-west-1');
+  asPlatform(realPlatform);
+
+  const pendingDir = state.tempDirs[0];
+
+  suite.check('another script is written and left pending',
+    quitting.success === true && !!pendingDir, quitting.error);
+
+  (state.appEvents['before-quit'] || []).forEach(handler => handler());
+
+  suite.check('quitting removes it without waiting out the five seconds',
+    state.removed.includes(pendingDir), state.removed);
+  suite.check('and only what Portus wrote is touched',
+    state.removed.every(p => p === pendingDir), state.removed);
+
+  // ---------------------------------------------------------------------------
   suite.section('a chain Portus has no part in is left alone');
   // from-keys roots at static keys, which the CLI resolves perfectly well on its
   // own. Walking it here would be Portus doing work it has no reason to do.
