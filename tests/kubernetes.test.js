@@ -68,10 +68,14 @@ const { handlers, state, ready } = loadMain({
   files: { config: CONFIG, credentials: CREDENTIALS },
   // `where` is the shell probe behind the Windows terminals. Answering it here
   // keeps the tests on the PowerShell path rather than timing out into the cmd
-  // fallback, and keeps them quick.
-  onSpawn: ({ command, args }) => (command === 'where'
-    ? { exit: args[0] === 'pwsh' ? 0 : 1 }
-    : { stdout: 'Port forwarding started', keepOpen: true }),
+  // fallback, and keeps them quick. `command -v` is the Linux equivalent: the
+  // terminal launcher resolves an emulator on PATH before spawning it, so report
+  // gnome-terminal present rather than letting each probe time out.
+  onSpawn: ({ command, args }) => {
+    if (command === 'where') return { exit: args[0] === 'pwsh' ? 0 : 1 };
+    if (command === 'sh' && String(args[1]).startsWith('command -v ')) return { exit: 0 };
+    return { stdout: 'Port forwarding started', keepOpen: true };
+  },
   modules: {
     '@aws-sdk/client-eks': eksStub,
     './azure-saml': {
