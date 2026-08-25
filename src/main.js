@@ -615,12 +615,12 @@ function validateInstanceId(instanceId) {
 // the environment — which is exactly the case for a name it does not
 // recognise, since cliCredentialEnv returns null rather than throwing for one
 // — the raw name is interpolated into the `--profile` flag of a command that
-// ends up in bash -c, PowerShell, cmd or an AppleScript string. AWS documents
-// letters, digits, hyphens and underscores for profile names, and names with
-// spaces occur in the wild, so this rejects nothing real while keeping out
-// every character one of those shells would act on. It must start with an
-// alphanumeric so a "profile name" cannot pose as a command-line flag.
-const VALID_PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._-]*$/;
+// ends up in bash -c, PowerShell, cmd or an AppleScript string. What passes:
+// Unicode letters and digits, space, period, underscore and hyphen, with a
+// letter or digit first. That set is accepted because none of it is a
+// character any of those shells would act on, and the leading letter or digit
+// is what keeps a "profile name" from posing as a command-line flag.
+const VALID_PROFILE_NAME = /^[\p{L}\p{N}][\p{L}\p{N} ._-]*$/u;
 
 function validateProfileName(profileName) {
   if (!profileName || !VALID_PROFILE_NAME.test(profileName)) {

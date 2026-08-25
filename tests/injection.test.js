@@ -166,14 +166,22 @@ const LEGITIMATE_HOSTS = [
   }
 
   // AWS documents letters, digits, hyphens and underscores for profile names,
-  // and names with spaces exist in the wild — so the guard has to reject
-  // commands, not the occasional space.
-  state.files.config = '[profile demo]\nregion = eu-central-1\n[profile demo two]\nregion = eu-central-1\n';
+  // and both spaces and non-ASCII letters occur in the wild — so the guard
+  // has to reject commands, not the occasional space or accented letter.
+  state.files.config = '[profile demo]\nregion = eu-central-1\n'
+    + '[profile demo two]\nregion = eu-central-1\n'
+    + '[profile café two]\nregion = eu-central-1\n';
   state.spawns.length = 0;
   suite.check('a profile name with spaces is still accepted',
     (await forward({}, 'demo two', 'i-0a1b2c3d4e5f60011', 'bastion',
       { remoteHost: 'db.example.internal', remotePort: '5432', localPort: '' })).success === true
       && lastCommand().includes('--profile demo two'),
+    { command: lastCommand().slice(0, 120) });
+  state.spawns.length = 0;
+  suite.check('a non-ASCII profile name is still accepted',
+    (await forward({}, 'café two', 'i-0a1b2c3d4e5f60011', 'bastion',
+      { remoteHost: 'db.example.internal', remotePort: '5432', localPort: '' })).success === true
+      && lastCommand().includes('--profile café two'),
     { command: lastCommand().slice(0, 120) });
   state.files.config = '[profile demo]\nregion = eu-central-1\n';
 
