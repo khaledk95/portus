@@ -11,17 +11,26 @@ const { createSuite } = require('./helpers/assert');
 const suite = createSuite('Documentation accuracy');
 
 // ---------------------------------------------------------------------------
-suite.section('the README tests tree lists the EKS suite');
-// tests/run.js globs every *.test.js in this directory, so a suite missing
+suite.section('the README tests tree lists every suite the runner discovers');
+// tests/run.js globs every *.test.js in this directory, so any suite missing
 // from the README's project tree is undocumented by the very section that
-// inventories the repository. kubernetes.test.js is the EKS feature's only
-// suite, and the README documents EKS tunneling and the kubeconfig Portus
-// writes — that feature's test belongs in the tree.
+// inventories the repository — and the omission would recur silently every
+// time a suite is added. The pin therefore holds the whole tree honest:
+// every suite file the runner would discover must be named in it.
 const readme = fs.readFileSync(path.join(__dirname, '..', 'README.md'), 'utf8');
 const tree = (readme.match(/├── tests\/[\s\S]*?\n├── \.github/) || [''])[0];
 
-suite.check('the tests tree names kubernetes.test.js',
-  /kubernetes\.test\.js/.test(tree),
-  (tree.match(/.*mfa\.test\.js.*/) || [''])[0]);
+const discovered = fs.readdirSync(__dirname)
+  .filter(name => name.endsWith('.test.js'))
+  .sort();
+const missing = discovered.filter(name => !tree.includes(name));
+
+suite.check('the tests tree block is found in the README',
+  tree.length > 0,
+  'no tests/ tree between the tests/ and .github/ headings');
+
+suite.check('every suite the runner discovers is listed',
+  missing.length === 0,
+  missing.join(', '));
 
 suite.done();
