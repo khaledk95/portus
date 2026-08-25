@@ -649,6 +649,26 @@ const openPortDialog = async (app, remote = true) => {
     app.window.close();
   }
 
+  // ---------------------------------------------------------------------------
+  suite.section('the page grants scripts and connections nothing it does not use');
+  // jsdom does not enforce CSP, so this pins the policy string itself — the
+  // same readFileSync+regex convention as release-check.test.js. The app ships
+  // exactly one script element (the external renderer.js) and every AWS call
+  // goes over ipcRenderer.invoke, so inline script and https: connections are
+  // grants nothing uses; any future escaping regression would use them.
+  {
+    const source = require('fs').readFileSync(
+      require('path').join(__dirname, '..', 'src', 'index.html'), 'utf8');
+    const policy = (source.match(/Content-Security-Policy"\s+content="([^"]+)"/) || [])[1] || '';
+    const scriptSrc = (policy.match(/script-src([^;]*);/) || [])[1] || '';
+    const connectSrc = (policy.match(/connect-src([^;]*);/) || [])[1] || '';
+
+    suite.check('script-src does not allow inline script',
+      !/'unsafe-inline'/.test(scriptSrc), scriptSrc.trim());
+    suite.check('connect-src is the app itself, not every https host',
+      connectSrc.trim() === "'self'", connectSrc.trim());
+  }
+
   suite.done();
 })().catch(error => {
   console.error('\n  the suite threw:', error && error.stack);
