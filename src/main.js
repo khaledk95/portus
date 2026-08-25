@@ -1736,7 +1736,13 @@ async function getSsmManagedInstances(profileName, region) {
   const managed = new Map();
   let nextToken;
   let page = 0;
-  const MAX_PAGES = 40; // safety valve against an unbounded pagination loop
+  // Safety valve against an unbounded pagination loop. DescribeInstanceInformation
+  // caps MaxResults at 50, where DescribeInstances allows 1000, so this loop needs
+  // 20x the pages to cover the same fleet. The instance list (DescribeInstances)
+  // walks up to 40 pages of 1000 = 40,000 instances; sized to the same ceiling so
+  // the SSM status join does not run out first and leave managed instances past
+  // #2,000 mislabelled 'Not managed' with their connect buttons disabled.
+  const MAX_PAGES = 800; // 800 x 50 = 40,000, matching the instance-list ceiling
 
   do {
     const response = await client.send(new DescribeInstanceInformationCommand({
