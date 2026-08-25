@@ -14,6 +14,10 @@ const { createSuite } = require('./helpers/assert');
 const APP_ROOT = path.join(__dirname, '..');
 const suite = createSuite('Window chrome');
 
+// Every BrowserWindow the stubbed electron hands out lands here, so the
+// constructor options each load passed are inspectable after the fact.
+const createdWindows = [];
+
 // main.js reads process.platform at startup, so each platform needs its own load
 function startOn(platform) {
   const menusSet = [];
@@ -30,6 +34,7 @@ function startOn(platform) {
       BrowserWindow: class {
         constructor(options) {
           this.options = options;
+          createdWindows.push(this);
           this.webContents = { setFrameRate() {}, openDevTools() {}, send() {} };
         }
         loadFile() {} once() {} on() {} show() {}
@@ -78,5 +83,20 @@ suite.check('Linux clears the menu', linux.length === 1 && linux[0] === null, li
 const mac = startOn('darwin');
 suite.check('macOS keeps it, so Cmd+C, Cmd+V and Cmd+Q still work',
   mac.length === 0, mac);
+
+suite.section('the main window pins the renderer sandbox');
+
+// Electron has sandboxed renderers by default since v20, but a default is not
+// a posture: a future Electron default flip or an edited webPreferences
+// literal could silently unsandbox the trusted window. The app states
+// sandbox: true itself, next to its other explicit pins (nodeIntegration,
+// contextIsolation). Every load above runs the same createWindow(), so all
+// created windows testify.
+const sandboxPins = createdWindows.map(
+  window => window.options.webPreferences && window.options.webPreferences.sandbox
+);
+suite.check('webPreferences sets sandbox: true',
+  createdWindows.length > 0 && sandboxPins.every(pin => pin === true),
+  sandboxPins);
 
 suite.done();
