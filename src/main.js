@@ -610,6 +610,24 @@ function validateInstanceId(instanceId) {
   return { valid: true };
 }
 
+// The profile name lands on a command line too — `--profile ${profileName}` — and
+// the ini parser keeps a section name verbatim, so `[profile x$(id)]` in a
+// hand-edited or tool-written ~/.aws/config becomes a selectable profile whose
+// name carries shell syntax. Every sibling parameter (instance id, region, host,
+// port) is already validated for this; the profile name arrives over the same IPC
+// channel and must be too. The character set is what AWS profile names use in
+// practice: letters, digits, spaces and _ + = , . @ - (the set the CLI documents
+// for IAM-friendly names), which rejects nothing real while excluding ; & | ` $ "
+// and newlines.
+const VALID_PROFILE = /^[A-Za-z0-9_+=,.@ -]{1,128}$/;
+
+function validateProfileName(profileName) {
+  if (!profileName || !VALID_PROFILE.test(profileName)) {
+    return { valid: false, error: 'That profile name contains characters Portus will not pass to a shell.' };
+  }
+  return { valid: true };
+}
+
 function validateRemoteHost(host) {
   if (!host) return { valid: true };
 
@@ -1814,13 +1832,17 @@ const REGION_NAMES = {
 
 // The region a request should use: what the user picked, or the profile's own.
 // An unrecognised value is discarded rather than passed on, so nothing shaped
-// like a command-line argument can arrive from the renderer and be appended to
-// one.
+// like a command-line argument can arrive and be appended to one. This holds for
+// the profile's own region too: `region` is read verbatim from ~/.aws/config, so
+// a hand-edited or tool-written `region = us-east-1$(id)` would otherwise reach
+// `--region ${region}` on the command line without ever passing the renderer's
+// picker. Anything that fails the guard falls back to the same default the config
+// reader already uses.
 async function regionFor(profileName, requested) {
   if (requested && VALID_REGION.test(requested)) return requested;
 
   const profile = await getProfileConfig(profileName);
-  return profile.region;
+  return VALID_REGION.test(profile.region) ? profile.region : 'us-east-1';
 }
 
 // ============================================================================
@@ -1892,6 +1914,8 @@ function setupIpcHandlers() {
     const { remoteHost, remotePort, localPort, region: requestedRegion, kubernetes } = options || {};
     const clusterName = kubernetes && kubernetes.clusterName ? String(kubernetes.clusterName) : null;
 
+    const profileCheck = validateProfileName(profileName);
+    if (!profileCheck.valid) return { success: false, error: profileCheck.error };
     const idCheck = validateInstanceId(instanceId);
     if (!idCheck.valid) return { success: false, error: idCheck.error };
 
@@ -2638,6 +2662,8 @@ function setupIpcHandlers() {
   // resolves to whatever stale keys an older tool left behind — which surfaces as
   // "ExpiredToken … AssumeRole" in a terminal that just opened.
   ipcMain.handle('connect-ssm', async (event, profileName, instanceId, requestedRegion) => {
+    const profileCheck = validateProfileName(profileName);
+    if (!profileCheck.valid) return { success: false, error: profileCheck.error };
     const idCheck = validateInstanceId(instanceId);
     if (!idCheck.valid) return { success: false, error: idCheck.error };
     let credentialEnv;
@@ -2724,6 +2750,8 @@ function setupIpcHandlers() {
   // The tunnel is registered so it can be listed in the UI and terminated on exit.
   // RDP over SSM: a 3389 port forward plus the platform's RDP client.
   ipcMain.handle('connect-rdp-ssm', async (event, profileName, instanceId, instanceName, requestedRegion) => {
+    const profileCheck = validateProfileName(profileName);
+    if (!profileCheck.valid) return { success: false, error: profileCheck.error };
     const idCheck = validateInstanceId(instanceId);
     if (!idCheck.valid) return { success: false, error: idCheck.error };
     // Only an existing *RDP* tunnel can be reused. Without the kind check a port
