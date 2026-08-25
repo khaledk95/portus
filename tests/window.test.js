@@ -8,14 +8,21 @@
 // which is what this guards.
 
 const path = require('path');
+const { pathToFileURL } = require('url');
 const Module = require('module');
 const { createSuite } = require('./helpers/assert');
 
 const APP_ROOT = path.join(__dirname, '..');
 const suite = createSuite('Window chrome');
 
+// The window the most recent startOn() created, so checks below can reach the
+// webContents handlers main.js registered on it.
+const createdWindows = [];
+
 // main.js reads process.platform at startup, so each platform needs its own load
 function startOn(platform) {
+  createdWindows.length = 0;
+
   const menusSet = [];
   let readyCallback;
 
@@ -30,7 +37,18 @@ function startOn(platform) {
       BrowserWindow: class {
         constructor(options) {
           this.options = options;
-          this.webContents = { setFrameRate() {}, openDevTools() {}, send() {} };
+          this.events = {};               // webContents.on(channel, handler)
+          this.windowOpenHandler = null;  // webContents.setWindowOpenHandler(fn)
+          this.webContents = {
+            setFrameRate() {},
+            openDevTools() {},
+            send() {},
+            on: (channel, handler) => {
+              (this.events[channel] = this.events[channel] || []).push(handler);
+            },
+            setWindowOpenHandler: (handler) => { this.windowOpenHandler = handler; }
+          };
+          createdWindows.push(this);
         }
         loadFile() {} once() {} on() {} show() {}
         isDestroyed() { return false; }
@@ -78,5 +96,38 @@ suite.check('Linux clears the menu', linux.length === 1 && linux[0] === null, li
 const mac = startOn('darwin');
 suite.check('macOS keeps it, so Cmd+C, Cmd+V and Cmd+Q still work',
   mac.length === 0, mac);
+
+// The window shows Portus's own UI and nothing in it navigates anywhere — the
+// only outbound links go through the validated open-release-page IPC. So the
+// window may neither be pointed at another page (script running in the renderer
+// is the attacker here) nor be used to open new ones.
+suite.section('the window cannot be navigated or popped open to anywhere else');
+
+startOn('linux');
+
+const win = createdWindows[0];
+const appUrl = pathToFileURL(path.join(APP_ROOT, 'src', 'index.html')).href;
+
+const navigate = (url) => {
+  let prevented = false;
+  const handlers = (win && win.events['will-navigate']) || [];
+  handlers.forEach(handler => handler({ preventDefault: () => { prevented = true; } }, url));
+  return prevented;
+};
+
+suite.check('a will-navigate guard is registered on the main window',
+  Boolean(win && win.events['will-navigate']),
+  win ? Object.keys(win.events).join(', ') || 'no webContents handlers registered' : 'no window created');
+
+suite.check('navigating anywhere but the app itself is stopped',
+  navigate('https://evil.example') === true, 'https://evil.example');
+
+suite.check('navigating to the app\'s own page is still allowed',
+  navigate(appUrl) === false, appUrl);
+
+const openResult = win && win.windowOpenHandler && win.windowOpenHandler({ url: 'https://evil.example' });
+suite.check('script in the page cannot open new windows either',
+  Boolean(openResult) && openResult.action === 'deny',
+  openResult ? `action: ${openResult.action}` : 'no setWindowOpenHandler registered');
 
 suite.done();

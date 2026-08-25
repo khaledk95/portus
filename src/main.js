@@ -5,6 +5,7 @@ if (!process.env.NODE_ENV) {
 
 const { app, BrowserWindow, ipcMain, shell, Menu } = require('electron');
 const path = require('path');
+const { pathToFileURL } = require('url');
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs-extra');
 const ini = require('ini');
@@ -433,6 +434,20 @@ function createWindow() {
   });
 
   mainWindow.webContents.setFrameRate(60);
+
+  // Navigation guard. This window is Portus's own UI and nothing in it ever
+  // navigates elsewhere — outbound links go through the validated
+  // open-release-page IPC instead — so any navigation to another page means
+  // script acting inside the renderer, not the user, and is stopped. The app's
+  // own page stays allowed so a reload keeps working. window.open is refused
+  // outright: no legitimate flow opens a second window from this one. (The
+  // Azure sign-in window is separate and must follow Microsoft's redirects.)
+  const appUrl = pathToFileURL(path.join(__dirname, 'index.html')).href;
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (url !== appUrl) event.preventDefault();
+  });
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
   mainWindow.loadFile('src/index.html');
 
   mainWindow.once('ready-to-show', () => {
