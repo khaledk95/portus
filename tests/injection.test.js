@@ -129,6 +129,57 @@ const LEGITIMATE_HOSTS = [
       { remoteHost: 'db.example.internal', remotePort: '5432', localPort: '' })).success === true);
 
   // ---------------------------------------------------------------------------
+  suite.section('a hostile profile name never reaches a shell either');
+  // The profile takes the same road in as the instance id — over IPC — and it is
+  // interpolated into the `--profile` flag whenever Portus cannot hand the
+  // credentials over in the environment. An unknown name is exactly that case:
+  // nothing is resolved for it, so the raw name is what lands in the command.
+
+  const HOSTILE_PROFILES = [
+    'demo; calc.exe',
+    'demo && whoami',
+    'demo | net user',
+    'demo`whoami`',
+    'demo$(whoami)',
+    'demo" && calc.exe && "',
+    "demo' ; calc",
+    'demo\ncalc.exe',
+    '../../etc/passwd',
+    ''
+  ];
+
+  for (const profile of HOSTILE_PROFILES) {
+    for (const [name, call] of [
+      ['port forward', () => forward({}, profile, 'i-0abc', 'bastion',
+        { remoteHost: 'db.example.internal', remotePort: '5432', localPort: '' })],
+      ['SSM shell', () => ssm({}, profile, 'i-0abc', 'eu-central-1')],
+      ['RDP', () => rdp({}, profile, 'i-0abc', 'jump', 'eu-central-1')]
+    ]) {
+      state.spawns.length = 0;
+      const result = await call();
+
+      const label = (profile || '(empty)').replace(/\n/g, '\\n').slice(0, 24);
+      suite.check(`${name} rejected: ${label}`,
+        result.success === false && state.spawns.length === 0,
+        { success: result.success, spawns: state.spawns.length });
+    }
+  }
+
+  // AWS documents letters, digits, hyphens and underscores for profile names,
+  // and names with spaces exist in the wild — so the guard has to reject
+  // commands, not the occasional space.
+  state.files.config = '[profile demo]\nregion = eu-central-1\n[profile demo two]\nregion = eu-central-1\n';
+  state.spawns.length = 0;
+  suite.check('a profile name with spaces is still accepted',
+    (await forward({}, 'demo two', 'i-0a1b2c3d4e5f60011', 'bastion',
+      { remoteHost: 'db.example.internal', remotePort: '5432', localPort: '' })).success === true
+      && lastCommand().includes('--profile demo two'),
+    { command: lastCommand().slice(0, 120) });
+  state.files.config = '[profile demo]\nregion = eu-central-1\n';
+
+  closeAll();
+
+  // ---------------------------------------------------------------------------
   suite.section('a hostile port is neutralised rather than refused');
   // The port is parsed to an integer, so "5432; calc.exe" becomes 5432 and the
   // suffix is discarded. What matters is that only digits reach the command.

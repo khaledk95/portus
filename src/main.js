@@ -610,6 +610,25 @@ function validateInstanceId(instanceId) {
   return { valid: true };
 }
 
+// A profile name joins the instance id on the same command lines. It arrives
+// over IPC the same way, and whenever Portus cannot hand credentials over in
+// the environment — which is exactly the case for a name it does not
+// recognise, since cliCredentialEnv returns null rather than throwing for one
+// — the raw name is interpolated into the `--profile` flag of a command that
+// ends up in bash -c, PowerShell, cmd or an AppleScript string. AWS documents
+// letters, digits, hyphens and underscores for profile names, and names with
+// spaces occur in the wild, so this rejects nothing real while keeping out
+// every character one of those shells would act on. It must start with an
+// alphanumeric so a "profile name" cannot pose as a command-line flag.
+const VALID_PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._-]*$/;
+
+function validateProfileName(profileName) {
+  if (!profileName || !VALID_PROFILE_NAME.test(profileName)) {
+    return { valid: false, error: 'That does not look like a profile name.' };
+  }
+  return { valid: true };
+}
+
 function validateRemoteHost(host) {
   if (!host) return { valid: true };
 
@@ -1895,6 +1914,9 @@ function setupIpcHandlers() {
     const idCheck = validateInstanceId(instanceId);
     if (!idCheck.valid) return { success: false, error: idCheck.error };
 
+    const nameCheck = validateProfileName(profileName);
+    if (!nameCheck.valid) return { success: false, error: nameCheck.error };
+
     const targetPort = parseInt(remotePort, 10);
     if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
       return { success: false, error: 'Remote port must be a number between 1 and 65535.' };
@@ -2640,6 +2662,8 @@ function setupIpcHandlers() {
   ipcMain.handle('connect-ssm', async (event, profileName, instanceId, requestedRegion) => {
     const idCheck = validateInstanceId(instanceId);
     if (!idCheck.valid) return { success: false, error: idCheck.error };
+    const nameCheck = validateProfileName(profileName);
+    if (!nameCheck.valid) return { success: false, error: nameCheck.error };
     let credentialEnv;
     try {
       credentialEnv = await cliCredentialEnv(profileName);
@@ -2726,6 +2750,8 @@ function setupIpcHandlers() {
   ipcMain.handle('connect-rdp-ssm', async (event, profileName, instanceId, instanceName, requestedRegion) => {
     const idCheck = validateInstanceId(instanceId);
     if (!idCheck.valid) return { success: false, error: idCheck.error };
+    const nameCheck = validateProfileName(profileName);
+    if (!nameCheck.valid) return { success: false, error: nameCheck.error };
     // Only an existing *RDP* tunnel can be reused. Without the kind check a port
     // forward on the same instance would be mistaken for an open RDP session.
     const existing = Array.from(activeTunnels.values()).find(tunnel =>
