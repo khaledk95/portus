@@ -171,6 +171,24 @@ const release = (tag, body) => ({
   suite.check('the owner and repo are compiled in',
     /const GITHUB_OWNER = 'khaledk95'/.test(source) && /const GITHUB_REPO = 'portus'/.test(source));
 
+  // ---------------------------------------------------------------------------
+  suite.section('the documented Linux terminal is the one the code opens');
+  // openTerminal's Linux branch always spawns gnome-terminal (src/main.js
+  // picks terminals[0] without probing what is installed), so the README must
+  // not promise "your usual emulator" — on KDE or an xterm-only desktop that
+  // one-click shell fails to open at all. Source assertion because jsdom has
+  // no terminal to launch; the pin is on the documented claim itself.
+  const readme = require('fs').readFileSync(
+    require('path').join(__dirname, '..', 'README.md'), 'utf8');
+  const ssmLine = (readme.match(/- \*\*One-click SSM shell\*\*.*/) || [''])[0];
+
+  suite.check('the SSM shell line names gnome-terminal for Linux',
+    /gnome-terminal/.test(ssmLine), ssmLine);
+
+  suite.check('and no emulator is promised that the code does not open',
+    !/your usual emulator/.test(readme),
+    (readme.match(/.*your usual emulator.*/) || [''])[0]);
+
   suite.done();
 })();
 
