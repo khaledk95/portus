@@ -1540,11 +1540,15 @@ function runSsoLogin(profile, timeoutMs = 180000) {
       ? ['sso', 'login', '--sso-session', profile.ssoSession]
       : ['sso', 'login', '--profile', profile.name];
 
+    // The session and profile names come from ~/.aws/config itself, and a
+    // pasted or shared file can carry shell syntax in them. On Windows the
+    // shell stays: that is how the CLI's aws.cmd shim is found and quoted. On
+    // macOS and Linux the arguments above cross as plain argv — no shell ever
+    // sees them — and the PATH below is what resolves `aws` without one.
     const spawnOptions = platform === 'win32'
       ? { stdio: 'pipe', shell: true, windowsHide: true }
       : {
           stdio: 'pipe',
-          shell: true,
           env: { ...process.env, PATH: process.env.PATH + ':/usr/local/bin:/opt/homebrew/bin:/usr/bin' }
         };
 

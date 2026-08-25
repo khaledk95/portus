@@ -457,5 +457,48 @@ region = eu-central-1
     partial.success === true && partial.data.some(profile => profile.name === 'ok'),
     partial.data.map(profile => profile.name));
 
+  // ---------------------------------------------------------------------------
+  suite.section('a hostile ~/.aws/config gains no shell at sign-in');
+  // The values sign-in runs with come from the ini file's own bytes: a section
+  // header names the profile, a line names the session. Under shell:true Node
+  // joins them into a single /bin/sh -c string, so a pasted or shared config
+  // carrying command substitution would run it at the next sign-in. They must
+  // cross to the CLI as plain arguments that nothing interprets. (The semicolon
+  // in the header below never survives ini parsing — it starts a comment — but
+  // $() and backticks do, in headers and values alike.)
+  setConfig(`
+[profile p;calc]
+sso_session = x$(touch /tmp/portus-pwn)
+region = eu-central-1
+
+[profile legacy$(touch /tmp/portus-pwn)]
+sso_start_url = https://portal.awsapps.com/start
+region = eu-central-1
+`, '');
+
+  state.spawns.length = 0;
+  const hostileSession = await signIn({}, 'p');
+  const sessionSpawn = state.spawns.find(spawn => (spawn.args || []).includes('sso'));
+
+  suite.check('a metacharacter session value is one literal argument',
+    hostileSession.success === true
+      && sessionSpawn && sessionSpawn.args.includes('x$(touch /tmp/portus-pwn)'),
+    { hostileSession, args: sessionSpawn && sessionSpawn.args });
+  suite.check('and no shell is asked to interpret it',
+    process.platform === 'win32' || !!(sessionSpawn && sessionSpawn.options.shell !== true),
+    sessionSpawn && sessionSpawn.options.shell);
+
+  state.spawns.length = 0;
+  const hostileProfile = await signIn({}, 'legacy$(touch /tmp/portus-pwn)');
+  const profileSpawn = state.spawns.find(spawn => (spawn.args || []).includes('sso'));
+
+  suite.check('a metacharacter profile name is one literal argument',
+    hostileProfile.success === true
+      && profileSpawn && profileSpawn.args.includes('legacy$(touch /tmp/portus-pwn)'),
+    { hostileProfile, args: profileSpawn && profileSpawn.args });
+  suite.check('and no shell is asked to interpret that either',
+    process.platform === 'win32' || !!(profileSpawn && profileSpawn.options.shell !== true),
+    profileSpawn && profileSpawn.options.shell);
+
   suite.done();
 })();
