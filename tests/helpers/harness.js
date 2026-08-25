@@ -77,7 +77,11 @@ function loadMain(options = {}) {
           this.webContents = {
             setFrameRate() {},
             openDevTools() {},
-            send: (channel, payload) => state.sent.push({ channel, payload })
+            send: (channel, payload) => state.sent.push({ channel, payload }),
+            // createWindow registers the navigation guard on every window; no
+            // suite here asserts on it, so recording nothing is enough
+            on() {},
+            setWindowOpenHandler() {}
           };
         }
         loadFile() {}
