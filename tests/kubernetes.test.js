@@ -215,7 +215,9 @@ const { handlers, state, ready } = loadMain({
     spawned.options.env.KUBECONFIG);
   suite.check('credentials travel with it, since get-token runs out there',
     !!spawned.options.env.AWS_ACCESS_KEY_ID);
-  suite.check('the rest of the environment survives', spawned.options.env.PATH !== undefined);
+  // Windows names it Path, not PATH — see azure-chain.test.js
+  suite.check('the rest of the environment survives',
+    Object.keys(spawned.options.env).some(name => name.toLowerCase() === 'path'));
 
   suite.check('a tunnel with no cluster is refused',
     (await kubectl({}, 'no-such-tunnel')).success === false);

@@ -132,8 +132,9 @@ const answerNextPrompt = async (submit, code) => {
       && env.AWS_SECRET_ACCESS_KEY === 'fake-secret'
       && env.AWS_SESSION_TOKEN === 'fake-token',
     { id: env.AWS_ACCESS_KEY_ID, token: env.AWS_SESSION_TOKEN ? 'set' : 'missing' });
+  // Windows names it Path, not PATH — see azure-chain.test.js
   suite.check('the rest of the environment is preserved',
-    env.PATH !== undefined, Object.keys(env).length);
+    Object.keys(env).some(name => name.toLowerCase() === 'path'), Object.keys(env).length);
   suite.check('--profile is dropped, so the CLI does not re-resolve and re-prompt',
     !command.includes('--profile'), command.slice(0, 140));
   suite.check('the region is still passed', /--region eu-central-1/.test(command), command.slice(0, 140));

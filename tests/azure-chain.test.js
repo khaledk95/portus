@@ -214,8 +214,10 @@ const answerNextPrompt = async (submit, code) => {
     (shellSpawn.options.env || {}).AWS_SESSION_TOKEN);
   suite.check('--profile is dropped, so the CLI does not re-chain and fail',
     !shellCommand.includes('--profile'), shellCommand);
+  // Windows names it Path, not PATH. process.env reads case-insensitively, but
+  // spreading it into a plain object keeps whatever case the OS used.
   suite.check('the rest of the environment survives',
-    (shellSpawn.options.env || {}).PATH !== undefined);
+    Object.keys(shellSpawn.options.env || {}).some(name => name.toLowerCase() === 'path'));
   suite.check('the region is still passed',
     shellCommand.includes('--region eu-west-1'), shellCommand);
   suite.check('the target is still passed',
