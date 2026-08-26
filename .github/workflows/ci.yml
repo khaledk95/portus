@@ -20,8 +20,18 @@ concurrency:
 
 jobs:
   test:
-    name: Tests
-    runs-on: ubuntu-latest
+    # The suite stubs the platform in places, but several paths are genuinely
+    # platform-specific — the terminal launcher, the macOS credential script, the
+    # Windows shell probe. An ubuntu-only run cannot see a regression in the two it
+    # is not on, which is exactly how the azure-chain SSM-shell section came to
+    # assert Linux behaviour and still pass CI while failing on macOS and Windows.
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One red platform should still report the others rather than cancel them
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v7

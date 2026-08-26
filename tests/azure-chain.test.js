@@ -200,6 +200,10 @@ const answerNextPrompt = async (submit, code) => {
 
   state.spawns.length = 0;
 
+  // This section describes the environment-passing path, which only exists off
+  // macOS — Terminal.app inherits nothing, so darwin uses the private file
+  // below. Pin the platform so the test says the same thing everywhere.
+  asPlatform('linux');
   const shell = await connectSsm({}, 'prod', 'i-0abc', 'eu-west-1');
   const shellSpawn = state.spawns[state.spawns.length - 1];
   const shellCommand = shellSpawn.args.join(' ');
@@ -220,6 +224,7 @@ const answerNextPrompt = async (submit, code) => {
   // A profile the CLI can resolve on its own must be left exactly as it was
   state.spawns.length = 0;
   await connectSsm({}, 'from-keys', 'i-0abc', 'eu-central-1');
+  asPlatform(realPlatform);
   const plainShell = state.spawns[state.spawns.length - 1];
 
   suite.check('a profile the CLI can resolve keeps --profile',
