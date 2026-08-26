@@ -65,7 +65,7 @@ for them on startup and tells you what is missing.
 
 ## Features
 
-- **Works with however you authenticate to AWS** — IAM Identity Center, Azure AD, `credential_process`, assume-role, static keys or environment credentials. Every profile in `~/.aws` is listed and selectable with no sign-in required first
+- **Works with however you authenticate to AWS** — IAM Identity Center, Azure AD, `credential_process`, assume-role or static keys. Every profile in `~/.aws` is listed and selectable with no sign-in required first
 - **Sign in from the app** — Identity Center opens your browser and shows the pairing code to confirm; Azure AD opens Microsoft's login page in a window, with passkeys and Windows Hello working and no extra tool to install
 - **EC2 instance browser** — live list per profile/region, searchable, with the name, instance ID and private IP copyable straight from the row
 - **Region switcher** — starts on the region the profile's config names, and offers only the regions the account has actually enabled, searchable by city or code. Everything follows it: the instance list, endpoint discovery, SSM shells, RDP and port forwards
@@ -292,7 +292,11 @@ can Portus, because it hands the profile name to the same SDK the CLI uses.
 | **Assume role** | `role_arn` | none needed — with `mfa_serial`, Portus asks for the code when it needs one |
 | **Access keys** | `aws_access_key_id` | none needed, they do not expire |
 
-Environment credentials (`AWS_ACCESS_KEY_ID`, an EC2 instance role) work too.
+Credentials are resolved per profile from `~/.aws`, so a profile has to exist in
+`~/.aws/config` or `~/.aws/credentials` to appear and connect. Bare environment
+variables (`AWS_ACCESS_KEY_ID`) and an EC2 instance role are not picked up on their
+own — put keys in a profile with `aws configure --profile <name>`, or point one at
+your source with `credential_process`.
 
 The sidebar dropdown lists every profile. The **Sign in** dialog lists only the
 logins Portus can start. Profiles sharing an `[sso-session]` appear as one row,
@@ -321,6 +325,13 @@ The credentials stay in memory and are passed to the AWS CLI directly — nothin
 written to `~/.aws/credentials`. Profiles that assume a role from the Azure profile
 (`role_arn` + `source_profile`) work as usual.
 
+One macOS-only exception: Terminal.app is already running and inherits nothing from
+a launch, so opening an SSM shell or `kubectl` terminal there writes the session
+credentials to a private, owner-only script in a private temp directory, which the
+shell reads and Portus deletes a few seconds later. It never reaches `~/.aws`, the
+AppleScript, or shell history. Windows and Linux pass them straight through the
+environment and write nothing.
+
 Your Microsoft session is remembered per tenant, so renewals happen without
 interrupting you. That stores a session cookie, the same as staying signed in to
 Microsoft in a browser.
@@ -332,7 +343,7 @@ Settings, in `~/.aws/config`:
 | `azure_tenant_id` | yes | The tenant to sign in against |
 | `azure_app_id_uri` | yes | The AWS app in that tenant, usually `https://signin.aws.amazon.com/saml` |
 | `azure_default_role_arn` | no | Which role to assume when you have several. Without it, Portus asks |
-| `azure_default_duration_hours` | no | Session length, up to the role's own maximum |
+| `azure_default_duration_hours` | no | Session length. Must not exceed the role's own maximum session duration — AWS rejects the sign-in if it does, rather than capping it. Lower the value or raise the role's limit |
 
 `azure_default_username` is not used — Microsoft's page handles that.
 
@@ -355,7 +366,7 @@ region = me-central-1
 azure_tenant_id = 00000000-0000-0000-0000-000000000000
 azure_app_id_uri = https://signin.aws.amazon.com/saml
 azure_default_role_arn = arn:aws:iam::123456789012:role/YourRole   # optional; skips the role picker
-azure_default_duration_hours = 4                                   # optional; the role's max applies
+azure_default_duration_hours = 4                                   # optional; must not exceed the role's max session duration, or AWS refuses the sign-in
 region = me-central-1
 
 # --- Assume role from a base profile ---
@@ -385,9 +396,12 @@ region = me-central-1
 `aws configure --profile my-keys` writes this for you and gets the syntax right.
 Portus merges both files per profile, so the region can live in either.
 
-**Environment credentials** need no configuration at all: if `AWS_ACCESS_KEY_ID`
-and `AWS_SECRET_ACCESS_KEY` are exported, or Portus is running on an EC2 instance
-with an instance role, the SDK picks them up for the `default` profile.
+**Environment variables and instance roles** are not read on their own. Portus
+resolves each profile's credentials from `~/.aws` (the same files the AWS CLI
+reads), so exported `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` or an EC2
+instance role are not enough by themselves — there must be a matching profile. A
+`[default]` profile in the files works like any other; to use existing keys, write
+them with `aws configure` or reference them from a profile via `credential_process`.
 
 **Assume role with MFA** works too. A profile with `mfa_serial` cannot produce
 credentials until a six-digit code is entered, so Portus asks for one when a call
@@ -550,6 +564,7 @@ All builds output to the `dist/` folder (git-ignored).
 │   ├── azure-saml.test.js   # The SAML request, the assertion, the persisted session
 │   ├── azure-chain.test.js  # Assume-role chains rooted at an Azure sign-in
 │   ├── endpoints.test.js  # RDS / Aurora / ElastiCache discovery
+│   ├── kubernetes.test.js  # EKS kubeconfig generation, port choice, cleanup on quit
 │   ├── injection.test.js  # Nothing hostile reaches a shell command
 │   ├── mfa.test.js        # mfa_serial prompting, caching and cancellation
 │   ├── regions.test.js    # Enabled regions, and the region reaching every request
@@ -558,7 +573,7 @@ All builds output to the `dist/` folder (git-ignored).
 │   ├── window.test.js     # Which platforms keep the application menu
 │   └── run.js           # Runs every suite, one process each
 ├── .github/workflows/
-│   ├── ci.yml           # Runs the tests on every push and pull request, or on demand
+│   ├── ci.yml           # Runs the tests on every push to main and every pull request, or on demand
 │   └── release.yml      # Tests, then builds all three platforms on a v* tag
 ├── package.json         # Scripts + electron-builder config
 └── README.md
@@ -638,8 +653,9 @@ ie4uinit.exe -show
   `@aws-sdk/credential-providers`
 - `fs-extra`, `ini` (read `~/.aws` config)
 - `jsdom` (development only — the renderer tests run the real UI without a display)
-- External CLIs at runtime: **AWS CLI v2** and the **Session Manager plugin**. Nothing else —
-  Azure AD sign-in is done in the app
+- External CLIs at runtime: **AWS CLI v2** and the **Session Manager plugin** are
+  always required; an **RDP client** is needed only for RDP sessions and **kubectl**
+  only for EKS clusters. Azure AD sign-in needs no extra tool — it is done in the app
 
 ---
 
