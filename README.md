@@ -560,12 +560,14 @@ All builds output to the `dist/` folder (git-ignored).
 │   │   ├── harness.js   # Loads the real main.js with electron/fs/AWS stubbed out
 │   │   ├── renderer-harness.js  # Boots the real index.html + renderer.js in jsdom
 │   │   └── assert.js    # Pass/fail counter, deliberately not a framework
+│   ├── audit-regression.test.js  # Regression pins for the documentation-audit findings
 │   ├── providers.test.js  # Credential providers, sign-in routing, session expiry
 │   ├── azure-saml.test.js   # The SAML request, the assertion, the persisted session
 │   ├── azure-chain.test.js  # Assume-role chains rooted at an Azure sign-in
 │   ├── endpoints.test.js  # RDS / Aurora / ElastiCache discovery
 │   ├── kubernetes.test.js  # EKS kubeconfig generation, port choice, cleanup on quit
 │   ├── injection.test.js  # Nothing hostile reaches a shell command
+│   ├── kubernetes.test.js  # EKS cluster discovery and the kubeconfig Portus writes
 │   ├── mfa.test.js        # mfa_serial prompting, caching and cancellation
 │   ├── regions.test.js    # Enabled regions, and the region reaching every request
 │   ├── release-check.test.js  # Version comparison and which links may be opened
