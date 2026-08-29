@@ -10,7 +10,9 @@ const { createSuite } = require('./helpers/assert');
 const suite = createSuite('Command injection');
 
 const { handlers, state, ready } = loadMain({
-  files: { config: '[profile demo]\nregion = eu-central-1\n' },
+  // `region-poison` carries a region the ini parser keeps verbatim; it is only
+  // reached when no valid region is requested, exercising regionFor's fallback.
+  files: { config: '[profile demo]\nregion = eu-central-1\n\n[profile region-poison]\nregion = us-east-1$(id)\n' },
   // the phrase the tunnel waits for before reporting itself up, then it stays up
   onSpawn: () => ({ stdout: 'Port forwarding started', keepOpen: true })
 });
@@ -188,6 +190,70 @@ const LEGITIMATE_HOSTS = [
     suite.check('POSIX execs so no shell is left as a parent',
       String(spawned.args[1]).startsWith('exec aws ssm start-session '), String(spawned.args[1]).slice(0, 60));
   }
+
+  closeAll();
+
+  // ---------------------------------------------------------------------------
+  suite.section('a hostile profile name never reaches a shell');
+  // The profile name lands on the command line as `--profile <name>`, and the ini
+  // parser keeps a section name verbatim — so `[profile x$(id)]` in a hand-edited
+  // or tool-written ~/.aws/config is a selectable profile whose name carries shell
+  // syntax. It arrives over the same IPC channel as the instance id, and is
+  // validated the same way. These are the shapes that would break out on each
+  // platform: $() and backticks under bash, ; & | as separators, " to escape the
+  // macOS `do script` string literal, and a newline.
+  const HOSTILE_PROFILES = [
+    'x$(id)',
+    'x`id`',
+    'x && calc.exe',
+    'x | net user',
+    'x; rm -rf ~',
+    'x" ; rm -rf ~ ; "',
+    'x\ncalc.exe',
+    ''
+  ];
+
+  for (const profile of HOSTILE_PROFILES) {
+    for (const [name, call] of [
+      ['SSM shell', () => ssm({}, profile, 'i-0abc', 'eu-central-1')],
+      ['RDP', () => rdp({}, profile, 'i-0abc', 'jump', 'eu-central-1')],
+      ['port forward', () => forward({}, profile, 'i-0abc', 'bastion',
+        { remoteHost: 'db.example.internal', remotePort: '5432', localPort: '' })]
+    ]) {
+      state.spawns.length = 0;
+      const result = await call();
+
+      const label = (profile || '(empty)').replace(/\n/g, '\\n').slice(0, 24);
+      suite.check(`${name} rejected: ${label}`,
+        result.success === false && state.spawns.length === 0,
+        { success: result.success, spawns: state.spawns.length });
+    }
+    closeAll();
+  }
+
+  // A real profile name is still accepted, or the guard is just breaking the app
+  state.spawns.length = 0;
+  suite.check('a genuine profile name is still accepted',
+    (await ssm({}, 'demo', 'i-0abc', 'eu-central-1')).success === true);
+
+  closeAll();
+
+  // ---------------------------------------------------------------------------
+  suite.section('a hostile region on disk never reaches a shell either');
+  // The requested region is guarded, but the profile's own region is read verbatim
+  // from ~/.aws/config. With no valid region requested, regionFor falls back to it,
+  // so a poisoned `region = us-east-1$(id)` must be discarded, not appended.
+  state.spawns.length = 0;
+  // an invalid requested region forces the fallback to the (poisoned) disk region
+  const poisoned = await ssm({}, 'region-poison', 'i-0abc', 'not a region!!');
+  const poisonedCommand = lastCommand();
+
+  suite.check('the connection is not built from the poisoned region',
+    poisoned.success === true
+      && !poisonedCommand.includes('$(id)')
+      && !/[;&|`\n]|\$\(/.test(poisonedCommand)
+      && poisonedCommand.includes('--region us-east-1'),
+    poisonedCommand.slice(0, 160));
 
   closeAll();
 
