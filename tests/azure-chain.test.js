@@ -51,11 +51,15 @@ const fromIniCalls = [];
 
 const { handlers, state, ready } = loadMain({
   files: { config: CONFIG, credentials: CREDENTIALS },
-  // `where` probes which shell the Windows terminals should use; answering it
-  // avoids a five second timeout per launch
-  onSpawn: ({ command, args }) => (command === 'where'
-    ? { exit: args[0] === 'pwsh' ? 0 : 1 }
-    : { stdout: 'Port forwarding started', keepOpen: true }),
+  // `where` probes which shell the Windows terminals should use; `command -v` is
+  // the Linux launcher resolving an emulator on PATH before spawning it. Answering
+  // both avoids a five second timeout per launch and, on Linux, keeps the SSM
+  // shell on a real terminal rather than the no-emulator-found failure.
+  onSpawn: ({ command, args }) => {
+    if (command === 'where') return { exit: args[0] === 'pwsh' ? 0 : 1 };
+    if (command === 'sh' && String(args[1]).startsWith('command -v ')) return { exit: 0 };
+    return { stdout: 'Port forwarding started', keepOpen: true };
+  },
   modules: {
     './azure-saml': {
       requestAssertion: async () => ({

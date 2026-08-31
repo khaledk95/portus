@@ -855,6 +855,31 @@ function windowsTerminalArgs(shell, command) {
     : ['/c', 'start', shell, '-NoExit'];
 }
 
+// Linux has no single terminal to assume. spawn does not fail synchronously for a
+// missing binary, so picking the first name and spawning it always "succeeded" on
+// gnome-terminal even where only konsole or xterm was installed — the same trap
+// launchRdpClient documents and already avoids. Resolve each candidate on PATH
+// first, and hand it the argument form it expects: gnome-terminal takes `--` before
+// the command, the others take `-e`. Returns null when none is installed, so the
+// error the user sees ("install gnome-terminal, konsole, or xterm") names options
+// that would actually be used.
+async function resolveLinuxTerminal(shell) {
+  const terminals = [
+    { command: 'gnome-terminal', args: ['--', 'bash', '-c', shell] },
+    { command: 'konsole', args: ['-e', 'bash', '-c', shell] },
+    { command: 'xterm', args: ['-e', 'bash', '-c', shell] },
+    { command: 'x-terminal-emulator', args: ['-e', 'bash', '-c', shell] }
+  ];
+
+  for (const terminal of terminals) {
+    if (await isCommandAvailable(terminal.command)) {
+      return { launcher: terminal.command, args: terminal.args };
+    }
+  }
+
+  return null;
+}
+
 // Opens a terminal the user can see, carrying an environment they cannot.
 //
 // Shared by the SSM shell and the kubectl session, which differ only in what
@@ -864,10 +889,15 @@ function windowsTerminalArgs(shell, command) {
 // assume, and Windows needs `start` to get a window at all.
 async function openTerminal({ command, env, interactive = false, scriptPath = null, message }) {
   const platform = process.platform;
+  const isPosixDesktop = platform !== 'win32' && platform !== 'darwin';
 
-  // Resolved before the promise: picking a shell is the one asynchronous part,
-  // and everything after it is synchronous spawn plumbing.
+  // Resolved before the promise: picking a shell (Windows) or an installed
+  // emulator (Linux) is the one asynchronous part, and everything after it is
+  // synchronous spawn plumbing.
   const shell = platform === 'win32' ? await windowsShell() : null;
+  const linuxTerminal = isPosixDesktop
+    ? await resolveLinuxTerminal(interactive && !command ? 'exec bash' : `${command}; exec bash`)
+    : null;
 
   return new Promise((resolve) => {
     let launcher, args;
@@ -881,11 +911,16 @@ async function openTerminal({ command, env, interactive = false, scriptPath = nu
       launcher = 'osascript';
       args = ['-e', `tell application "Terminal" to do script "${scriptPath || command}"`];
     } else {
-      const shell = interactive && !command ? 'exec bash' : `${command}; exec bash`;
-      const terminals = ['gnome-terminal', 'konsole', 'xterm', 'x-terminal-emulator'];
-
-      launcher = terminals[0];
-      args = ['--', 'bash', '-c', shell];
+      if (!linuxTerminal) {
+        resolve({
+          success: false,
+          error: 'No suitable terminal emulator found. Please install gnome-terminal, konsole, or xterm.'
+        });
+        if (scriptPath) scheduleScriptRemoval(scriptPath, 0);
+        return;
+      }
+      launcher = linuxTerminal.launcher;
+      args = linuxTerminal.args;
     }
 
     // detached is deliberately off on Windows. libuv turns it into
