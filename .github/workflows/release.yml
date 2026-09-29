@@ -17,7 +17,9 @@ jobs:
   # produce installers, let alone a release.
   test:
     name: Tests
-    runs-on: ubuntu-latest
+    # Pinned, not -latest: the label moves to Ubuntu 26 from 19 October 2026, and
+    # a release should not start building on a new image because a date passed.
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -47,7 +49,7 @@ jobs:
           - os: macos-latest
             name: macOS
             build: npm run build:mac
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             name: Linux
             build: npm run build:linux
 
@@ -66,14 +68,16 @@ jobs:
 
       # dmg-license builds through node-gyp, which needs Python
       - name: Setup Python (macOS only)
-        if: matrix.os == 'macos-latest'
+        # Keyed to the platform, not the runner label: pinning an image should
+        # not quietly turn a setup step off.
+        if: matrix.name == 'macOS'
         uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
       # The rpm target shells out to rpmbuild, which the runner image lacks
       - name: Install rpm tooling (Linux only)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.name == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y rpm
 
       - name: Install dependencies
@@ -119,7 +123,7 @@ jobs:
   publish:
     name: Publish release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v7

@@ -31,7 +31,10 @@ jobs:
       # One red platform should still report the others rather than cancel them
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Ubuntu is pinned rather than -latest: the label moves to Ubuntu 26 from
+        # 19 October 2026, and a runner image should change because this file
+        # changed, not because a date passed. Bump it deliberately.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
