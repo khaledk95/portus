@@ -26,6 +26,20 @@ function awsRelative(filePath) {
   return marker === -1 ? normalised : normalised.slice(marker + '/.aws/'.length);
 }
 
+// Which command an availability probe is asking about, or null if this spawn is
+// not one. main.js asks two ways: `where x` on Windows, `sh -c "command -v x"`
+// everywhere else.
+function probeTarget(command, args = []) {
+  if (command === 'where' && args.length === 1) return args[0];
+
+  if (command === 'sh' && args[0] === '-c') {
+    const match = /^command -v (\S+)$/.exec(String(args[1] || ''));
+    if (match) return match[1];
+  }
+
+  return null;
+}
+
 function inertClient() {
   return class { async send() { return {}; } };
 }
@@ -54,12 +68,18 @@ function loadMain(options = {}) {
     written: [],         // every file written outside ~/.aws
     removed: [],         // every path removed
     dirs: [],            // every directory created
-    appEvents: {}        // app.on handlers, so shutdown can be triggered
+    appEvents: {},       // app.on handlers, so shutdown can be triggered
+    webContentsEvents: {}, // webContents.on handlers, e.g. the navigation guard
+    windowOpenHandler: null // whatever setWindowOpenHandler was given
   };
 
   const handlers = new Map();
 
   const onSpawn = options.onSpawn || (() => ({ exit: 0 }));
+
+  // Commands a suite wants to be absent from the machine, e.g. to push the
+  // terminal search past gnome-terminal
+  const missingCommands = options.missingCommands || [];
 
   const stubs = {
     electron: {
@@ -77,7 +97,13 @@ function loadMain(options = {}) {
           this.webContents = {
             setFrameRate() {},
             openDevTools() {},
-            send: (channel, payload) => state.sent.push({ channel, payload })
+            send: (channel, payload) => state.sent.push({ channel, payload }),
+            // The navigation guards register here, and a test drives them by
+            // calling what was registered.
+            on: (event, handler) => {
+              (state.webContentsEvents[event] = state.webContentsEvents[event] || []).push(handler);
+            },
+            setWindowOpenHandler: (handler) => { state.windowOpenHandler = handler; }
           };
         }
         loadFile() {}
@@ -144,7 +170,14 @@ function loadMain(options = {}) {
         // through, and the shell:true that Windows quoting depends on
         state.spawns.push({ command, args, options });
 
-        const reply = onSpawn({ command, args }) || {};
+        // "is this installed?" probes — `sh -c command -v x` and `where x`.
+        // Answered here so no suite has to model them, and so they never reach a
+        // test's onSpawn and sit there until the five-second timeout. Everything
+        // is present unless a suite names it in missingCommands.
+        const probed = probeTarget(command, args);
+        const reply = probed
+          ? { exit: missingCommands.includes(probed) ? 1 : 0 }
+          : onSpawn({ command, args }) || {};
         const proc = new EventEmitter();
 
         proc.pid = 4242;
@@ -225,6 +258,11 @@ function loadMain(options = {}) {
     return realLoad.call(this, request, ...rest);
   };
 
+  // Dropped from the cache so a suite can load main.js more than once and get a
+  // genuinely fresh module each time — memoised state, such as which terminal
+  // the machine has, would otherwise survive into the next load and the second
+  // scenario would silently test the first one's answer.
+  delete require.cache[require.resolve(path.join(APP_ROOT, 'src', 'main.js'))];
   require(path.join(APP_ROOT, 'src', 'main.js'));
 
   return {

@@ -230,7 +230,7 @@ const answerNextPrompt = async (submit, code) => {
   const plainShell = state.spawns[state.spawns.length - 1];
 
   suite.check('a profile the CLI can resolve keeps --profile',
-    plainShell.args.join(' ').includes('--profile from-keys'), plainShell.args.join(' '));
+    plainShell.args.join(' ').includes('--profile "from-keys"'), plainShell.args.join(' '));
   suite.check('and gets no credentials in its environment',
     (plainShell.options.env || {}).AWS_ACCESS_KEY_ID === undefined);
 
@@ -313,7 +313,7 @@ const answerNextPrompt = async (submit, code) => {
   suite.check('nothing is resolved in-process at all',
     fromIniCalls.length === 0, fromIniCalls.map(c => c.profile));
   suite.check('--profile is still passed, so the CLI resolves it as it always did',
-    lastCommand().includes('--profile from-keys'), lastCommand().slice(0, 120));
+    lastCommand().includes('--profile "from-keys"'), lastCommand().slice(0, 120));
   suite.check('and nothing is injected into its environment',
     lastEnv().AWS_ACCESS_KEY_ID === undefined, lastEnv().AWS_ACCESS_KEY_ID);
 
@@ -331,7 +331,7 @@ const answerNextPrompt = async (submit, code) => {
 
   const after = await tunnelFor('prod');
   suite.check('the derived profile is no longer served from the cache',
-    !lastEnv().AWS_SESSION_TOKEN && lastCommand().includes('--profile prod'),
+    !lastEnv().AWS_SESSION_TOKEN && lastCommand().includes('--profile "prod"'),
     { token: lastEnv().AWS_SESSION_TOKEN, command: lastCommand().slice(0, 120) });
   suite.check('nothing is re-assumed off the forgotten credentials',
     assumeRoles().length === 0, assumeRoles());

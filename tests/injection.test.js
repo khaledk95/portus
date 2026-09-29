@@ -68,9 +68,16 @@ const LEGITIMATE_HOSTS = [
   // left hanging around as a parent. Both wrappers are stripped here, and the
   // wrapper itself is asserted separately below.
   const onWindows = process.platform === 'win32';
+  // Availability probes (`where pwsh`, `sh -c "command -v …"`) are spawns too,
+  // and the first terminal launch is preceded by one. They are not what any
+  // assertion here is about.
+  const isProbe = (spawn) => spawn.command === 'where'
+    || (spawn.command === 'sh' && /^command -v /.test(String((spawn.args || [])[1] || '')));
+
   const lastCommand = () => {
-    if (!state.spawns.length) return '';
-    const spawned = state.spawns[0];
+    const real = state.spawns.filter(spawn => !isProbe(spawn));
+    if (!real.length) return '';
+    const spawned = real[0];
     return String(spawned.args[spawned.args.length - 1]).replace(/^exec /, '');
   };
 
@@ -127,6 +134,63 @@ const LEGITIMATE_HOSTS = [
   suite.check('a genuine instance id is still accepted',
     (await forward({}, 'demo', 'i-0a1b2c3d4e5f60011', 'bastion',
       { remoteHost: 'db.example.internal', remotePort: '5432', localPort: '' })).success === true);
+
+  // ---------------------------------------------------------------------------
+  suite.section('a hostile profile name never reaches a shell either');
+  // The profile name lands on the same command line as `--profile <name>`, and
+  // on Windows that line goes to PowerShell as one string. It arrives over IPC
+  // like everything else here.
+
+  const HOSTILE_PROFILES = [
+    'demo; calc.exe',
+    'demo && whoami',
+    'demo | net user',
+    'demo`whoami`',
+    'demo$(whoami)',
+    'demo"; calc.exe; "',
+    "demo'; calc.exe; '",
+    'demo\ncalc.exe',
+    'demo\\"; calc',
+    '$env:PATH',
+    'demo > C:\\Windows\\Temp\\owned',
+    '',
+    'a'.repeat(200)
+  ];
+
+  for (const name of HOSTILE_PROFILES) {
+    for (const [label, call] of [
+      ['port forward', () => forward({}, name, 'i-0abc', 'bastion',
+        { remoteHost: 'db.example.internal', remotePort: '5432', localPort: '' })],
+      ['SSM shell', () => ssm({}, name, 'i-0abc', 'eu-central-1')],
+      ['RDP', () => rdp({}, name, 'i-0abc', 'jump', 'eu-central-1')]
+    ]) {
+      state.spawns.length = 0;
+      const result = await call();
+
+      const shown = (name || '(empty)').replace(/\n/g, '\\n').slice(0, 22);
+      suite.check(`${label} rejected: ${shown}`,
+        result.success === false && state.spawns.length === 0,
+        { success: result.success, spawns: state.spawns.length });
+    }
+  }
+
+  // AWS allows far more than [a-z0-9-] in a profile name, and people use it.
+  // Rejecting these would be a regression dressed up as hardening.
+  const LEGITIMATE_PROFILES = [
+    'demo', 'acme-prod', 'acme_staging', 'team.platform',
+    'user@corp', 'team+aws', '_leading', 'café', 'prod 2', 'a/b', 'v1=2'
+  ];
+
+  for (const name of LEGITIMATE_PROFILES) {
+    state.spawns.length = 0;
+    const result = await ssm({}, name, 'i-0abc', 'eu-central-1');
+
+    suite.check(`accepted: ${name}`, result.success === true, result.error);
+    suite.check('  and is quoted on the command line',
+      lastCommand().includes(`--profile "${name}"`), lastCommand().slice(0, 140));
+  }
+
+  closeAll();
 
   // ---------------------------------------------------------------------------
   suite.section('a hostile port is neutralised rather than refused');

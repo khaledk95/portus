@@ -10,6 +10,7 @@ const fs = require('fs-extra');
 const ini = require('ini');
 const os = require('os');
 const https = require('https');
+const { fileURLToPath } = require('url');
 
 // AWS SDK imports (EC2 only - needed to list SSM/RDP targets)
 const { EC2Client, DescribeInstancesCommand, DescribeRegionsCommand } = require('@aws-sdk/client-ec2');
@@ -413,6 +414,37 @@ function applyApplicationMenu() {
   if (process.platform !== 'darwin') Menu.setApplicationMenu(null);
 }
 
+// Is this URL the app's own page?
+//
+// Compared as a resolved filesystem path rather than as a URL string. The window
+// is loaded with loadFile, and an install path containing spaces, non-ASCII
+// characters or a drive letter of either case can percent-encode differently
+// from what the navigation event reports — so an exact href match would refuse
+// the page its own reload, in exactly the installs hardest to diagnose.
+function isOwnPage(url, pageOnDisk) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (error) {
+    return false;
+  }
+
+  if (parsed.protocol !== 'file:') return false;
+
+  try {
+    const target = path.resolve(fileURLToPath(parsed));
+    const page = path.resolve(pageOnDisk);
+
+    // Windows paths are case-insensitive, and the drive letter in particular
+    // arrives in either case depending on who produced the URL.
+    return process.platform === 'win32'
+      ? target.toLowerCase() === page.toLowerCase()
+      : target === page;
+  } catch (error) {
+    return false;
+  }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
@@ -435,6 +467,28 @@ function createWindow() {
 
   mainWindow.webContents.setFrameRate(60);
   mainWindow.loadFile('src/index.html');
+
+  // The renderer only ever shows the page packaged with the app, and nothing in
+  // it navigates anywhere. These two guards keep it that way: a main window that
+  // followed a link to a remote origin would take its preload bridge — every IPC
+  // channel, and the AWS access behind them — along with it.
+  //
+  // This is the main window only. The Azure sign-in window has to navigate
+  // across Microsoft's domains to do its job, so it is deliberately left alone.
+  const pageOnDisk = path.join(__dirname, 'index.html');
+
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isOwnPage(url, pageOnDisk)) return;
+    event.preventDefault();
+  });
+
+  // Nothing in the app opens a window. Anything that asks for one is either a
+  // link meant for a browser or something that should not be happening, and
+  // neither wants a second privileged renderer.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
 
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
@@ -607,6 +661,29 @@ const VALID_INSTANCE_ID = /^[A-Za-z0-9-]{1,64}$/;
 function validateInstanceId(instanceId) {
   if (!instanceId || !VALID_INSTANCE_ID.test(instanceId)) {
     return { valid: false, error: 'That does not look like an EC2 instance ID.' };
+  }
+  return { valid: true };
+}
+
+// A profile name lands on a command line too, as `--profile <name>`, and on
+// Windows that line is handed to PowerShell as one string.
+//
+// Rejecting by what is dangerous rather than by what is alphanumeric, because
+// AWS allows a broad set of characters here and people use them: user@corp,
+// team+aws, _leading, café, names with spaces. Banning quotes, `$` and the
+// backtick is what lets the value be quoted safely at the call site — inside
+// double quotes both PowerShell and bash would otherwise still expand them.
+const INVALID_PROFILE_NAME = /[\u0000-\u001f\u007f"'`$;&|<>(){}\[\]\\\n\r]/;
+
+function validateProfileName(profileName) {
+  if (!profileName) {
+    return { valid: false, error: 'No profile was selected.' };
+  }
+  if (profileName.length > 128) {
+    return { valid: false, error: 'That profile name is too long to be a real one.' };
+  }
+  if (INVALID_PROFILE_NAME.test(profileName)) {
+    return { valid: false, error: 'That profile name contains characters a shell would read as syntax.' };
   }
   return { valid: true };
 }
@@ -845,6 +922,39 @@ function windowsShell() {
   return windowsShellPromise;
 }
 
+// Which terminal to open on Linux, and how to hand it a command.
+//
+// There is no terminal every distribution has, so this is a real search rather
+// than a default with alternatives listed in an error message. The flag differs
+// too — gnome-terminal ends its own options with `--`, the rest take `-e` — so
+// the argument shape travels with the command instead of being assumed.
+//
+// x-terminal-emulator is Debian's alternatives symlink, tried late so that a
+// machine with a real terminal installed gets that one by name.
+const LINUX_TERMINALS = [
+  { command: 'gnome-terminal', args: ['--'] },
+  { command: 'konsole', args: ['-e'] },
+  { command: 'xterm', args: ['-e'] },
+  { command: 'x-terminal-emulator', args: ['-e'] }
+];
+
+// Resolved once, for the same reason windowsShell() is: the installed terminal
+// cannot change while the app runs, and probing four commands on every launch is
+// four spawns nobody is waiting for.
+let linuxTerminalPromise = null;
+
+function linuxTerminal() {
+  if (!linuxTerminalPromise) {
+    linuxTerminalPromise = (async () => {
+      for (const terminal of LINUX_TERMINALS) {
+        if (await isCommandAvailable(terminal.command)) return terminal;
+      }
+      return null;
+    })();
+  }
+  return linuxTerminalPromise;
+}
+
 // -NoExit is PowerShell's /k: run this, then leave me a prompt.
 function windowsTerminalArgs(shell, command) {
   if (shell === 'cmd') {
@@ -865,9 +975,17 @@ function windowsTerminalArgs(shell, command) {
 async function openTerminal({ command, env, interactive = false, scriptPath = null, message }) {
   const platform = process.platform;
 
-  // Resolved before the promise: picking a shell is the one asynchronous part,
-  // and everything after it is synchronous spawn plumbing.
+  // Resolved before the promise: picking a shell or a terminal is the one
+  // asynchronous part, and everything after it is synchronous spawn plumbing.
   const shell = platform === 'win32' ? await windowsShell() : null;
+  const terminal = platform === 'win32' || platform === 'darwin' ? null : await linuxTerminal();
+
+  if (!terminal && platform !== 'win32' && platform !== 'darwin') {
+    return {
+      success: false,
+      error: `No terminal emulator found. Please install one of: ${LINUX_TERMINALS.map(t => t.command).join(', ')}.`
+    };
+  }
 
   return new Promise((resolve) => {
     let launcher, args;
@@ -881,11 +999,10 @@ async function openTerminal({ command, env, interactive = false, scriptPath = nu
       launcher = 'osascript';
       args = ['-e', `tell application "Terminal" to do script "${scriptPath || command}"`];
     } else {
-      const shell = interactive && !command ? 'exec bash' : `${command}; exec bash`;
-      const terminals = ['gnome-terminal', 'konsole', 'xterm', 'x-terminal-emulator'];
+      const script = interactive && !command ? 'exec bash' : `${command}; exec bash`;
 
-      launcher = terminals[0];
-      args = ['--', 'bash', '-c', shell];
+      launcher = terminal.command;
+      args = [...terminal.args, 'bash', '-c', script];
     }
 
     // detached is deliberately off on Windows. libuv turns it into
@@ -919,7 +1036,7 @@ async function openTerminal({ command, env, interactive = false, scriptPath = nu
             ? 'Could not open Command Prompt. Please ensure cmd.exe is available.'
             : platform === 'darwin'
               ? 'Could not open Terminal. Please ensure Terminal.app is available.'
-              : 'No suitable terminal emulator found. Please install gnome-terminal, konsole, or xterm.'
+              : `Could not open ${terminal.command}. It answered a moment ago, so it may have just been removed.`
         });
       } else {
         resolve({ success: false, error: `Failed to open terminal: ${error.message}` });
@@ -1852,6 +1969,15 @@ async function regionFor(profileName, requested) {
   if (requested && VALID_REGION.test(requested)) return requested;
 
   const profile = await getProfileConfig(profileName);
+
+  // The configured region reaches the same command line the requested one does.
+  // It comes off disk rather than over IPC, so this is the quieter of the two
+  // paths — but a hand-edited or generated ~/.aws/config is not a promise, and
+  // there is no reason for the two to be trusted differently.
+  if (profile.region && !VALID_REGION.test(profile.region)) {
+    throw new Error(`Profile "${profileName}" has a region that is not a valid region code.`);
+  }
+
   return profile.region;
 }
 
@@ -1924,6 +2050,9 @@ function setupIpcHandlers() {
     const { remoteHost, remotePort, localPort, region: requestedRegion, kubernetes } = options || {};
     const clusterName = kubernetes && kubernetes.clusterName ? String(kubernetes.clusterName) : null;
 
+    const profileCheck = validateProfileName(profileName);
+    if (!profileCheck.valid) return { success: false, error: profileCheck.error };
+
     const idCheck = validateInstanceId(instanceId);
     if (!idCheck.valid) return { success: false, error: idCheck.error };
 
@@ -1993,7 +2122,7 @@ function setupIpcHandlers() {
       return { success: false, error: `Could not get credentials for ${profileName}: ${error.message}` };
     }
 
-    const profileFlag = credentialEnv ? '' : ` --profile ${profileName}`;
+    const profileFlag = credentialEnv ? '' : ` --profile "${profileName}"`;
     const region = await regionFor(profileName, requestedRegion);
     const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name ${documentName} --parameters "${parameters}"${profileFlag} --region ${region}`;
 
@@ -2670,6 +2799,9 @@ function setupIpcHandlers() {
   // resolves to whatever stale keys an older tool left behind — which surfaces as
   // "ExpiredToken … AssumeRole" in a terminal that just opened.
   ipcMain.handle('connect-ssm', async (event, profileName, instanceId, requestedRegion) => {
+    const profileCheck = validateProfileName(profileName);
+    if (!profileCheck.valid) return { success: false, error: profileCheck.error };
+
     const idCheck = validateInstanceId(instanceId);
     if (!idCheck.valid) return { success: false, error: idCheck.error };
     let credentialEnv;
@@ -2686,7 +2818,7 @@ function setupIpcHandlers() {
       return { success: false, error: `Failed to get profile config: ${error.message}` };
     }
 
-    const profileFlag = credentialEnv ? '' : ` --profile ${profileName}`;
+    const profileFlag = credentialEnv ? '' : ` --profile "${profileName}"`;
     const awsCommand = `aws ssm start-session --target ${instanceId}${profileFlag} --region ${region}`;
 
     // macOS is the awkward one: Terminal.app is already running, so it does not
@@ -2756,6 +2888,9 @@ function setupIpcHandlers() {
   // The tunnel is registered so it can be listed in the UI and terminated on exit.
   // RDP over SSM: a 3389 port forward plus the platform's RDP client.
   ipcMain.handle('connect-rdp-ssm', async (event, profileName, instanceId, instanceName, requestedRegion) => {
+    const profileCheck = validateProfileName(profileName);
+    if (!profileCheck.valid) return { success: false, error: profileCheck.error };
+
     const idCheck = validateInstanceId(instanceId);
     if (!idCheck.valid) return { success: false, error: idCheck.error };
     // Only an existing *RDP* tunnel can be reused. Without the kind check a port
@@ -2789,7 +2924,7 @@ function setupIpcHandlers() {
       return { success: false, error: `Could not get credentials for ${profileName}: ${error.message}` };
     }
 
-    const profileFlag = credentialEnv ? '' : ` --profile ${profileName}`;
+    const profileFlag = credentialEnv ? '' : ` --profile "${profileName}"`;
     const region = await regionFor(profileName, requestedRegion);
     const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=3389,localPortNumber=${localPort}"${profileFlag} --region ${region}`;
 

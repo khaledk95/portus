@@ -170,8 +170,11 @@ const answerNextPrompt = async (submit, code) => {
 
   suite.check('it starts with no prompt',
     plain.success === true && !state.sent.some(message => message.channel === 'mfa-required'));
-  suite.check('--profile is still passed, exactly as before',
-    lastCommand().includes('--profile plain'), lastCommand().slice(0, 140));
+  // Quoted, so a profile name containing a space survives the trip through
+  // PowerShell. The name itself is validated before it gets here, so nothing
+  // inside the quotes can end them.
+  suite.check('--profile is still passed, now quoted',
+    lastCommand().includes('--profile "plain"'), lastCommand().slice(0, 140));
   suite.check('no MFA callback is handed to the SDK',
     fromIniCalls.every(call => call.mfaCodeProvider === undefined), fromIniCalls.length);
   suite.check('no credentials are injected into its environment',
