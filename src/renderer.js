@@ -1330,7 +1330,15 @@ class Portus {
                 <button class="act" data-action="port">Port</button>
             `;
         } else {
-            actions = `<button class="act" disabled title="${blocked}">No SSM</button>`;
+            // No agent of its own is not the same as unreachable: if something
+            // managed is running in the same VPC, it can carry the traffic. The
+            // SSM column still reports the real status, so nothing is hidden.
+            const reachableVia = item.privateIp && this.hopCandidatesFor(item).length;
+
+            actions = reachableVia
+                ? `<button class="act" data-action="via"
+                           title="${blocked} Portus can still reach it through a managed instance in the same VPC.">Access via…</button>`
+                : `<button class="act" disabled title="${blocked}">No SSM</button>`;
         }
 
         row.innerHTML = `
@@ -1423,6 +1431,7 @@ class Portus {
         if (action === 'ssm') this.connectSsm(item.instanceId, name);
         if (action === 'rdp') this.connectRdp(item.instanceId, name);
         if (action === 'port') this.openPortDialog(item.instanceId, name);
+        if (action === 'via') this.openHopDialog(item);
     }
 
     // ==========================================================================
@@ -1517,10 +1526,184 @@ class Portus {
         }
     }
 
-    async connectRdp(instanceId, name) {
+    // Which of the loaded instances could carry traffic to this one.
+    //
+    // Same subnet first, since nothing has to route between them, then the rest
+    // of the VPC. Instances in another VPC are left out entirely: without peering
+    // they cannot reach the address, and offering one would only buy a tunnel
+    // that times out two minutes later.
+    hopCandidatesFor(item) {
+        if (!item.vpcId) return [];
+
+        return this.instances
+            .filter(candidate =>
+                candidate.instanceId !== item.instanceId &&
+                candidate.state === 'running' &&
+                (candidate.ssmStatus === 'online' || candidate.ssmStatus === 'unknown') &&
+                candidate.vpcId === item.vpcId)
+            .map(candidate => ({
+                ...candidate,
+                sameSubnet: !!(item.subnetId && candidate.subnetId === item.subnetId)
+            }))
+            .sort((a, b) => (Number(b.sameSubnet) - Number(a.sameSubnet))
+                || String(a.instanceName || a.instanceId)
+                    .localeCompare(String(b.instanceName || b.instanceId)));
+    }
+
+    // Reaching an instance that has no SSM agent, through one that has.
+    //
+    // Nothing new happens underneath: the tunnel is the same
+    // StartPortForwardingSessionToRemoteHost a database forward already uses,
+    // with this instance's private address as the far end. The only real
+    // question is which managed instance carries it, so that is what the dialog
+    // asks — preselected, because the answer is usually obvious.
+    openHopDialog(item) {
+        const name = item.instanceName || item.instanceId;
+        const isWindows = (item.platform || '').toLowerCase().includes('windows');
+        const hops = this.hopCandidatesFor(item);
+
+        if (!hops.length) {
+            this.toast(`No SSM-managed instance is running in ${item.vpcId || 'this VPC'} to reach ${name} through`, 'warning');
+            return;
+        }
+        if (!item.privateIp) {
+            this.toast(`${name} has no private IP address to connect to`, 'warning');
+            return;
+        }
+
+        const defaultPort = isWindows ? 3389 : 22;
+
+        const overlay = document.createElement('div');
+        overlay.className = 'overlay';
+        overlay.innerHTML = `
+            <div class="dialog port-dialog">
+                <div class="dialog-head">
+                    <h3>Access ${this.escapeHtml(name)}</h3>
+                    <button type="button" class="icon-btn" data-close><i class="fas fa-times"></i></button>
+                </div>
+                <div class="dialog-body">
+                    <p class="dialog-note">
+                        ${this.escapeHtml(name)} is not registered with Systems Manager, so Portus
+                        reaches it through an instance that is — nothing is installed on
+                        ${this.escapeHtml(name)} itself.
+                    </p>
+
+                    <div class="field">
+                        <label class="field-label">Through</label>
+                        <select class="input" id="hopPick">
+                            ${hops.map((hop, index) => `
+                                <option value="${this.escapeHtml(hop.instanceId)}"${index === 0 ? ' selected' : ''}>
+                                    ${this.escapeHtml(hop.instanceName || hop.instanceId)} · ${this.escapeHtml(hop.instanceId)}${hop.sameSubnet ? ' · same subnet' : ''}
+                                </option>`).join('')}
+                        </select>
+                    </div>
+
+                    <div class="field">
+                        <label class="field-label">Connect to</label>
+                        <div class="seg" id="hopMode">
+                            ${isWindows ? '<button type="button" class="on" data-mode="rdp">Remote Desktop</button>' : ''}
+                            <button type="button"${isWindows ? '' : ' class="on"'} data-mode="port">Forward a port</button>
+                        </div>
+                    </div>
+
+                    <div class="field" id="hopPortField"${isWindows ? ' style="display:none;"' : ''}>
+                        <label class="field-label">Port on ${this.escapeHtml(name)}</label>
+                        <input class="input mono" id="hopPort" value="${defaultPort}" spellcheck="false" autocomplete="off">
+                        <p class="dialog-note" id="hopPortHint"></p>
+                    </div>
+                </div>
+                <div class="dialog-foot">
+                    <button type="button" class="btn" data-close>Cancel</button>
+                    <button type="button" class="btn btn-primary" id="hopStart">
+                        <i class="fas fa-right-left"></i> Connect
+                    </button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+
+        const close = () => overlay.remove();
+        overlay.querySelectorAll('[data-close]').forEach(el => el.addEventListener('click', close));
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+        const portField = overlay.querySelector('#hopPortField');
+        const portInput = overlay.querySelector('#hopPort');
+        const hint = overlay.querySelector('#hopPortHint');
+        const start = overlay.querySelector('#hopStart');
+        const mode = () => overlay.querySelector('#hopMode button.on').dataset.mode;
+
+        // A forwarded port is only useful if you know what to point at it, and on
+        // Linux that is nearly always ssh — which Portus deliberately does not run
+        // for you, since it would mean handling your keys.
+        const describePort = () => {
+            const port = portInput.value.trim();
+            hint.textContent = port === '22'
+                ? 'Portus opens the tunnel; connect with your own ssh client once it is up.'
+                : '';
+        };
+
+        overlay.querySelectorAll('#hopMode button').forEach(button => {
+            button.addEventListener('click', () => {
+                overlay.querySelectorAll('#hopMode button').forEach(b => b.classList.remove('on'));
+                button.classList.add('on');
+                portField.style.display = button.dataset.mode === 'port' ? '' : 'none';
+            });
+        });
+
+        portInput.addEventListener('input', describePort);
+        describePort();
+
+        start.addEventListener('click', async () => {
+            const hopId = overlay.querySelector('#hopPick').value;
+            const hop = hops.find(candidate => candidate.instanceId === hopId);
+            if (!hop) { this.toast('Pick an instance to connect through', 'warning'); return; }
+
+            const viaName = hop.instanceName || hop.instanceId;
+
+            start.disabled = true;
+            start.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Connecting…';
+
+            let result;
+            if (mode() === 'rdp') {
+                result = await this.connectRdp(item.instanceId, name, {
+                    via: { instanceId: hop.instanceId, instanceName: viaName, targetHost: item.privateIp }
+                });
+            } else {
+                const port = portInput.value.trim();
+                if (!port) {
+                    this.toast('Enter the port to reach on ' + name, 'warning');
+                    start.disabled = false;
+                    start.innerHTML = '<i class="fas fa-right-left"></i> Connect';
+                    portInput.focus();
+                    return;
+                }
+
+                // The tunnel runs on the hop and the far end is the target's own
+                // address, which is exactly the shape a database forward has.
+                result = await this.startPortForward(hop.instanceId, viaName, {
+                    remoteHost: item.privateIp,
+                    remotePort: port,
+                    localPort: '',
+                    region: this.currentRegion,
+                    target: { instanceId: item.instanceId, instanceName: name }
+                });
+            }
+
+            if (result && result.success) {
+                close();
+            } else {
+                start.disabled = false;
+                start.innerHTML = '<i class="fas fa-right-left"></i> Connect';
+            }
+        });
+    }
+
+    async connectRdp(instanceId, name, options) {
         this.toast(`Establishing RDP tunnel to ${name}…`, 'info');
         try {
-            const result = await window.electronAPI.connectRDPSSM(this.currentProfile, instanceId, name, this.currentRegion);
+            const result = await window.electronAPI.connectRDPSSM(
+                this.currentProfile, instanceId, name, this.currentRegion, options);
             if (result && result.success) {
                 this.toast(result.reused
                     ? `${name} is already tunnelled on port ${result.port}`
@@ -1529,8 +1712,11 @@ class Portus {
             } else {
                 throw new Error(result?.error || 'Failed to establish RDP tunnel');
             }
+            // Returned so a caller that opened a dialog knows whether to close it
+            return result;
         } catch (error) {
             this.toast(`${name}: ${error.error || error.message}`, 'error');
+            return { success: false };
         }
     }
 
@@ -2025,13 +2211,19 @@ class Portus {
                 ? `${tunnel.remoteHost}:${tunnel.remotePort}`
                 : `this instance:${tunnel.remotePort || 3389}`;
 
+            // On a two-hop tunnel the instance column would otherwise name the hop
+            // as though it were the destination, which reads as the wrong machine.
+            const instanceLabel = tunnel.target
+                ? `${tunnel.target.instanceName || tunnel.target.instanceId} via ${tunnel.instanceName || tunnel.instanceId}`
+                : (tunnel.instanceName || tunnel.instanceId);
+
             // kept on the cell so the ticker can redraw it without the tunnel list
             const startedAt = new Date(tunnel.startedAt).getTime();
 
             const row = document.createElement('tr');
             row.innerHTML = `
                 <td><span class="state"><span class="dot ok"></span>${kind}</span></td>
-                <td class="name-cell">${this.escapeHtml(tunnel.instanceName || tunnel.instanceId)}</td>
+                <td class="name-cell">${this.escapeHtml(instanceLabel)}</td>
                 <td class="mono">localhost:${tunnel.port}</td>
                 <td class="mono muted">${this.escapeHtml(target)}</td>
                 <td class="muted num" data-started-at="${startedAt}">${this.uptime(startedAt)}</td>

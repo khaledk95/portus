@@ -73,6 +73,7 @@ for them on startup and tells you what is missing.
 - **One-click SSM shell** — opens `aws ssm start-session` in a new terminal window. On Windows that is PowerShell, for its tab completion; macOS uses Terminal, and Linux the first of gnome-terminal, konsole or xterm it finds
 - **RDP over SSM** — auto port-forward tunnel + launches your RDP client (Windows-only instances)
 - **Port forwarding over SSM** — tunnel any TCP port to `localhost`, either on the instance itself or on a host it can reach (an RDS endpoint, for example), so you can use your own database or web client without a bastion or an inbound rule
+- **Instances with no SSM agent** — a row that cannot take a session of its own offers **Access via…** instead: pick a managed instance in the same VPC and Portus reaches the target through it, for Remote Desktop or any port. Nothing is installed on the target, and no keys are involved — for SSH, Portus opens the tunnel and you point your own `ssh` at the local port
 - **Endpoint discovery** — RDS, Aurora (writer endpoint), ElastiCache and EKS endpoints in the selected region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed
 - **Private EKS clusters** — tunnel to a cluster's API server through an instance in its VPC, and Portus writes a kubeconfig and opens a terminal with `kubectl` pointed at it. Your own `~/.kube/config` is never touched
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
@@ -572,6 +573,7 @@ All builds output to the `dist/` folder (git-ignored).
 │   ├── renderer.test.js   # The UI, driven through the real markup
 │   ├── ssm-inventory.test.js  # Paging the SSM inventory as deep as the instance list
 │   ├── linux-terminal.test.js  # Which terminal Linux opens, and that it is asked once
+│   ├── hop-access.test.js  # Reaching an unmanaged instance through a managed one
 │   ├── window.test.js     # The application menu, the renderer sandbox, navigation guards
 │   └── run.js           # Runs every suite, one process each
 ├── .github/workflows/
@@ -625,7 +627,9 @@ ie4uinit.exe -show
 | SSM session window opens then closes / errors | AWS CLI v2 and/or **Session Manager plugin** not installed, or instance has no SSM agent/IAM role |
 | `AWS CLI not found` | Install AWS CLI v2 and ensure it's on your `PATH` |
 | RDP button missing on an instance | RDP only appears for **running Windows** instances |
-| Connect buttons show *No SSM* and are disabled | The instance is not registered with Systems Manager — check the SSM agent is running and the instance IAM role includes `AmazonSSMManagedInstanceCore`. Hover the button for the exact reason |
+| Connect buttons show *No SSM* and are disabled | The instance is not registered with Systems Manager — check the SSM agent is running and the instance IAM role includes `AmazonSSMManagedInstanceCore`. Hover the button for the exact reason. If a managed instance is running in the same VPC, the row offers **Access via…** instead |
+| *Access via…* is missing on an unmanaged instance | Nothing managed is running in its VPC, or it has no private IP. A hop in another VPC is not offered, because without peering it cannot reach the address |
+| Tunnel through a hop times out | The hop's security group must be allowed *out* to the target, and the target's security group must allow the port *in from the hop* — not from your own address, since the traffic arrives from the hop |
 | SSM Agent column shows *Unknown* | Your credentials lack `ssm:DescribeInstanceInformation`. Harmless — the buttons stay enabled |
 | `Local port ... is already in use` | Something else holds that port. Leave **Local port** blank to have one picked automatically |
 | Port forward to an RDS endpoint fails | Use **A host reachable from it** (not *This instance*), and check the instance's security group is allowed to reach the database |

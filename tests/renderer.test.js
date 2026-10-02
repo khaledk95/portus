@@ -669,6 +669,131 @@ const openPortDialog = async (app, remote = true) => {
       connectSrc.trim() === "'self'", connectSrc.trim());
   }
 
+  // ---------------------------------------------------------------------------
+  suite.section('an instance with no SSM agent can still be reached through one');
+  // Its row used to be a dead "No SSM" button. If something managed is running
+  // in the same VPC, there is a route — so the row offers it.
+
+  {
+    const app = await boot({
+      instances: [
+        instance({ instanceName: 'bastion-01', instanceId: 'i-0hop00000000001', subnetId: 'subnet-b' }),
+        instance({ instanceName: 'same-subnet-hop', instanceId: 'i-0hop00000000002', subnetId: 'subnet-a' }),
+        instance({ instanceName: 'other-vpc-hop', instanceId: 'i-0hop00000000003',
+          vpcId: 'vpc-999', subnetId: 'subnet-z' }),
+        instance({ instanceName: 'legacy-win', instanceId: 'i-0target00000001',
+          platform: 'Windows', privateIp: '10.0.2.57', subnetId: 'subnet-a',
+          ssmStatus: 'unmanaged', ssmAgentVersion: null, ssmPlatformName: null })
+      ]
+    });
+    await pick(app, 'keys');
+
+    const rowFor = (id) => [...app.document.querySelectorAll('tbody tr')]
+      .find(tr => tr.textContent.includes(id));
+
+    const targetRow = rowFor('i-0target00000001');
+    const viaButton = targetRow.querySelector('button[data-action="via"]');
+
+    suite.check('the unmanaged row offers a way in',
+      !!viaButton, targetRow.querySelector('.row-actions').textContent.trim());
+    suite.check('and the SSM column still reports the truth',
+      /not managed/i.test(targetRow.textContent), targetRow.textContent.replace(/\s+/g, ' ').slice(0, 120));
+
+    // Ranking, read straight off the dialog so it is the order a user sees
+    viaButton.click();
+    await settle(app.window, 60);
+
+    const options = [...app.document.querySelectorAll('#hopPick option')];
+    const labels = options.map(option => option.textContent.replace(/\s+/g, ' ').trim());
+
+    suite.check('a hop in another VPC is not offered, since it cannot reach the address',
+      !labels.some(label => /other-vpc-hop/.test(label)), labels);
+    suite.check('the same-subnet hop is preselected',
+      /same-subnet-hop/.test(labels[0]) && options[0].selected, labels);
+    suite.check('and it is marked as such',
+      /same subnet/.test(labels[0]), labels[0]);
+    suite.check('the rest of the VPC is still available',
+      labels.some(label => /bastion-01/.test(label)), labels);
+
+    // Windows, so Remote Desktop leads and the port field is out of the way
+    suite.check('Remote Desktop is the default for a Windows target',
+      app.document.querySelector('#hopMode button.on').dataset.mode === 'rdp',
+      app.document.querySelector('#hopMode button.on').textContent.trim());
+
+    app.document.querySelector('#hopStart').click();
+    await settle(app.window, 80);
+
+    const call = app.calls.rdp[app.calls.rdp.length - 1];
+
+    suite.check('connecting asks for the target, carrying the hop with it',
+      call && call.instanceId === 'i-0target00000001'
+        && call.options.via.instanceId === 'i-0hop00000000002'
+        && call.options.via.targetHost === '10.0.2.57',
+      call);
+
+  }
+
+  {
+    // A Linux target has no RDP client to launch, so the only offer is a port
+    // forward — and ssh stays the user's to run, since Portus holds no keys.
+    const app = await boot({
+      instances: [
+        instance({ instanceName: 'bastion-01', instanceId: 'i-0hop00000000001' }),
+        instance({ instanceName: 'legacy-linux', instanceId: 'i-0target00000002',
+          privateIp: '10.0.2.58', ssmStatus: 'unmanaged' })
+      ]
+    });
+    await pick(app, 'keys');
+
+    [...app.document.querySelectorAll('tbody tr')]
+      .find(tr => tr.textContent.includes('i-0target00000002'))
+      .querySelector('button[data-action="via"]')
+      .click();
+    await settle(app.window, 60);
+
+    suite.check('no Remote Desktop option for a Linux target',
+      !app.document.querySelector('#hopMode button[data-mode="rdp"]'),
+      app.document.querySelector('#hopMode').textContent.trim());
+    suite.check('a port forward is selected, defaulting to ssh',
+      app.document.querySelector('#hopMode button.on').dataset.mode === 'port'
+        && app.document.querySelector('#hopPort').value === '22');
+    suite.check('and the dialog says Portus will not run ssh for you',
+      /your own ssh/i.test(app.document.querySelector('#hopPortHint').textContent),
+      app.document.querySelector('#hopPortHint').textContent);
+
+    app.document.querySelector('#hopStart').click();
+    await settle(app.window, 80);
+
+    const call = app.calls.forwardTargets[app.calls.forwardTargets.length - 1];
+
+    suite.check('the forward runs on the hop, with the target as the far end',
+      call && call.instanceId === 'i-0hop00000000001'
+        && call.options.remoteHost === '10.0.2.58'
+        && String(call.options.remotePort) === '22'
+        && call.options.target.instanceId === 'i-0target00000002',
+      call);
+
+  }
+
+  {
+    // Nothing managed in the VPC means there is genuinely no route, and saying
+    // so is better than a dialog with an empty dropdown.
+    const app = await boot({
+      instances: [
+        instance({ instanceName: 'legacy-linux', instanceId: 'i-0target00000003',
+          privateIp: '10.0.2.59', ssmStatus: 'unmanaged' })
+      ]
+    });
+    await pick(app, 'keys');
+
+    const row = app.document.querySelector('tbody tr');
+    suite.check('with no hop available the row stays disabled',
+      !row.querySelector('button[data-action="via"]')
+        && row.querySelector('.row-actions button').disabled === true,
+      row.querySelector('.row-actions').textContent.trim());
+
+  }
+
   suite.done();
 })().catch(error => {
   console.error('\n  the suite threw:', error && error.stack);

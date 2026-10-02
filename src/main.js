@@ -595,6 +595,9 @@ function listTunnels() {
     remoteHost: tunnel.remoteHost || null,
     remotePort: tunnel.remotePort || null,
     startedAt: tunnel.startedAt,
+    // Set when this tunnel reaches an instance that is not SSM-managed itself,
+    // through the one named above
+    target: tunnel.target || null,
     // Present only on a tunnel to a cluster; it is what puts a kubectl action on
     // the row rather than just an address to copy.
     kubernetes: tunnel.kubernetes || null
@@ -1108,7 +1111,12 @@ function scheduleScriptRemoval(scriptPath, delayMs = 5000) {
 
 // Shared tunnel launcher for port forwarding. Resolves once the CLI reports the
 // listener is up, or with an error; never rejects, so the message survives IPC.
-function startSsmTunnel({ ssmCommand, kind, instanceId, instanceName, profileName, localPort, remoteHost, remotePort, credentialEnv }) {
+// `instanceId` is always the SSM-managed instance the session actually runs on.
+// When that instance is only carrying traffic for something else, `target` names
+// what is on the far end — an EC2 instance with no SSM agent of its own, reached
+// through this one. The UI reads it to show "target via hop" rather than naming
+// the hop as though it were the destination.
+function startSsmTunnel({ ssmCommand, kind, instanceId, instanceName, profileName, localPort, remoteHost, remotePort, credentialEnv, target }) {
   return new Promise(resolve => {
     const platform = process.platform;
     let established = false;
@@ -1146,6 +1154,7 @@ function startSsmTunnel({ ssmCommand, kind, instanceId, instanceName, profileNam
         port: localPort,
         remoteHost: remoteHost || null,
         remotePort,
+        target: target || null,
         ssmProcess: proc,
         rdpProcess: null,
         startedAt: Date.now()
@@ -2045,9 +2054,12 @@ function setupIpcHandlers() {
 
   // Generic port forwarding over SSM. With a remote host this tunnels *through*
   // the instance to something else in the VPC (an RDS endpoint, for example),
-  // which is otherwise unreachable because RDS cannot run an SSM agent.
+  // which is otherwise unreachable because RDS cannot run an SSM agent. An EC2
+  // instance with no agent installed is the same problem with a different cause,
+  // so `options.target` lets the caller say that the far end is a known instance
+  // — it changes nothing about the tunnel, only how the row describes itself.
   ipcMain.handle('start-port-forward', async (event, profileName, instanceId, instanceName, options) => {
-    const { remoteHost, remotePort, localPort, region: requestedRegion, kubernetes } = options || {};
+    const { remoteHost, remotePort, localPort, region: requestedRegion, kubernetes, target } = options || {};
     const clusterName = kubernetes && kubernetes.clusterName ? String(kubernetes.clusterName) : null;
 
     const profileCheck = validateProfileName(profileName);
@@ -2055,6 +2067,24 @@ function setupIpcHandlers() {
 
     const idCheck = validateInstanceId(instanceId);
     if (!idCheck.valid) return { success: false, error: idCheck.error };
+
+    // Descriptive only, but it is renderer input that ends up on screen, so the
+    // id is held to the same shape as any other.
+    let targetInstance = null;
+    if (target && target.instanceId) {
+      const targetIdCheck = validateInstanceId(target.instanceId);
+      if (!targetIdCheck.valid) {
+        return { success: false, error: 'That does not look like an EC2 instance ID for the target.' };
+      }
+      if (target.instanceId === instanceId) {
+        return { success: false, error: 'The hop and the target are the same instance.' };
+      }
+      targetInstance = {
+        instanceId: target.instanceId,
+        instanceName: String(target.instanceName || target.instanceId).slice(0, 128),
+        host: remoteHost || null
+      };
+    }
 
     const targetPort = parseInt(remotePort, 10);
     if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
@@ -2135,7 +2165,8 @@ function setupIpcHandlers() {
       profileName,
       localPort: resolvedLocalPort,
       remoteHost: targetHost,
-      remotePort: targetPort
+      remotePort: targetPort,
+      target: targetInstance
     });
 
     if (!result.success) return result;
@@ -2444,6 +2475,9 @@ function setupIpcHandlers() {
           platform: instance.Platform || 'Linux',
           availabilityZone: instance.Placement ? instance.Placement.AvailabilityZone : null,
           vpcId: instance.VpcId || null,
+          // Used to rank hop candidates for an unmanaged instance: same subnet
+          // beats same VPC, because a subnet-local hop needs no route between them
+          subnetId: instance.SubnetId || null,
           // Surfaced in the detail panel; Name is shown separately as the row title
           tags: (instance.Tags || [])
             .filter(tag => tag.Key !== 'Name')
@@ -2887,18 +2921,50 @@ function setupIpcHandlers() {
   // RDP over SSM - port-forward tunnel + launch RDP client.
   // The tunnel is registered so it can be listed in the UI and terminated on exit.
   // RDP over SSM: a 3389 port forward plus the platform's RDP client.
-  ipcMain.handle('connect-rdp-ssm', async (event, profileName, instanceId, instanceName, requestedRegion) => {
+  // `options.via` turns this into a two-hop connection: the session runs on an
+  // SSM-managed instance, which forwards 3389 to a Windows box that has no agent
+  // of its own. Nothing about the transport is new — it is the same
+  // StartPortForwardingSessionToRemoteHost a database tunnel uses, pointed at an
+  // instance's private address instead of an endpoint's.
+  ipcMain.handle('connect-rdp-ssm', async (event, profileName, instanceId, instanceName, requestedRegion, options = {}) => {
     const profileCheck = validateProfileName(profileName);
     if (!profileCheck.valid) return { success: false, error: profileCheck.error };
 
     const idCheck = validateInstanceId(instanceId);
     if (!idCheck.valid) return { success: false, error: idCheck.error };
+
+    // Both ends are validated: the hop lands on a command line as --target, and
+    // the private address lands inside --parameters.
+    const via = options && options.via ? options.via : null;
+
+    if (via) {
+      const hopCheck = validateInstanceId(via.instanceId);
+      if (!hopCheck.valid) {
+        return { success: false, error: 'That does not look like an EC2 instance ID for the hop.' };
+      }
+      if (via.instanceId === instanceId) {
+        return { success: false, error: 'The hop and the target are the same instance.' };
+      }
+
+      const hostCheck = validateRemoteHost(via.targetHost);
+      if (!hostCheck.valid) return { success: false, error: hostCheck.error };
+      if (!via.targetHost) {
+        return { success: false, error: 'That instance has no private IP address to connect to.' };
+      }
+    }
+
+    // The instance the SSM session runs on, which is the hop when there is one
+    const sessionInstanceId = via ? via.instanceId : instanceId;
+
     // Only an existing *RDP* tunnel can be reused. Without the kind check a port
     // forward on the same instance would be mistaken for an open RDP session.
+    // Reuse is keyed on the machine the user asked for, not the one carrying the
+    // traffic, so a second request for the same target reuses it whichever hop
+    // was chosen last time.
     const existing = Array.from(activeTunnels.values()).find(tunnel =>
       tunnel.kind === 'rdp' &&
-      tunnel.instanceId === instanceId &&
-      tunnel.profileName === profileName
+      tunnel.profileName === profileName &&
+      (tunnel.target ? tunnel.target.instanceId : tunnel.instanceId) === instanceId
     );
 
     if (existing) {
@@ -2926,18 +2992,22 @@ function setupIpcHandlers() {
 
     const profileFlag = credentialEnv ? '' : ` --profile "${profileName}"`;
     const region = await regionFor(profileName, requestedRegion);
-    const ssmCommand = `aws ssm start-session --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=3389,localPortNumber=${localPort}"${profileFlag} --region ${region}`;
+
+    const ssmCommand = via
+      ? `aws ssm start-session --target ${via.instanceId} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters "host=${via.targetHost},portNumber=3389,localPortNumber=${localPort}"${profileFlag} --region ${region}`
+      : `aws ssm start-session --target ${instanceId} --document-name AWS-StartPortForwardingSession --parameters "portNumber=3389,localPortNumber=${localPort}"${profileFlag} --region ${region}`;
 
     const result = await startSsmTunnel({
       ssmCommand,
       credentialEnv,
       kind: 'rdp',
-      instanceId,
-      instanceName,
+      instanceId: sessionInstanceId,
+      instanceName: via ? (via.instanceName || via.instanceId) : instanceName,
       profileName,
       localPort,
-      remoteHost: '',
-      remotePort: 3389
+      remoteHost: via ? via.targetHost : '',
+      remotePort: 3389,
+      target: via ? { instanceId, instanceName: instanceName || instanceId, host: via.targetHost } : null
     });
 
     if (!result.success) return result;
@@ -2954,7 +3024,9 @@ function setupIpcHandlers() {
     return {
       success: true,
       port: localPort,
-      message: `RDP tunnel established for ${instanceName} on port ${localPort}.`
+      message: via
+        ? `RDP tunnel established for ${instanceName} through ${via.instanceName || via.instanceId} on port ${localPort}.`
+        : `RDP tunnel established for ${instanceName} on port ${localPort}.`
     };
   });
 }

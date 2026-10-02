@@ -43,6 +43,8 @@ function instance(overrides = {}) {
     platform: 'Linux',
     availabilityZone: 'eu-central-1a',
     vpcId: 'vpc-123',
+    // Hop ranking reads both: same subnet is preferred over same VPC
+    subnetId: 'subnet-a',
     tags: [],
     ssmStatus: 'online',
     ssmLastPing: null,
@@ -66,6 +68,9 @@ async function bootRenderer(options = {}) {
   const calls = {
     signIns: [],
     forwards: [],
+    // The same forwards, with the instance they ran on — `forwards` holds only
+    // the options, which cannot say which end was the hop.
+    forwardTargets: [],
     opened: [],
     mfaAnswers: [],
     roleAnswers: [],
@@ -155,9 +160,15 @@ async function bootRenderer(options = {}) {
     },
 
     connectSSM: async (p, id, region) => { calls.ssm.push({ id, region }); return { success: true }; },
-    connectRDPSSM: async (p, id, name, region) => { calls.rdp.push({ id, region }); return { success: true }; },
+    // instanceId and options are both recorded: on a two-hop connection they are
+    // what says which machine was asked for and which one is carrying it.
+    connectRDPSSM: async (p, id, name, region, options) => {
+      calls.rdp.push({ id, instanceId: id, name, region, options: options || null });
+      return { success: true, port: 50002 };
+    },
     startPortForward: async (p, id, name, opts) => {
       calls.forwards.push(opts);
+      calls.forwardTargets.push({ instanceId: id, name, options: opts });
       return { success: true, port: 50001, tunnelId: 't1' };
     },
 

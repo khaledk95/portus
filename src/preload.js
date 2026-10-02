@@ -87,7 +87,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   connectSSM: (profileName, instanceId, region) =>
     ipcRenderer.invoke('connect-ssm', profileName, instanceId, region),
 
-  // RDP over SSM Connect
-  connectRDPSSM: (profileName, instanceId, instanceName, region) =>
-    ipcRenderer.invoke('connect-rdp-ssm', profileName, instanceId, instanceName, region),
+  // RDP over SSM Connect. `options.via` reaches a Windows box that has no SSM
+  // agent, through one that does.
+  connectRDPSSM: (profileName, instanceId, instanceName, region, options) =>
+    ipcRenderer.invoke('connect-rdp-ssm', profileName, instanceId, instanceName, region, options),
 });
