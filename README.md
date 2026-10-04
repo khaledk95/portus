@@ -102,22 +102,30 @@ sign-in covers.
 ![The Sign in dialog listing an Azure AD and an Identity Center login](screenshots/02-sign-in.png)
 
 **3. Instances** — the fleet for the selected profile and region, with SSM
-readiness per instance. Connect buttons only appear where Systems Manager can
-actually reach the instance. Selecting a row opens its details, and the name,
+readiness per instance. A row Systems Manager cannot reach offers **Access via…**
+instead of the usual buttons. Selecting a row opens its details, and the name,
 instance ID and private IP can be copied from the row itself.
 
 ![The instance list showing state, SSM status and connect actions](screenshots/03-instances.png)
 
 **4. Forward a port** — tunnel to the instance itself or to a host it can reach.
-Managed database and cache endpoints in the region are offered directly, with the
-real port filled in.
+Managed database, cache and EKS endpoints in the region are offered directly, with
+the real port filled in.
 
 ![The Forward a port dialog with service presets and endpoint discovery](screenshots/04-ports.png)
 
-**5. Tunnels** — everything open, with its local address and live uptime. Copy the
-address or disconnect from here; they are all closed when Portus exits.
+**5. Tunnels** — everything open, with its local address and live uptime. A tunnel
+to a cluster gets a **kubectl** button; one that reached its target through
+another instance says so. Copy the address or disconnect from here; they are all
+closed when Portus exits.
 
-![The Tunnels view listing an open port forward and an RDP tunnel](screenshots/05-tunnels.png)
+![The Tunnels view listing a database forward, an EKS cluster and an RDP tunnel through a hop](screenshots/05-tunnels.png)
+
+**6. Access via…** — an instance with no SSM agent of its own, reached through one
+that has. The hop is preselected from the same subnet and can be changed; nothing
+is installed on the target.
+
+![The Access via dialog with a hop preselected and Remote Desktop chosen](screenshots/06-access-via.png)
 
 ---
 
