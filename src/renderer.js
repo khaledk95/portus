@@ -1759,6 +1759,24 @@ class Portus {
                         </div>
                     </div>
 
+                    <div class="field" id="pfClusterField" style="display:none;">
+                        <label class="field-label">Cluster account</label>
+                        <div class="cluster-source">
+                            <select class="input" id="pfClusterProfile">
+                                ${(this.profiles || []).map(p => `
+                                    <option value="${this.escapeHtml(p.name)}"${p.name === this.currentProfile ? ' selected' : ''}>${this.escapeHtml(p.name)}</option>`).join('')}
+                            </select>
+                            <input class="input mono" id="pfClusterRegion" spellcheck="false" autocomplete="off"
+                                   value="${this.escapeHtml(this.currentRegion || '')}"
+                                   placeholder="the profile's own region">
+                        </div>
+                        <p class="dialog-note">
+                            The cluster can live in a different account from the instance reaching it.
+                            The tunnel stays on this instance; the kubeconfig and
+                            <span class="mono">eks get-token</span> use the account chosen here.
+                        </p>
+                    </div>
+
                     <div class="field" id="pfHostField" style="display:none;">
                         <label class="field-label">Remote host</label>
                         <div class="host-combo" id="pfHostCombo">
@@ -1830,6 +1848,11 @@ class Portus {
         // Set when a discovered EKS cluster is picked, cleared the moment the host
         // is edited by hand: a typed host is not the cluster we described.
         let chosenKubernetes = null;
+
+        // Set only when the cluster is in a different account or region from the
+        // instance opening the tunnel; null means this one, and the single
+        // account case behaves exactly as before.
+        let clusterSource = null;
         let endpoints = [];
         let matches = [];
         let activeIndex = -1;
@@ -1860,7 +1883,7 @@ class Portus {
         const ensureEndpoints = async () => {
             if (loadState === 'loading' || loadState === 'ready') return;
 
-            const cached = this.endpointCache.get(this.endpointCacheKey());
+            const cached = clusterSource ? null : this.endpointCache.get(this.endpointCacheKey());
             if (cached) {
                 endpoints = cached;
                 loadState = 'ready';
@@ -1871,12 +1894,22 @@ class Portus {
             loadState = 'loading';
             renderList();
 
-            const result = await this.loadEndpoints();
+            // A cluster in another account is listed with that account's
+            // credentials. Everything else — including a cluster in this one —
+            // goes through normal endpoint discovery.
+            const result = clusterSource
+                ? await this.loadClusters(clusterSource.profileName, clusterSource.region)
+                : await this.loadEndpoints();
             if (!overlay.isConnected) return;   // dialog closed while in flight
 
             if (result.success) {
                 endpoints = result.data;
                 loadState = 'ready';
+
+                // Pin the region the listing actually used, so the kubeconfig is
+                // written against the same one the cluster was found in rather
+                // than resolving it a second time and possibly differently.
+                if (clusterSource && result.region) clusterSource.region = result.region;
             } else {
                 loadError = result.error || 'Could not list endpoints';
                 loadState = 'error';
@@ -1909,7 +1942,9 @@ class Portus {
             });
 
             if (!endpoints.length) {
-                list.innerHTML = '<div class="combo-empty">No databases or caches found in this region</div>';
+                list.innerHTML = clusterSource
+                    ? `<div class="combo-empty">No clusters found in ${this.escapeHtml(clusterSource.profileName)}</div>`
+                    : '<div class="combo-empty">No databases or caches found in this region</div>';
                 foot.textContent = 'Type the host manually';
                 return;
             }
@@ -1960,7 +1995,13 @@ class Portus {
 
         const selectEndpoint = (endpoint) => {
             host.value = endpoint.host;
-            chosenKubernetes = endpoint.kubernetes || null;
+
+            // The cluster carries the account it was listed from, so the
+            // kubeconfig is written and tokened against that one rather than
+            // against whichever profile happens to own the instance.
+            chosenKubernetes = endpoint.kubernetes
+                ? { ...endpoint.kubernetes, ...(clusterSource || {}) }
+                : null;
 
             // The port the API reported wins over the service preset — a database
             // on a non-standard port is otherwise silently wrong.
@@ -2042,6 +2083,42 @@ class Portus {
             }
         });
 
+        // The cluster account row only means anything for Kubernetes, and only
+        // changes behaviour when it names something other than this account.
+        const clusterField = overlay.querySelector('#pfClusterField');
+        const clusterProfile = overlay.querySelector('#pfClusterProfile');
+        const clusterRegion = overlay.querySelector('#pfClusterRegion');
+
+        const syncClusterSource = () => {
+            const name = clusterProfile.value;
+            const regionValue = clusterRegion.value.trim();
+            const isOtherAccount = name !== this.currentProfile
+                || (regionValue && regionValue !== this.currentRegion);
+
+            clusterSource = isOtherAccount
+                ? { profileName: name, region: regionValue || null }
+                : null;
+
+            // The list came from somewhere else, so it has to be fetched again
+            endpoints = [];
+            chosenKubernetes = null;
+            loadState = 'idle';
+            ensureEndpoints();
+        };
+
+        clusterProfile.addEventListener('change', () => {
+            // The region box starts on this instance's region, which is the
+            // wrong default the moment the account changes — a cluster in
+            // eu-west-1 would be looked for in eu-central-1 and simply not
+            // found. Blank means "that profile's own region", which is the
+            // right guess, and it stays editable.
+            clusterRegion.value = clusterProfile.value === this.currentProfile
+                ? (this.currentRegion || '')
+                : '';
+            syncClusterSource();
+        });
+        clusterRegion.addEventListener('change', syncClusterSource);
+
         overlay.querySelectorAll('.chip').forEach(chip => {
             chip.addEventListener('click', () => {
                 const wasOn = chip.classList.contains('on');
@@ -2050,6 +2127,19 @@ class Portus {
                     chip.classList.add('on');
                     remote.value = chip.dataset.port;
                 }
+
+                const kubernetesChosen = !wasOn && chip.dataset.service === 'kubernetes';
+                clusterField.style.display = kubernetesChosen ? 'block' : 'none';
+
+                // Leaving Kubernetes returns the list to this account, rather
+                // than quietly filtering another account's clusters by service
+                if (!kubernetesChosen && clusterSource) {
+                    clusterProfile.value = this.currentProfile;
+                    clusterRegion.value = this.currentRegion || '';
+                    syncClusterSource();
+                    return;
+                }
+
                 renderList();   // the chip is also the endpoint filter
             });
         });
@@ -2088,6 +2178,31 @@ class Portus {
     // Managed database and cache endpoints in the profile's region. Failure is
     // returned rather than thrown: the dialog degrades to a plain text field,
     // which is exactly how it worked before this existed.
+    // Clusters belonging to another account, listed with that account's own
+    // credentials. Not cached: it is asked for only when someone opens the
+    // picker and changes the account, and a stale list there is worse than a
+    // second call.
+    async loadClusters(profileName, region) {
+        if (!profileName) return { success: false, error: 'No profile selected for the cluster' };
+
+        this.setBusy(true);
+        try {
+            const result = await window.electronAPI.listClusters(profileName, region || undefined);
+
+            if (result && result.success) {
+                if (result.warnings && result.warnings.length) {
+                    this.toast(`Some clusters could not be listed: ${result.warnings.join('; ')}`, 'warning');
+                }
+                return { success: true, data: result.data || [], region: result.region || null };
+            }
+            return { success: false, error: result?.error || `Could not list clusters in ${profileName}` };
+        } catch (error) {
+            return { success: false, error: error.message || 'Could not list clusters' };
+        } finally {
+            this.setBusy(false);
+        }
+    }
+
     async loadEndpoints() {
         if (!this.currentProfile) return { success: false, error: 'No profile selected' };
 

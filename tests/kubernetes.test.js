@@ -20,10 +20,26 @@ region = eu-west-1
 
 [profile keys-only]
 region = eu-west-1
+
+# The cluster's own account. An instance reached through keys-only can talk to
+# a cluster here, but keys-only cannot describe it.
+[profile other-account]
+region = eu-west-1
+
+# A cluster account whose credentials Portus has to resolve itself. That is what
+# makes the terminal's environment observable: a profile the CLI can read off
+# disk produces no environment at all, so there is nothing to tell apart.
+[profile mfa-account]
+region = eu-west-1
+mfa_serial = arn:aws:iam::222222222222:mfa/alice
 `;
 
 const CREDENTIALS = `
 [keys-only]
+aws_access_key_id = AKIAIOSFODNN7EXAMPLE
+aws_secret_access_key = secret
+
+[other-account]
 aws_access_key_id = AKIAIOSFODNN7EXAMPLE
 aws_secret_access_key = secret
 `;
@@ -34,10 +50,28 @@ const CA = 'LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUMrRkFLRQotLS0tLUVORA==';
 // mid-listing must not empty the dialog for the others.
 let describeFailsFor = null;
 
+// Which credentials and region each EKS call was made with. A cluster in
+// another account is described with that account's profile, and asserting it
+// needs the client's own configuration, not just its answer.
+const eksCalls = [];
+
 const eksStub = {
   EKSClient: class {
+    constructor(config) { this.config = config || {}; }
+
     async send(command) {
       const input = command.input || {};
+
+      const credentials = typeof this.config.credentials === 'function'
+        ? await this.config.credentials()
+        : this.config.credentials;
+
+      eksCalls.push({
+        operation: command.constructor.name,
+        name: input.name || null,
+        region: this.config.region,
+        profile: (credentials || {}).__profile || null
+      });
 
       if (command.constructor.name === 'ListClustersCommand') {
         return { clusters: ['platform-prod', 'platform-sandbox'] };
@@ -74,6 +108,17 @@ const { handlers, state, ready } = loadMain({
     : { stdout: 'Port forwarding started', keepOpen: true }),
   modules: {
     '@aws-sdk/client-eks': eksStub,
+    // Tags the resolved credentials with the profile they came from, which is
+    // the only way to tell which account an EKS call was made as.
+    '@aws-sdk/credential-providers': {
+      // The key carries the profile, so an environment can be attributed to
+      // the account it came from.
+      fromIni: (options = {}) => async () => ({
+        accessKeyId: `AKIA-${options.profile || 'none'}`,
+        secretAccessKey: 'secret',
+        __profile: options.profile || null
+      })
+    },
     './azure-saml': {
       requestAssertion: async () => ({
         samlResponse: 'PHNhbWw+',
@@ -298,6 +343,107 @@ const { handlers, state, ready } = loadMain({
   (state.appEvents['will-quit'] || []).forEach(handler => handler());
   suite.check('a second shutdown is a no-op',
     !state.removed.includes(generated), state.removed);
+
+  // -------------------------------------------------------------------------
+  suite.section('a cluster in another account than the instance reaching it');
+  // The instance is reached with one profile; the cluster is described, and
+  // later tokened, with the profile that owns it. Getting this wrong is quiet:
+  // the tunnel comes up either way and only the kubectl call fails, with an
+  // error that points at the cluster rather than at the account.
+
+  closeAll();
+  state.written.length = 0;
+  eksCalls.length = 0;
+
+  const crossAccount = await forward({}, 'keys-only', 'i-0abc', 'bastion', {
+    remoteHost: 'ABCD1234P.gr7.eu-west-1.eks.amazonaws.com',
+    remotePort: '443',
+    localPort: '',
+    region: 'eu-central-1',   // the tunnel's region, deliberately not the cluster's
+    kubernetes: {
+      clusterName: 'platform-prod',
+      profileName: 'other-account',
+      region: 'eu-west-1'
+    }
+  });
+
+  suite.check('the tunnel starts', crossAccount.success === true, crossAccount.error);
+
+  const describe = eksCalls.filter(call => call.operation === 'DescribeClusterCommand').pop();
+  suite.check('the cluster is described with its own account, not the tunnel\'s',
+    describe && describe.profile === 'other-account', describe);
+  suite.check('and in its own region, not the one the tunnel runs in',
+    describe && describe.region === 'eu-west-1', describe);
+
+  const crossTunnel = listTunnels()[0];
+  suite.check('the tunnel still belongs to the instance\'s profile',
+    crossTunnel.profileName === 'keys-only', crossTunnel.profileName);
+  suite.check('while the cluster records the account that owns it',
+    crossTunnel.kubernetes && crossTunnel.kubernetes.profileName === 'other-account',
+    crossTunnel.kubernetes);
+
+  const crossYaml = lastWritten().contents;
+  suite.check('get-token is pointed at the cluster account',
+    crossYaml.includes('value: "other-account"'), (crossYaml.match(/value: ".*"/g) || []));
+  suite.check('and at the cluster\'s region',
+    /- --region\s+\n?\s*- "eu-west-1"/.test(crossYaml) || crossYaml.includes('"eu-west-1"'),
+    (crossYaml.match(/eu-\w+-\d/g) || []));
+  suite.check('certificate verification is unchanged by any of this',
+    crossYaml.includes(`certificate-authority-data: "${CA}"`)
+      && !/insecure-skip-tls-verify/.test(crossYaml));
+
+  // The terminal has to sign as the cluster's account too — the instance
+  // carrying the packets has nothing to do with who the cluster trusts. This
+  // one needs a cluster account whose credentials Portus resolves itself:
+  // a profile the CLI can read off disk puts nothing in the environment, so
+  // there would be nothing to tell the two accounts apart by.
+  closeAll();
+  state.written.length = 0;
+  state.spawns.length = 0;
+
+  const heldByPortus = await forward({}, 'keys-only', 'i-0abc', 'bastion', {
+    remoteHost: 'ABCD1234P.gr7.eu-west-1.eks.amazonaws.com',
+    remotePort: '443', localPort: '', region: 'eu-central-1',
+    kubernetes: { clusterName: 'platform-prod', profileName: 'mfa-account', region: 'eu-west-1' }
+  });
+  suite.check('a tunnel to a cluster account Portus holds credentials for starts',
+    heldByPortus.success === true, heldByPortus.error);
+
+  const heldTunnel = listTunnels()[0];
+  state.spawns.length = 0;
+  const crossTerminal = await kubectl({}, heldTunnel.id);
+
+  suite.check('the kubectl terminal opens', crossTerminal.success === true, crossTerminal.error);
+  suite.check('and it names the cluster, not the hop',
+    /platform-prod/.test(crossTerminal.message), crossTerminal.message);
+
+  const terminalEnv = (state.spawns[state.spawns.length - 1] || {}).options || {};
+  const keyUsed = (terminalEnv.env || {}).AWS_ACCESS_KEY_ID;
+
+  suite.check('it signs as the cluster account, not the instance\'s',
+    keyUsed === 'AKIA-mfa-account', keyUsed);
+  suite.check('and the kubeconfig it points at is the one just written',
+    (terminalEnv.env || {}).KUBECONFIG === heldTunnel.kubernetes.kubeconfig,
+    (terminalEnv.env || {}).KUBECONFIG);
+
+  // -------------------------------------------------------------------------
+  suite.section('the cluster account is validated like every other input');
+
+  for (const [label, kubernetes] of [
+    ['a hostile profile name', { clusterName: 'platform-prod', profileName: 'x"; calc.exe; "' }],
+    ['a hostile region', { clusterName: 'platform-prod', profileName: 'other-account', region: 'eu-west-1; calc' }],
+    ['a region that is not one', { clusterName: 'platform-prod', profileName: 'other-account', region: '$(whoami)' }]
+  ]) {
+    closeAll();
+    const rejected = await forward({}, 'keys-only', 'i-0abc', 'bastion', {
+      remoteHost: 'ABCD1234P.gr7.eu-west-1.eks.amazonaws.com',
+      remotePort: '443', localPort: '', region: 'eu-west-1', kubernetes
+    });
+
+    suite.check(`rejected: ${label}`, rejected.success === false, rejected);
+  }
+
+  closeAll();
 
   suite.done();
 })();

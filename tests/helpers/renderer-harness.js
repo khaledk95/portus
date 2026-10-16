@@ -82,6 +82,9 @@ async function bootRenderer(options = {}) {
     rdp: [],
     closedTunnels: [],
     regionLookups: [],
+    // Every cross-account cluster listing, so a test can assert which account
+    // was asked and in which region
+    clusterLookups: [],
     // every region a request was made against, so a test can assert what the
     // main process would have received
     instanceRegions: [],
@@ -93,6 +96,8 @@ async function bootRenderer(options = {}) {
     loginTargets: options.loginTargets || [],
     instances: options.instances || [],
     endpoints: options.endpoints || [],
+    clusters: options.clusters || [],
+    clustersResult: null,         // set to force a failure
     tunnels: options.tunnels || [],
     regions: options.regions || [
       { name: 'eu-central-1', label: 'Frankfurt' },
@@ -157,6 +162,19 @@ async function bootRenderer(options = {}) {
       calls.endpointRegions.push(region);
       return state.endpointsResult
         || ({ success: true, data: state.endpoints, region, warnings: [] });
+    },
+
+    // Clusters in another account. Separate from getEndpoints on purpose: a
+    // test that returns clusters here and nothing there is the cross-account
+    // case, where the tunnel's own credentials cannot see the cluster at all.
+    listClusters: async (profileName, region) => {
+      calls.clusterLookups.push({ profileName, region: region || null });
+      return state.clustersResult || ({
+        success: true,
+        data: state.clusters || [],
+        region: region || 'eu-west-1',
+        warnings: []
+      });
     },
 
     connectSSM: async (p, id, region) => { calls.ssm.push({ id, region }); return { success: true }; },

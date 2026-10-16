@@ -794,6 +794,129 @@ const openPortDialog = async (app, remote = true) => {
 
   }
 
+  // ---------------------------------------------------------------------------
+  suite.section('a cluster in another account than the instance reaching it');
+  // The reported bug: the Kubernetes chip is only a port preset, and a cluster
+  // the current credentials cannot list could only be typed in — which is the
+  // one path that clears the cluster flag, so no kubeconfig was ever written
+  // and the kubectl button never appeared.
+
+  {
+    const app = await boot({
+      profiles: [profile('keys'), profile('cluster-account', { region: 'eu-west-1' })],
+      instances: [instance({ instanceName: 'bastion-01', instanceId: 'i-0abc123' })],
+      endpoints: [],      // nothing the tunnel account can see
+      clusters: [{
+        id: 'eks:platform-prod', name: 'platform-prod',
+        host: 'ABCD1234P.gr7.eu-west-1.eks.amazonaws.com',
+        port: 443, service: 'kubernetes', kind: 'EKS cluster', tls: true,
+        kubernetes: { clusterName: 'platform-prod' }
+      }]
+    });
+    await pick(app, 'keys');
+
+    app.document.querySelector('button[data-action="port"]').click();
+    await settle(app.window, 40);
+    [...app.document.querySelectorAll('#pfTarget button')]
+      .find(b => b.dataset.target === 'remote').click();
+    await settle(app.window, 40);
+
+    const clusterField = app.document.getElementById('pfClusterField');
+    suite.check('the cluster account row is hidden until Kubernetes is chosen',
+      clusterField.style.display === 'none', clusterField.style.display);
+
+    [...app.document.querySelectorAll('#pfChips .chip')]
+      .find(c => c.dataset.service === 'kubernetes').click();
+    await settle(app.window, 60);
+
+    suite.check('choosing Kubernetes reveals it',
+      clusterField.style.display !== 'none', clusterField.style.display);
+
+    const picker = app.document.getElementById('pfClusterProfile');
+    suite.check('it lists every profile, starting on the current one',
+      picker.value === 'keys' && picker.options.length === 2,
+      [...picker.options].map(o => o.value));
+
+    picker.value = 'cluster-account';
+    picker.dispatchEvent(new app.window.Event('change', { bubbles: true }));
+    await settle(app.window, 200);
+
+    // Prefilling the tunnel's region here would look for a eu-west-1 cluster in
+    // eu-central-1 and quietly find nothing
+    suite.check('switching account clears the region, so the cluster account\'s own is used',
+      app.document.getElementById('pfClusterRegion').value === '',
+      app.document.getElementById('pfClusterRegion').value);
+
+    const lookup = app.calls.clusterLookups[app.calls.clusterLookups.length - 1];
+    suite.check('the clusters are listed with the cluster account',
+      lookup && lookup.profileName === 'cluster-account' && lookup.region === null, lookup);
+
+    const listed = [...app.document.querySelectorAll('#pfHostList .endpoint-option')];
+    suite.check('and the cluster appears, without anyone typing an endpoint',
+      listed.length === 1 && /platform-prod/.test(listed[0].textContent), listed.length);
+
+    listed[0].dispatchEvent(new app.window.MouseEvent('mousedown', { bubbles: true }));
+    await settle(app.window, 80);
+
+    suite.check('picking it fills in the real endpoint',
+      app.document.getElementById('pfHost').value === 'ABCD1234P.gr7.eu-west-1.eks.amazonaws.com',
+      app.document.getElementById('pfHost').value);
+
+    app.document.getElementById('pfStart').click();
+    await settle(app.window, 120);
+
+    const sent = app.calls.forwards[app.calls.forwards.length - 1];
+
+    suite.check('the forward is marked as a cluster, so a kubeconfig gets written',
+      sent && !!sent.kubernetes, sent);
+    suite.check('and it carries the account and region that own the cluster',
+      sent.kubernetes.clusterName === 'platform-prod'
+        && sent.kubernetes.profileName === 'cluster-account'
+        && sent.kubernetes.region === 'eu-west-1',
+      sent.kubernetes);
+    suite.check('while the tunnel itself stays in the instance\'s region',
+      sent.region === 'eu-central-1', sent.region);
+  }
+
+  {
+    // Same account is the common case and must not have gained a step
+    const app = await boot({
+      instances: [instance({ instanceName: 'bastion-01', instanceId: 'i-0abc123' })],
+      endpoints: [{
+        id: 'eks:local-prod', name: 'local-prod',
+        host: 'LOCAL1234.gr7.eu-central-1.eks.amazonaws.com',
+        port: 443, service: 'kubernetes', kind: 'EKS cluster', tls: true,
+        kubernetes: { clusterName: 'local-prod' }
+      }]
+    });
+    await pick(app, 'keys');
+
+    app.document.querySelector('button[data-action="port"]').click();
+    await settle(app.window, 40);
+    [...app.document.querySelectorAll('#pfTarget button')]
+      .find(b => b.dataset.target === 'remote').click();
+    await settle(app.window, 40);
+    [...app.document.querySelectorAll('#pfChips .chip')]
+      .find(c => c.dataset.service === 'kubernetes').click();
+    await settle(app.window, 150);
+
+    const listed = [...app.document.querySelectorAll('#pfHostList .endpoint-option')];
+    listed[0].dispatchEvent(new app.window.MouseEvent('mousedown', { bubbles: true }));
+    await settle(app.window, 80);
+
+    app.document.getElementById('pfStart').click();
+    await settle(app.window, 120);
+
+    const sent = app.calls.forwards[app.calls.forwards.length - 1];
+
+    suite.check('a cluster in this account needs no account picked',
+      app.calls.clusterLookups.length === 0, app.calls.clusterLookups);
+    suite.check('and is sent with just its name, exactly as before',
+      sent.kubernetes && sent.kubernetes.clusterName === 'local-prod'
+        && !sent.kubernetes.profileName,
+      sent.kubernetes);
+  }
+
   suite.done();
 })().catch(error => {
   console.error('\n  the suite threw:', error && error.stack);

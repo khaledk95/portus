@@ -83,6 +83,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Managed database endpoints suggested in the port forwarding dialog
   getEndpoints: (profileName, region) => ipcRenderer.invoke('get-endpoints', profileName, region),
 
+  // Clusters only, for a cluster that lives in a different account from the
+  // instance that reaches it
+  listClusters: (profileName, region) => ipcRenderer.invoke('list-clusters', profileName, region),
+
   // SSM Connect
   connectSSM: (profileName, instanceId, region) =>
     ipcRenderer.invoke('connect-ssm', profileName, instanceId, region),

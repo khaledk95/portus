@@ -659,6 +659,12 @@ td.actions { text-align: left; }
 .input.mono { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
+/* Profile and region for a cluster in another account. The region is the
+   narrower of the two: it is usually left at the default. */
+.cluster-source { display: flex; gap: 8px; }
+.cluster-source select { flex: 1 1 auto; min-width: 0; }
+.cluster-source input { flex: 0 1 190px; min-width: 0; }
+
 .chips { display: flex; flex-wrap: wrap; gap: 5px; }
 .chip {
   font-size: 11.5px; padding: 4px 10px; border-radius: 4px;

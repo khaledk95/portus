@@ -840,6 +840,11 @@ function kubeconfigPathFor(clusterName) {
 // and a CA blob both end up in a file another program parses.
 const yamlString = (value) => `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 
+// `profileName` and `region` belong to the cluster, which is not always the
+// profile that opened the tunnel: an instance in one account can reach a cluster
+// in another. The tunnel is the instance's, while describing the cluster and
+// later minting its token are the cluster account's — so this takes only the
+// cluster's side and the caller resolves which that is.
 async function writeKubeconfig({ clusterName, region, localPort, profileName, useEnvCredentials }) {
   const config = { credentials: awsCredentials(profileName), region };
   const { cluster } = await new EKSClient(config).send(new DescribeClusterCommand({ name: clusterName }));
@@ -1970,6 +1975,60 @@ const REGION_NAMES = {
   'cn-north-1': 'Beijing', 'cn-northwest-1': 'Ningxia'
 };
 
+// Every EKS cluster a set of credentials can see, as endpoint rows.
+//
+// Shared by endpoint discovery and by the cross-account cluster picker. The
+// second one exists because a cluster can live in a different account from the
+// instance that reaches it: the tunnel is opened with the instance's profile,
+// while the cluster is described — and later tokened — with its own.
+//
+// DescribeCluster per cluster is the only way to get an endpoint, and the list
+// is normally short. One that fails is skipped rather than losing the rest; a
+// cluster being deleted mid-listing should not empty the dialog.
+async function listEksClusters(eks, onWarning) {
+  const listed = [];
+  const clusters = [];
+  let nextToken;
+  let page = 0;
+
+  do {
+    const response = await eks.send(new ListClustersCommand({ maxResults: 100, nextToken }));
+    listed.push(...(response.clusters || []));
+    nextToken = response.nextToken;
+    page += 1;
+  } while (nextToken && page < MAX_PAGES);
+
+  for (const name of listed) {
+    try {
+      const { cluster } = await eks.send(new DescribeClusterCommand({ name }));
+      if (!cluster || !cluster.endpoint) continue;
+
+      clusters.push({
+        id: `eks:${name}`,
+        name,
+        host: hostnameOf(cluster.endpoint),
+        port: 443,
+        service: 'kubernetes',
+        kind: 'EKS cluster',
+        engine: 'kubernetes',
+        engineVersion: cluster.version || null,
+        status: cluster.status || null,
+        tls: true,
+        // Marks it as more than a host: the renderer offers the kubectl flow for
+        // these, and the tunnel writes a kubeconfig. The CA stays here — it is
+        // re-read when the file is written, so nothing large crosses to the
+        // renderer.
+        kubernetes: { clusterName: name }
+      });
+    } catch (error) {
+      if (isCredentialsError(error) && !isAuthorizationError(error)) throw error;
+      onWarning(`EKS ${name}: ${describeDeniedAction(error)}`);
+    }
+  }
+
+  return clusters;
+}
+
 // The region a request should use: what the user picked, or the profile's own.
 // An unrecognised value is discarded rather than passed on, so nothing shaped
 // like a command-line argument can arrive from the renderer and be appended to
@@ -2061,6 +2120,27 @@ function setupIpcHandlers() {
   ipcMain.handle('start-port-forward', async (event, profileName, instanceId, instanceName, options) => {
     const { remoteHost, remotePort, localPort, region: requestedRegion, kubernetes, target } = options || {};
     const clusterName = kubernetes && kubernetes.clusterName ? String(kubernetes.clusterName) : null;
+
+    // A cluster can live in a different account from the instance reaching it.
+    // When it does, the renderer names the profile and region that own it; when
+    // it does not, these fall back to the ones opening the tunnel and the
+    // single-account case is unchanged.
+    const clusterProfile = kubernetes && kubernetes.profileName
+      ? String(kubernetes.profileName)
+      : profileName;
+    const clusterRegionRequested = kubernetes && kubernetes.region
+      ? String(kubernetes.region)
+      : null;
+
+    if (clusterName && clusterProfile !== profileName) {
+      const clusterProfileCheck = validateProfileName(clusterProfile);
+      if (!clusterProfileCheck.valid) {
+        return { success: false, error: `Cluster account: ${clusterProfileCheck.error}` };
+      }
+    }
+    if (clusterRegionRequested && !VALID_REGION.test(clusterRegionRequested)) {
+      return { success: false, error: 'That does not look like a region code for the cluster.' };
+    }
 
     const profileCheck = validateProfileName(profileName);
     if (!profileCheck.valid) return { success: false, error: profileCheck.error };
@@ -2177,17 +2257,40 @@ function setupIpcHandlers() {
     let kube = null;
     if (clusterName) {
       try {
+        // Resolved against the cluster's own profile, so a cluster in another
+        // account is described in its own region rather than the tunnel's.
+        const clusterRegion = clusterProfile === profileName && !clusterRegionRequested
+          ? region
+          : await regionFor(clusterProfile, clusterRegionRequested);
+
+        // Whether the CLI can resolve the cluster's profile by itself is a
+        // question about that profile, not about the one holding the tunnel
+        // open. Asking it of the wrong one writes AWS_PROFILE into a kubeconfig
+        // whose credentials are in the environment, or omits it when it is the
+        // only way `aws eks get-token` will find anything.
+        const clusterCredentialEnv = clusterProfile === profileName
+          ? credentialEnv
+          : await cliCredentialEnv(clusterProfile);
+
         kube = await writeKubeconfig({
           clusterName,
-          region,
+          region: clusterRegion,
           localPort: resolvedLocalPort,
-          profileName,
-          useEnvCredentials: !!credentialEnv
+          profileName: clusterProfile,
+          useEnvCredentials: !!clusterCredentialEnv
         });
 
         const tunnel = activeTunnels.get(result.tunnelId);
         if (tunnel) {
-          tunnel.kubernetes = { clusterName, kubeconfig: kube.path, context: kube.context };
+          tunnel.kubernetes = {
+            clusterName,
+            kubeconfig: kube.path,
+            context: kube.context,
+            // The kubectl terminal needs the cluster's credentials, not the
+            // tunnel's — get-token has to sign as an identity the cluster knows.
+            profileName: clusterProfile,
+            region: clusterRegion
+          };
           broadcastTunnels();
         }
       } catch (error) {
@@ -2543,6 +2646,32 @@ function setupIpcHandlers() {
   // "a host reachable from it" in port forwarding.
   // Same re-auth path as the EC2 listing: expired credentials trigger one silent
   // SSO login and a single retry.
+  // Clusters only, for the case where the cluster is in a different account from
+  // the instance that reaches it. Deliberately not get-endpoints: that also
+  // queries RDS and ElastiCache, which in the cluster's account would be calls
+  // nobody asked for and a column of AccessDenied warnings for databases the
+  // user is not looking for.
+  ipcMain.handle('list-clusters', async (event, profileName, requestedRegion) => {
+    const profileCheck = validateProfileName(profileName);
+    if (!profileCheck.valid) return { success: false, error: profileCheck.error };
+
+    try {
+      const region = await regionFor(profileName, requestedRegion);
+      const warnings = [];
+      const eks = new EKSClient({ credentials: awsCredentials(profileName), region });
+
+      const clusters = await listEksClusters(eks, warning => warnings.push(warning));
+      clusters.sort((a, b) => a.name.localeCompare(b.name));
+
+      return { success: true, data: clusters, region, warnings };
+    } catch (error) {
+      if (isMfaError(error)) {
+        return { success: false, mfaRequired: true, error: error.message };
+      }
+      return { success: false, error: `Could not list clusters for ${profileName}: ${error.message}` };
+    }
+  });
+
   ipcMain.handle('get-endpoints', async (event, profileName, region) => {
     try {
       return await describeEndpoints(profileName, region);
@@ -2775,49 +2904,7 @@ function setupIpcHandlers() {
     // instance that sits in the VPC. What makes it more than a port forward is
     // the kubeconfig, written once the tunnel is up — see writeKubeconfig.
     await collect('EKS clusters', async () => {
-      const listed = [];
-      let nextToken;
-      let page = 0;
-
-      do {
-        const response = await eks.send(new ListClustersCommand({ maxResults: 100, nextToken }));
-        listed.push(...(response.clusters || []));
-        nextToken = response.nextToken;
-        page += 1;
-      } while (nextToken && page < MAX_PAGES);
-
-      // DescribeCluster per cluster is the only way to get the endpoint, and the
-      // list is normally short. One that fails is skipped rather than losing the
-      // rest — a cluster being deleted mid-listing should not empty the dialog.
-      for (const name of listed) {
-        try {
-          const { cluster } = await eks.send(new DescribeClusterCommand({ name }));
-          if (!cluster || !cluster.endpoint) continue;
-
-          const host = hostnameOf(cluster.endpoint);
-
-          endpoints.push({
-            id: `eks:${name}`,
-            name,
-            host,
-            port: 443,
-            service: 'kubernetes',
-            kind: 'EKS cluster',
-            engine: 'kubernetes',
-            engineVersion: cluster.version || null,
-            status: cluster.status || null,
-            tls: true,
-            // Marks it as more than a host: the renderer offers the kubectl flow
-            // for these, and the tunnel writes a kubeconfig. The CA and the ARN
-            // stay here — they are re-read when the file is written, so nothing
-            // large crosses to the renderer.
-            kubernetes: { clusterName: name }
-          });
-        } catch (error) {
-          if (isCredentialsError(error) && !isAuthorizationError(error)) throw error;
-          warnings.push(`EKS ${name}: ${describeDeniedAction(error)}`);
-        }
-      }
+      endpoints.push(...await listEksClusters(eks, warning => warnings.push(warning)));
     });
 
     endpoints.sort((a, b) => a.name.localeCompare(b.name));
@@ -2888,11 +2975,17 @@ function setupIpcHandlers() {
       return { success: false, error: 'That tunnel has no cluster attached.' };
     }
 
+    // The cluster's profile, which is the tunnel's own unless the cluster lives
+    // in another account. `aws eks get-token` runs out here and has to sign as
+    // an identity the cluster recognises; the instance carrying the traffic has
+    // nothing to do with that.
+    const clusterProfile = tunnel.kubernetes.profileName || tunnel.profileName;
+
     let credentialEnv;
     try {
-      credentialEnv = await cliCredentialEnv(tunnel.profileName);
+      credentialEnv = await cliCredentialEnv(clusterProfile);
     } catch (error) {
-      return { success: false, error: `Could not get credentials for ${tunnel.profileName}: ${error.message}` };
+      return { success: false, error: `Could not get credentials for ${clusterProfile}: ${error.message}` };
     }
 
     const env = { ...(credentialEnv || {}), KUBECONFIG: tunnel.kubernetes.kubeconfig };
