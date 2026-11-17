@@ -80,7 +80,7 @@ for them on startup and tells you what is missing.
 - **Startup preflight** — the AWS CLI and Session Manager plugin are checked at launch and anything missing is named up front, with its install command, rather than failing later mid-connect
 - **Session renewal** — Azure AD sessions are refreshed before they expire, without interrupting you. Identity Center needs a browser approval, so it is never renewed on a timer; you get a warning shortly before it lapses and sign in when you are ready
 - **Release notifications** — on launch, Portus checks whether a newer version has been published and shows it once, with what changed and a link to the release. It never downloads or installs anything
-- **Light and dark themes**, a collapsible sidebar, an instance detail panel, state/OS filters and `Ctrl K` search — the session countdown and open tunnel count stay visible in the status bar
+- **Light and dark themes**, a collapsible sidebar, an instance detail panel that closes on a click away or Escape, state/OS filters and `Ctrl K` search — the session countdown and open tunnel count stay visible in the status bar
 - Smart buttons: connect actions are only offered when Systems Manager can actually reach the instance, and RDP only on running Windows instances
 - Cross-platform: Windows, macOS, Linux — on Windows and Linux the stock Electron menu bar is removed, since Portus never used it
 
@@ -103,8 +103,10 @@ sign-in covers.
 
 **3. Instances** — the fleet for the selected profile and region, with SSM
 readiness per instance. A row Systems Manager cannot reach offers **Access via…**
-instead of the usual buttons. Selecting a row opens its details, and the name,
-instance ID and private IP can be copied from the row itself.
+instead of the usual buttons. Selecting a row opens its details — state, agent,
+placement and the key pair it was launched with — and clicking away or pressing
+Escape closes it again. The name, instance ID and private IP can be copied from
+the row itself.
 
 ![The instance list showing state, SSM status and connect actions](screenshots/03-instances.png)
 
