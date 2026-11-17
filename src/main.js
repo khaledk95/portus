@@ -2581,6 +2581,10 @@ function setupIpcHandlers() {
           // Used to rank hop candidates for an unmanaged instance: same subnet
           // beats same VPC, because a subnet-local hop needs no route between them
           subnetId: instance.SubnetId || null,
+          // The name of the key pair chosen at launch, shown in the detail
+          // panel. A name is all this is — no key material is read, fetched or
+          // stored, and Portus still never uses a key to connect.
+          keyName: instance.KeyName || null,
           // Surfaced in the detail panel; Name is shown separately as the row title
           tags: (instance.Tags || [])
             .filter(tag => tag.Key !== 'Name')

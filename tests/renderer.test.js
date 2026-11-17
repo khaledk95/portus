@@ -364,6 +364,47 @@ const openPortDialog = async (app, remote = true) => {
     await settle(app.window, 40);
     suite.check('the row itself still selects', app.portus.selectedInstanceId === 'i-0abc123');
 
+    // -------------------------------------------------------------------------
+    // The panel is part of the layout rather than an overlay, so without this
+    // the only way out of it was reloading the list.
+
+    const panel = app.document.getElementById('detailPanel');
+    suite.check('selecting a row opens the detail panel',
+      panel.style.display !== 'none', panel.style.display);
+
+    suite.check('the key pair named at launch is shown',
+      /platform-keypair/.test(app.document.getElementById('detailBody').textContent),
+      app.document.getElementById('detailBody').textContent.replace(/\s+/g, ' ').slice(0, 160));
+
+    // Inside the panel is not "away from" it
+    panel.click();
+    await settle(app.window, 40);
+    suite.check('clicking inside the panel keeps it open',
+      app.portus.selectedInstanceId === 'i-0abc123', app.portus.selectedInstanceId);
+
+    // Another row selects that instance rather than closing
+    app.document.querySelectorAll('#instanceTableWrap tbody tr')[1].click();
+    await settle(app.window, 40);
+    suite.check('clicking another row moves the selection, it does not close',
+      app.portus.selectedInstanceId === 'i-0def456', app.portus.selectedInstanceId);
+
+    // And anywhere else closes it
+    app.document.getElementById('instanceCount').click();
+    await settle(app.window, 40);
+    suite.check('clicking away closes it',
+      app.portus.selectedInstanceId === null, app.portus.selectedInstanceId);
+    suite.check('and the panel is hidden again',
+      app.document.getElementById('detailPanel').style.display === 'none',
+      app.document.getElementById('detailPanel').style.display);
+
+    // Escape is the other obvious gesture, once nothing is in front of it
+    app.document.querySelectorAll('#instanceTableWrap tbody tr')[0].click();
+    await settle(app.window, 40);
+    app.document.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await settle(app.window, 40);
+    suite.check('Escape closes it too', app.portus.selectedInstanceId === null,
+      app.portus.selectedInstanceId);
+
     // Nothing to copy means nothing offered, and the dash stays a plain dash
     const secondRow = app.document.querySelectorAll('#instanceTableWrap tbody tr')[1];
     suite.check('a row missing a name and an address offers only the id',

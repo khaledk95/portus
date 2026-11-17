@@ -27,6 +27,9 @@ const ec2Send = async (command) => {
           InstanceType: 't3.micro',
           State: { Name: 'running' },
           Placement: { AvailabilityZone: 'eu-central-1a' },
+          VpcId: 'vpc-0a1b2c3d',
+          SubnetId: 'subnet-0a1b2c3d',
+          KeyName: 'platform-keypair',
           Tags: [{ Key: 'Name', Value: id }]
         }))
       }]
@@ -104,6 +107,29 @@ const { handlers, state, ready } = loadMain({
   const last = byId.get(ids[TOTAL - 1]);
   suite.check('the last instance is Online, not unmanaged',
     last && last.ssmStatus === 'online', last && last.ssmStatus);
+
+  // -------------------------------------------------------------------------
+  suite.section('the fields the detail panel and hop picker need come through');
+  // Each of these is read by the UI and set nowhere else, so a mapping that
+  // quietly drops one shows up as an empty row rather than an error.
+
+  suite.check('the key pair named at launch is carried',
+    first && first.keyName === 'platform-keypair', first && first.keyName);
+  suite.check('and its subnet, which ranks hop candidates',
+    first && first.subnetId === 'subnet-0a1b2c3d', first && first.subnetId);
+  suite.check('and its VPC, which bounds them',
+    first && first.vpcId === 'vpc-0a1b2c3d', first && first.vpcId);
+
+  // No key material is read, fetched or stored — only the name AWS already
+  // returns with the instance. (privateIp is an address, not a private key.)
+  const keyFields = Object.keys(first || {}).filter(field => /key/i.test(field));
+  suite.check('the only key-related field is the name itself',
+    keyFields.length === 1 && keyFields[0] === 'keyName', keyFields);
+  suite.check('and it holds a name, not key material',
+    typeof first.keyName === 'string'
+      && first.keyName.length < 256
+      && !/BEGIN |\n/.test(first.keyName),
+    first.keyName);
 
   suite.done();
 })();

@@ -273,10 +273,40 @@ class Portus {
             }
             if (e.key === 'Escape') {
                 const overlay = document.querySelector('.overlay');
-                if (overlay) overlay.remove();
-                if (this.comboOpen) this.closeCombo();
+                if (overlay) { overlay.remove(); return; }
+                if (this.comboOpen) { this.closeCombo(); return; }
+                // Last, so Escape closes whatever is most on top: a dialog, then
+                // an open combo, then the detail panel underneath both.
+                this.clearInstanceSelection();
             }
         });
+
+        // The detail panel is part of the layout rather than an overlay, so
+        // nothing was dismissing it — opening it was easy and closing it meant
+        // reloading the list. Clicking away from it is the obvious gesture.
+        // Capture, deliberately. Selecting a row re-renders the table, so by the
+        // time a bubbled click reached here the clicked row had been replaced
+        // and no longer matched anything — the panel opened and shut in the same
+        // click. In the capture phase the document is still as the user saw it.
+        document.addEventListener('click', (e) => {
+            if (!this.selectedInstanceId) return;
+            // Inside the panel is not "away from" it
+            if (e.target.closest('#detailPanel')) return;
+            // Another row selects that instance rather than closing; its own
+            // handler runs after this one and does the selecting.
+            if (e.target.closest('#instanceTableWrap tbody tr')) return;
+            // A dialog is in front of the panel, not outside it
+            if (e.target.closest('.overlay')) return;
+
+            this.clearInstanceSelection();
+        }, true);
+    }
+
+    clearInstanceSelection() {
+        if (!this.selectedInstanceId) return;
+        this.selectedInstanceId = null;
+        this.renderInstances();
+        this.renderDetail(null);
     }
 
     // Segmented state / OS filters above the instance table
@@ -1489,7 +1519,13 @@ class Portus {
                 ['Public IP', item.publicIp
                     ? `<span class="mono">${this.escapeHtml(item.publicIp)}</span>`
                     : '<span class="dim">none</span>'],
-                ['Platform', this.escapeHtml(item.platform || '—')]
+                ['Platform', this.escapeHtml(item.platform || '—')],
+                // The name the instance was launched with. Portus never uses a
+                // key to connect; this is here because it identifies the
+                // instance's origin, not because anything needs it.
+                ['Key pair', item.keyName
+                    ? `<span class="mono">${this.escapeHtml(item.keyName)}</span>`
+                    : '<span class="dim">none</span>']
             ])}</dl>
 
             ${item.tags && item.tags.length ? `

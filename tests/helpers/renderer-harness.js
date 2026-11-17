@@ -45,6 +45,8 @@ function instance(overrides = {}) {
     vpcId: 'vpc-123',
     // Hop ranking reads both: same subnet is preferred over same VPC
     subnetId: 'subnet-a',
+    // The key pair named at launch. A name only — Portus never reads key material.
+    keyName: 'platform-keypair',
     tags: [],
     ssmStatus: 'online',
     ssmLastPing: null,
