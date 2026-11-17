@@ -817,20 +817,26 @@ const openPortDialog = async (app, remote = true) => {
 
     app.document.querySelector('button[data-action="port"]').click();
     await settle(app.window, 40);
+
+    const clusterField = app.document.getElementById('pfClusterField');
+    suite.check('the account row is hidden when forwarding on the instance itself',
+      clusterField.style.display === 'none', clusterField.style.display);
+
     [...app.document.querySelectorAll('#pfTarget button')]
       .find(b => b.dataset.target === 'remote').click();
     await settle(app.window, 40);
 
-    const clusterField = app.document.getElementById('pfClusterField');
-    suite.check('the cluster account row is hidden until Kubernetes is chosen',
-      clusterField.style.display === 'none', clusterField.style.display);
+    suite.check('and shown for anything reachable through it',
+      clusterField.style.display !== 'none', clusterField.style.display);
 
     [...app.document.querySelectorAll('#pfChips .chip')]
       .find(c => c.dataset.service === 'kubernetes').click();
     await settle(app.window, 60);
 
-    suite.check('choosing Kubernetes reveals it',
-      clusterField.style.display !== 'none', clusterField.style.display);
+    suite.check('the EKS preset is labelled for what it finds',
+      [...app.document.querySelectorAll('#pfChips .chip')]
+        .find(c => c.dataset.service === 'kubernetes').textContent.trim() === 'EKS',
+      [...app.document.querySelectorAll('#pfChips .chip')].map(c => c.textContent.trim()));
 
     const picker = app.document.getElementById('pfClusterProfile');
     suite.check('it lists every profile, starting on the current one',
@@ -876,6 +882,67 @@ const openPortDialog = async (app, remote = true) => {
       sent.kubernetes);
     suite.check('while the tunnel itself stays in the instance\'s region',
       sent.region === 'eu-central-1', sent.region);
+  }
+
+  {
+    // A database in another account, reached over peering. Unlike a cluster,
+    // the account is discovery alone: once the tunnel is up nothing refers to
+    // it again, so nothing about it should travel to the main process.
+    const app = await boot({
+      profiles: [profile('keys'), profile('data-account', { region: 'eu-west-1' })],
+      instances: [instance({ instanceName: 'bastion-01', instanceId: 'i-0abc123' })],
+      endpoints: []     // nothing the tunnel account can see
+    });
+    await pick(app, 'keys');
+
+    // The other account's databases, which only its own credentials can list
+    app.state.endpoints = [{
+      id: '1', name: 'orders-prod', kind: 'Aurora writer', service: 'postgresql',
+      host: 'orders-prod.cluster-abc.eu-west-1.rds.amazonaws.com', port: 5432, tls: true
+    }];
+
+    app.document.querySelector('button[data-action="port"]').click();
+    await settle(app.window, 40);
+    [...app.document.querySelectorAll('#pfTarget button')]
+      .find(b => b.dataset.target === 'remote').click();
+    await settle(app.window, 40);
+    [...app.document.querySelectorAll('#pfChips .chip')]
+      .find(c => c.dataset.service === 'postgresql').click();
+    await settle(app.window, 60);
+
+    const picker = app.document.getElementById('pfClusterProfile');
+    picker.value = 'data-account';
+    picker.dispatchEvent(new app.window.Event('change', { bubbles: true }));
+    await settle(app.window, 250);
+
+    suite.check('a database in another account is listed without EKS being involved',
+      app.calls.clusterLookups.length === 0, app.calls.clusterLookups);
+
+    const dbLookup = app.calls.endpointLookups[app.calls.endpointLookups.length - 1];
+    suite.check('and it is asked of that account, not the one holding the tunnel',
+      dbLookup && dbLookup.profileName === 'data-account', dbLookup);
+
+    const listed = [...app.document.querySelectorAll('#pfHostList .endpoint-option')];
+    suite.check('and the endpoint appears',
+      listed.length === 1 && /orders-prod/.test(listed[0].textContent),
+      listed.map(el => el.textContent.trim()));
+
+    listed[0].dispatchEvent(new app.window.MouseEvent('mousedown', { bubbles: true }));
+    await settle(app.window, 80);
+
+    const chosenHost = app.document.getElementById('pfHost').value;
+    const chosenPort = app.document.getElementById('pfRemote').value;
+
+    app.document.getElementById('pfStart').click();
+    await settle(app.window, 120);
+
+    const sent = app.calls.forwards[app.calls.forwards.length - 1];
+
+    suite.check('the real endpoint and its port are filled in',
+      chosenHost === 'orders-prod.cluster-abc.eu-west-1.rds.amazonaws.com' && chosenPort === '5432',
+      { chosenHost, chosenPort });
+    suite.check('the forward carries the host, and nothing about the account',
+      sent && sent.remoteHost === chosenHost && !sent.kubernetes, sent);
   }
 
   {

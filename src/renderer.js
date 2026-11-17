@@ -587,8 +587,8 @@ class Portus {
     // Endpoints are per account *and* per region: the same profile holds
     // different databases in eu-central-1 than in us-east-1, so a key of profile
     // alone would offer one region's hosts while connected to another.
-    endpointCacheKey() {
-        return `${this.currentProfile}|${this.currentRegion}`;
+    endpointCacheKey(profileName = this.currentProfile, region = this.currentRegion) {
+        return `${profileName}|${region}`;
     }
 
     // Enabled regions for the current profile. The picker is usable immediately
@@ -1727,7 +1727,10 @@ class Portus {
             { label: 'PostgreSQL', port: 5432, service: 'postgresql' },
             { label: 'MySQL', port: 3306, service: 'mysql' },
             { label: 'Redis', port: 6379, service: 'redis' },
-            { label: 'Kubernetes', port: 443, service: 'kubernetes' }
+            // Labelled EKS because that is what it finds. The key stays
+            // 'kubernetes' — it is what endpoint discovery tags clusters with,
+            // and renaming it would mean renaming the engine mapping too.
+            { label: 'EKS', port: 443, service: 'kubernetes' }
         ];
 
         const overlay = document.createElement('div');
@@ -1760,7 +1763,7 @@ class Portus {
                     </div>
 
                     <div class="field" id="pfClusterField" style="display:none;">
-                        <label class="field-label">Cluster account</label>
+                        <label class="field-label">Look in account</label>
                         <div class="cluster-source">
                             <select class="input" id="pfClusterProfile">
                                 ${(this.profiles || []).map(p => `
@@ -1770,11 +1773,7 @@ class Portus {
                                    value="${this.escapeHtml(this.currentRegion || '')}"
                                    placeholder="the profile's own region">
                         </div>
-                        <p class="dialog-note">
-                            The cluster can live in a different account from the instance reaching it.
-                            The tunnel stays on this instance; the kubeconfig and
-                            <span class="mono">eks get-token</span> use the account chosen here.
-                        </p>
+                        <p class="dialog-note" id="pfClusterNote"></p>
                     </div>
 
                     <div class="field" id="pfHostField" style="display:none;">
@@ -1849,9 +1848,16 @@ class Portus {
         // is edited by hand: a typed host is not the cluster we described.
         let chosenKubernetes = null;
 
-        // Set only when the cluster is in a different account or region from the
-        // instance opening the tunnel; null means this one, and the single
-        // account case behaves exactly as before.
+        // Set only when the thing being reached was found in a different account
+        // or region from the instance opening the tunnel; null means this one,
+        // and the single account case behaves exactly as before.
+        //
+        // What it is used for differs by service, and the difference is worth
+        // keeping straight. For a database or a cache it is discovery alone:
+        // the tunnel needs a host and a port, and once it is up nothing refers
+        // to that account again. For a cluster it outlives discovery — the
+        // kubeconfig is written from it and every `aws eks get-token` signs
+        // with it.
         let clusterSource = null;
         let endpoints = [];
         let matches = [];
@@ -1894,11 +1900,14 @@ class Portus {
             loadState = 'loading';
             renderList();
 
-            // A cluster in another account is listed with that account's
-            // credentials. Everything else — including a cluster in this one —
-            // goes through normal endpoint discovery.
+            // Another account is listed with that account's credentials. For a
+            // cluster that means EKS alone — asking for databases in an account
+            // someone picked to find a cluster in is a column of AccessDenied
+            // warnings about things they were not looking for.
             const result = clusterSource
-                ? await this.loadClusters(clusterSource.profileName, clusterSource.region)
+                ? (activeService() === 'kubernetes'
+                    ? await this.loadClusters(clusterSource.profileName, clusterSource.region)
+                    : await this.loadEndpoints(clusterSource.profileName, clusterSource.region))
                 : await this.loadEndpoints();
             if (!overlay.isConnected) return;   // dialog closed while in flight
 
@@ -2033,6 +2042,10 @@ class Portus {
                 btn.classList.add('on');
                 const isRemote = btn.dataset.target === 'remote';
                 hostField.style.display = isRemote ? 'block' : 'none';
+                // Only a remote target can be in another account — forwarding a
+                // port on the instance itself has no endpoint to look up.
+                clusterField.style.display = isRemote ? 'block' : 'none';
+                renderAccountNote();
                 // openPanel explicitly rather than relying on the focus handler:
                 // focus() is a no-op when the window itself is not focused, and
                 // the panel would then render its contents but stay closed
@@ -2083,11 +2096,22 @@ class Portus {
             }
         });
 
-        // The cluster account row only means anything for Kubernetes, and only
-        // changes behaviour when it names something other than this account.
+        // The account row applies to anything reachable through the instance,
+        // and only changes behaviour when it names something other than this
+        // account.
         const clusterField = overlay.querySelector('#pfClusterField');
         const clusterProfile = overlay.querySelector('#pfClusterProfile');
         const clusterRegion = overlay.querySelector('#pfClusterRegion');
+        const clusterNote = overlay.querySelector('#pfClusterNote');
+
+        // What the chosen account is actually used for is not the same for a
+        // cluster as for a database, and saying so is the difference between a
+        // field people understand and one they guess at.
+        const renderAccountNote = () => {
+            clusterNote.textContent = activeService() === 'kubernetes'
+                ? 'The cluster can be in a different account from the instance reaching it. The tunnel stays on this instance; the kubeconfig and eks get-token use the account chosen here.'
+                : 'Lists endpoints from another account, for something this instance can reach over peering. Only used to find the address — the tunnel itself is unchanged.';
+        };
 
         const syncClusterSource = () => {
             const name = clusterProfile.value;
@@ -2128,15 +2152,16 @@ class Portus {
                     remote.value = chip.dataset.port;
                 }
 
-                const kubernetesChosen = !wasOn && chip.dataset.service === 'kubernetes';
-                clusterField.style.display = kubernetesChosen ? 'block' : 'none';
+                renderAccountNote();
 
-                // Leaving Kubernetes returns the list to this account, rather
-                // than quietly filtering another account's clusters by service
-                if (!kubernetesChosen && clusterSource) {
-                    clusterProfile.value = this.currentProfile;
-                    clusterRegion.value = this.currentRegion || '';
-                    syncClusterSource();
+                // Clusters and databases are listed by different calls, so a
+                // list fetched from another account for one service cannot be
+                // filtered into the other. Switching service refetches.
+                if (clusterSource) {
+                    endpoints = [];
+                    chosenKubernetes = null;
+                    loadState = 'idle';
+                    ensureEndpoints();
                     return;
                 }
 
@@ -2203,32 +2228,45 @@ class Portus {
         }
     }
 
-    async loadEndpoints() {
-        if (!this.currentProfile) return { success: false, error: 'No profile selected' };
+    // Defaults to the selected profile and region. Another account is passed
+    // explicitly, for a database or cache that lives there — the instance can
+    // reach it over peering, but only that account can say what its endpoint is.
+    async loadEndpoints(profileName = this.currentProfile, region = this.currentRegion) {
+        if (!profileName) return { success: false, error: 'No profile selected' };
+
+        const isCurrent = profileName === this.currentProfile;
 
         this.setBusy(true);
         try {
-            const result = await window.electronAPI.getEndpoints(this.currentProfile, this.currentRegion);
+            const result = await window.electronAPI.getEndpoints(profileName, region);
 
             if (result && result.success) {
-                if (result.reauthenticated) {
+                // A silent re-auth says something about the session being used
+                // for the UI. Another account's listing says nothing about it.
+                if (result.reauthenticated && isCurrent) {
                     this.isLoggedIn = true;
                     this.updateConnection(true, this.selectedAuthProfile);
                     this.startSessionWatcher();
                 }
 
                 const data = result.data || [];
-                this.endpointCache.set(this.endpointCacheKey(), data);
+                // Keyed by what was actually asked, not by what is selected.
+                // Keying another account's endpoints under the current profile
+                // would hand them back as this account's the next time the
+                // dialog opened.
+                this.endpointCache.set(this.endpointCacheKey(profileName, result.region || region), data);
 
                 // A permission gap on one service still leaves the others usable,
                 // so this is a note rather than a failure.
                 if (result.warnings && result.warnings.length) {
                     this.toast(`Some endpoints could not be listed: ${result.warnings.join('; ')}`, 'warning');
                 }
-                return { success: true, data };
+                return { success: true, data, region: result.region || null };
             }
 
-            if (result && result.sessionExpired) {
+            // Only the session the UI runs on can expire out from under it.
+            // Another account failing says nothing about this one.
+            if (result && result.sessionExpired && isCurrent) {
                 this.handleSessionExpired(result.error);
                 return { success: false, error: result.error };
             }

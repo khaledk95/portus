@@ -74,7 +74,7 @@ for them on startup and tells you what is missing.
 - **RDP over SSM** — auto port-forward tunnel + launches your RDP client (Windows-only instances)
 - **Port forwarding over SSM** — tunnel any TCP port to `localhost`, either on the instance itself or on a host it can reach (an RDS endpoint, for example), so you can use your own database or web client without a bastion or an inbound rule
 - **Instances with no SSM agent** — a row that cannot take a session of its own offers **Access via…** instead: pick a managed instance in the same VPC and Portus reaches the target through it, for Remote Desktop or any port. Nothing is installed on the target, and no keys are involved — for SSH, Portus opens the tunnel and you point your own `ssh` at the local port
-- **Endpoint discovery** — RDS, Aurora (writer endpoint), ElastiCache and EKS endpoints in the selected region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed
+- **Endpoint discovery** — RDS, Aurora (writer endpoint), ElastiCache and EKS endpoints in the selected region are listed in the port-forward dialog, with the real port filled in, so nothing has to be copied out of the AWS console — any other host can still be typed, and another account can be listed for something reachable over peering
 - **Private EKS clusters** — tunnel to a cluster's API server through an instance in its VPC, and Portus writes a kubeconfig and opens a terminal with `kubectl` pointed at it. Your own `~/.kube/config` is never touched. The cluster can be in a different account from the instance reaching it
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
 - **Startup preflight** — the AWS CLI and Session Manager plugin are checked at launch and anything missing is named up front, with its install command, rather than failing later mid-connect
@@ -164,13 +164,23 @@ one, or type any other host — the field accepts both.
 | PostgreSQL | RDS instances, and the **writer endpoint** of Aurora PostgreSQL clusters |
 | MySQL | RDS instances, and the **writer endpoint** of Aurora MySQL clusters |
 | Redis | ElastiCache primary / configuration endpoints, and standalone nodes |
-| Kubernetes | EKS cluster API servers — see [Private EKS clusters](#private-eks-clusters) |
+| EKS | EKS cluster API servers — see [Private EKS clusters](#private-eks-clusters) |
 
 The port comes from the endpoint itself rather than the service preset, so a database
 on a non-standard port connects without being corrected by hand.
 
 Every endpoint in the region is listed. Being listed does not mean the instance can
 reach it — the database's security group and route table still decide that.
+
+**Another account.** An instance can often reach a database in a different account
+over peering or a transit gateway, and that database is not in the list because your
+current credentials cannot see it. The **Look in account** row lists endpoints with
+another profile instead, so the address can be picked rather than typed.
+
+For a database or cache that is all it does: the tunnel needs a host and a port, and
+once it is up nothing refers to that account again. A cluster is the exception — the
+account chosen there is also written into the kubeconfig and used by every
+`aws eks get-token`, as described below.
 
 Open tunnels get their own **Tunnels** view in the sidebar, listing each one with its
 local address and a live uptime, where you can copy the address or disconnect. The
@@ -181,7 +191,7 @@ exits.
 
 A cluster with private endpoint access answers only on an address inside its VPC,
 so reaching it means going through an instance that already sits there — the same
-route a database takes. Pick **Kubernetes** in the port-forward dialog, choose the
+route a database takes. Pick **EKS** in the port-forward dialog, choose the
 cluster, and start the tunnel. Nothing needs installing on the instance.
 
 The tunnel alone is not enough. `kubectl` would be pointed at `localhost` while
@@ -217,10 +227,10 @@ than they would be inside the VPC.
 
 An instance in one account can often reach a cluster in another, and then the
 cluster is not in the list — your current credentials cannot see it. Choosing
-**Kubernetes** reveals a **Cluster account** row: pick the profile that owns the
-cluster, and the list is fetched with that profile instead. The region clears
-when you switch, so the cluster's own region is used rather than the instance's;
-set it explicitly if the profile's default is not the right one.
+**EKS** and setting the **Look in account** row to the profile that owns the
+cluster lists it with that profile instead. The region clears when you switch,
+so the cluster's own region is used rather than the instance's; set it
+explicitly if the profile's default is not the right one.
 
 The split that matters: the tunnel is opened with the **instance's** profile,
 while the kubeconfig and every `aws eks get-token` call use the **cluster's**.
@@ -664,7 +674,7 @@ ie4uinit.exe -show
 | Endpoint list is empty or missing a database | Your credentials lack the `rds:*` / `elasticache:*` describe actions, or the database is in another region. Type the host manually — nothing is blocked |
 | `kubectl` says the certificate is not valid for `localhost` | The kubeconfig lost its `tls-server-name`, or you are using your own config rather than the one Portus generated. Use the **kubectl** button, or point `KUBECONFIG` at the file it wrote |
 | `kubectl` reports `connection refused` on localhost | The tunnel is gone. Reopen it from the port dialog — the kubeconfig is rewritten and any terminal you left open picks it up |
-| No clusters listed under **Kubernetes** | Your credentials lack `eks:ListClusters` / `eks:DescribeCluster`, or the cluster is in another region or another account. For another account, pick it in the **Cluster account** row rather than typing the endpoint — a typed host gets a tunnel but no kubeconfig, so no kubectl button |
+| No clusters listed under **EKS** | Your credentials lack `eks:ListClusters` / `eks:DescribeCluster`, or the cluster is in another region or another account. For another account, pick it in the **Look in account** row rather than typing the endpoint — a typed host gets a tunnel but no kubeconfig, so no kubectl button |
 | Tunnel opens but no **kubectl** button | The host was typed rather than picked. Portus only knows a tunnel is a cluster when the cluster was chosen from the list, because that is where the name, CA and real endpoint come from |
 | `kubectl` cannot get a token | The terminal needs credentials `aws eks get-token` can use. Open it with the **kubectl** button rather than a fresh shell, so Portus passes them through |
 | Redis connects but the TLS handshake fails | The cluster has encryption in transit, and its certificate names the real host, not `localhost`. Point your client at the real SNI name or disable hostname verification |

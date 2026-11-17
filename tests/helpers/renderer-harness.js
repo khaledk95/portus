@@ -77,6 +77,7 @@ async function bootRenderer(options = {}) {
     forgotten: [],
     copied: [],
     endpointChecks: 0,
+    endpointLookups: [],
     updateChecks: 0,
     ssm: [],
     rdp: [],
@@ -160,6 +161,9 @@ async function bootRenderer(options = {}) {
     getEndpoints: async (p, region) => {
       calls.endpointChecks += 1;
       calls.endpointRegions.push(region);
+      // Which account was asked. Endpoint discovery can be pointed at another
+      // profile, for a database this instance reaches over peering.
+      calls.endpointLookups.push({ profileName: p, region: region || null });
       return state.endpointsResult
         || ({ success: true, data: state.endpoints, region, warnings: [] });
     },
