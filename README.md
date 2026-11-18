@@ -511,7 +511,9 @@ No `.env` or extra config files are required.
 # Normal launch
 npm start
 
-# Launch with DevTools open
+# Launch with DevTools open. A development run is exempt from the
+# single-instance lock and uses its own profile directory, so it can
+# run beside an installed Portus without disturbing it
 npm run dev
 
 # Run the test suite
@@ -613,6 +615,7 @@ All builds output to the `dist/` folder (git-ignored).
 │   ├── renderer.test.js   # The UI, driven through the real markup
 │   ├── ssm-inventory.test.js  # Paging the SSM inventory as deep as the instance list
 │   ├── linux-terminal.test.js  # Which terminal Linux opens, and that it is asked once
+│   ├── single-instance.test.js  # One Portus at a time, and the development exemption
 │   ├── hop-access.test.js  # Reaching an unmanaged instance through a managed one
 │   ├── window.test.js     # The application menu, the renderer sandbox, navigation guards
 │   └── run.js           # Runs every suite, one process each
@@ -691,6 +694,8 @@ ie4uinit.exe -show
 | Never told about a new release | The check is a single call to GitHub's public API, made at launch and then at most once a day, and it fails silently — offline, behind a proxy, or rate-limited all mean no notification. The [Releases page](https://github.com/khaledk95/portus/releases) is always authoritative |
 | The version badge stays after updating | It compares the last check against the running version, so installing the update clears it on the next launch. A failed check is never cached, so nothing is stuck for a day because of one bad moment |
 | Portus does not update itself | Deliberate. The builds are unsigned, so an auto-updater would be downloading and running something it cannot verify — worse than being told a release exists and fetching it yourself |
+| Launching Portus again does nothing visible | It is already running — the second launch raises the window you have rather than opening another. One copy at a time, because two would share a profile directory and quietly disagree about what is in it |
+| `Unable to move the cache` on startup | Another Portus already holds that profile directory. Chromium falls back to an in-memory cache and nothing is lost. A development run (`npm run dev`) uses its own directory, so it does not collide with an installed copy |
 
 ---
 

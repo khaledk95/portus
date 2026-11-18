@@ -494,7 +494,7 @@ function createWindow() {
     mainWindow.show();
   });
 
-  if (process.env.NODE_ENV === 'development' || process.argv.includes('--dev')) {
+  if (isDevRun()) {
     mainWindow.webContents.openDevTools();
   }
 }
@@ -3125,6 +3125,40 @@ function setupIpcHandlers() {
         ? `RDP tunnel established for ${instanceName} through ${via.instanceName || via.instanceId} on port ${localPort}.`
         : `RDP tunnel established for ${instanceName} on port ${localPort}.`
     };
+  });
+}
+
+// Run from a checkout, rather than installed.
+function isDevRun() {
+  return process.env.NODE_ENV === 'development' || process.argv.includes('--dev');
+}
+
+// One Portus at a time, because two share a profile directory.
+//
+// Everything Electron keeps per app — the Chromium caches, localStorage, the
+// persisted Microsoft session — lives in one directory keyed by the app name.
+// A second copy fights the first for the caches, which is where the
+// "Unable to move the cache" noise on startup came from, and the two disagree
+// about anything in localStorage: which release you dismissed, when the update
+// check last ran. Last writer wins, silently.
+//
+// A development run is exempt, and given its own directory. Running a checkout
+// beside the installed app is a normal thing to do while working on it, and
+// separating the two means testing cannot disturb the real app's state — or
+// read its Microsoft session.
+if (isDevRun()) {
+  app.setPath('userData', `${app.getPath('userData')}-dev`);
+} else if (!app.requestSingleInstanceLock()) {
+  // Nothing to clean up: the tunnels and kubeconfigs belong to the instance
+  // that holds the lock, and this one never opened any.
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    // Launching it again reads as "show me the one I have"
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
   });
 }
 

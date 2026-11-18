@@ -33,6 +33,11 @@ function startOn(platform) {
         whenReady: () => ({ then: (fn) => { readyCallback = fn; } }),
         on: () => {},
         getVersion: () => '0.0.0',
+        // One Portus at a time; this load always wins the lock, since the
+        // window is what these tests are about.
+        requestSingleInstanceLock: () => true,
+        getPath: () => '/portus-userData',
+        setPath: () => {},
         quit: () => {}
       },
       BrowserWindow: class {

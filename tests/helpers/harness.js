@@ -69,6 +69,9 @@ function loadMain(options = {}) {
     removed: [],         // every path removed
     dirs: [],            // every directory created
     appEvents: {},       // app.on handlers, so shutdown can be triggered
+    paths: {},           // whatever app.setPath was given
+    lockRequests: 0,     // how often the single-instance lock was asked for
+    quits: 0,            // app.quit() calls, e.g. a second instance standing down
     webContentsEvents: {}, // webContents.on handlers, e.g. the navigation guard
     windowOpenHandler: null // whatever setWindowOpenHandler was given
   };
@@ -89,8 +92,15 @@ function loadMain(options = {}) {
         on: (event, handler) => { (state.appEvents[event] = state.appEvents[event] || []).push(handler); },
         getVersion: () => require(path.join(APP_ROOT, 'package.json')).version,
         // Where the generated kubeconfigs live
-        getPath: (name) => `/portus-${name}`,
-        quit: () => {}
+        getPath: (name) => state.paths[name] || `/portus-${name}`,
+        setPath: (name, value) => { state.paths[name] = value; },
+        // One Portus at a time. A suite can refuse the lock to exercise the
+        // second-instance path, which otherwise never runs in a test.
+        requestSingleInstanceLock: () => {
+          state.lockRequests += 1;
+          return options.singleInstanceLock !== false;
+        },
+        quit: () => { state.quits += 1; }
       },
       BrowserWindow: class {
         constructor() {
