@@ -222,6 +222,13 @@ async function bootRenderer(options = {}) {
 
   const { window } = dom;
 
+  // Seeded before renderer.js runs, so a test can boot into a state a previous
+  // launch would have left behind — a release already dismissed, or an update
+  // check made earlier today.
+  for (const [key, value] of Object.entries(options.storage || {})) {
+    window.localStorage.setItem(key, value);
+  }
+
   // jsdom has no layout, so scrolling an element into view is not implemented.
   // The combobox calls it whenever the highlighted option moves.
   window.Element.prototype.scrollIntoView = function scrollIntoView() {};

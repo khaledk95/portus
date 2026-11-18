@@ -203,6 +203,104 @@ const openPortDialog = async (app, remote = true) => {
   }
 
   // ---------------------------------------------------------------------------
+  suite.section('a dismissed release is still visible as a badge');
+  // Dismissing used to end it: the update was invisible until a newer release
+  // came along, with nothing to click back to.
+  {
+    const update = {
+      available: true, current: '2.3.3', version: '2.4.0',
+      notes: 'line one\nline two',
+      url: 'https://github.com/khaledk95/portus/releases/tag/v2.4.0'
+    };
+    const app = await boot({ update });
+    const chip = () => app.document.querySelector('.js-app-version');
+
+    suite.check('the chip is marked while the dialog is up',
+      chip().classList.contains('has-update'), chip().className);
+
+    app.document.querySelector('#releaseOverlay [data-close]').click();
+    await settle(app.window);
+
+    suite.check('and stays marked after dismissing',
+      chip().classList.contains('has-update'), chip().className);
+    suite.check('it says which version, so the mark is not a mystery',
+      /2\.4\.0/.test(chip().getAttribute('title') || ''), chip().getAttribute('title'));
+    suite.check('and is reachable by keyboard',
+      chip().getAttribute('role') === 'button' && chip().getAttribute('tabindex') === '0');
+
+    chip().click();
+    await settle(app.window, 60);
+    suite.check('clicking it brings the notes back',
+      !!app.document.getElementById('releaseOverlay')
+        && /line one/.test(app.document.getElementById('releaseNotes').textContent));
+
+    // Reopening must not stack dialogs
+    chip().click();
+    await settle(app.window, 60);
+    suite.check('and does not open a second one',
+      app.document.querySelectorAll('#releaseOverlay').length === 1,
+      app.document.querySelectorAll('#releaseOverlay').length);
+
+    app.window.close();
+  }
+
+  {
+    // The cached answer outlives the version it was about. Trusting it would
+    // leave the badge on after the update it was telling you to install.
+    const app = await boot({ update: { available: true, current: '2.3.2', version: '2.0.0' } });
+    const chip = app.document.querySelector('.js-app-version');
+
+    suite.check('a release older than the one running is not badged',
+      !chip.classList.contains('has-update'), chip.className);
+    suite.check('and the chip stays inert',
+      !chip.getAttribute('role'), chip.getAttribute('role'));
+    app.window.close();
+  }
+
+  // ---------------------------------------------------------------------------
+  suite.section('the release check runs once a day, not once a launch');
+  {
+    const update = { available: true, current: '2.3.3', version: '2.4.0', notes: 'x' };
+
+    const first = await boot({ update });
+    suite.check('a cold start asks GitHub', first.calls.updateChecks === 1, first.calls.updateChecks);
+
+    const cached = JSON.parse(first.window.localStorage.getItem('portus.updateCheck'));
+    suite.check('and records what it found, with when',
+      cached && cached.result.version === '2.4.0' && typeof cached.checkedAt === 'number', cached);
+    first.window.close();
+
+    // A launch later the same day, carrying that storage forward
+    const soon = await boot({ update, storage: { 'portus.updateCheck': JSON.stringify({
+      checkedAt: Date.now() - 60 * 60 * 1000, result: update
+    }) } });
+    suite.check('a launch an hour later asks nothing',
+      soon.calls.updateChecks === 0, soon.calls.updateChecks);
+    suite.check('but still knows an update is waiting',
+      soon.document.querySelector('.js-app-version').classList.contains('has-update'));
+    soon.window.close();
+
+    const old = await boot({ update, storage: { 'portus.updateCheck': JSON.stringify({
+      checkedAt: Date.now() - 25 * 60 * 60 * 1000, result: update
+    }) } });
+    suite.check('a day later it asks again', old.calls.updateChecks === 1, old.calls.updateChecks);
+    old.window.close();
+
+    // A clock that moved backwards would otherwise read as fresh forever
+    const future = await boot({ update, storage: { 'portus.updateCheck': JSON.stringify({
+      checkedAt: Date.now() + 60 * 60 * 1000, result: update
+    }) } });
+    suite.check('a timestamp in the future is not treated as fresh',
+      future.calls.updateChecks === 1, future.calls.updateChecks);
+    future.window.close();
+
+    const broken = await boot({ update, storage: { 'portus.updateCheck': 'not json' } });
+    suite.check('and neither is unreadable storage',
+      broken.calls.updateChecks === 1, broken.calls.updateChecks);
+    broken.window.close();
+  }
+
+  // ---------------------------------------------------------------------------
   suite.section('the MFA prompt answers every way it can be closed');
   {
     const app = await boot();

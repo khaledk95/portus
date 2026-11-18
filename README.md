@@ -79,7 +79,7 @@ for them on startup and tells you what is missing.
 - **Active tunnel management** — see every open tunnel with its local port and uptime, disconnect from the UI, and have them torn down automatically when the app exits
 - **Startup preflight** — the AWS CLI and Session Manager plugin are checked at launch and anything missing is named up front, with its install command, rather than failing later mid-connect
 - **Session renewal** — Azure AD sessions are refreshed before they expire, without interrupting you. Identity Center needs a browser approval, so it is never renewed on a timer; you get a warning shortly before it lapses and sign in when you are ready
-- **Release notifications** — on launch, Portus checks whether a newer version has been published and shows it once, with what changed and a link to the release. It never downloads or installs anything
+- **Release notifications** — Portus checks once a day whether a newer version has been published and shows it once, with what changed and a link to the release. Dismissing it marks the version badge in the top bar instead, which reopens the notes when clicked. It never downloads or installs anything
 - **Light and dark themes**, a collapsible sidebar, an instance detail panel that closes on a click away or Escape, state/OS filters and `Ctrl K` search — the session countdown and open tunnel count stay visible in the status bar
 - Smart buttons: connect actions are only offered when Systems Manager can actually reach the instance, and RDP only on running Windows instances
 - Cross-platform: Windows, macOS, Linux — on Windows and Linux the stock Electron menu bar is removed, since Portus never used it
@@ -688,7 +688,9 @@ ie4uinit.exe -show
 | No profiles in the dropdown | Nothing readable in `~/.aws/config` or `~/.aws/credentials` |
 | A profile you just added is missing | Click **Refresh** in the dropdown (or in the Sign in dialog) — `~/.aws` is otherwise only read at startup |
 | App icon not updating (Windows) | Stale icon cache — run `ie4uinit.exe -show` or reinstall to a new path |
-| Never told about a new release | The check is a single call to GitHub's public API at launch and fails silently — offline, behind a proxy, or rate-limited all mean no notification. The [Releases page](https://github.com/khaledk95/portus/releases) is always authoritative |
+| Never told about a new release | The check is a single call to GitHub's public API, made at launch and then at most once a day, and it fails silently — offline, behind a proxy, or rate-limited all mean no notification. The [Releases page](https://github.com/khaledk95/portus/releases) is always authoritative |
+| The version badge stays after updating | It compares the last check against the running version, so installing the update clears it on the next launch. A failed check is never cached, so nothing is stuck for a day because of one bad moment |
+| Portus does not update itself | Deliberate. The builds are unsigned, so an auto-updater would be downloading and running something it cannot verify — worse than being told a release exists and fetching it yourself |
 
 ---
 

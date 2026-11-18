@@ -71,7 +71,7 @@ class Portus {
         // Started here rather than awaited, so a slow or unreachable GitHub
         // cannot hold the splash open. Whatever it finds is shown once the app
         // is on screen.
-        const updateCheck = window.electronAPI.checkForUpdate().catch(() => ({ available: false }));
+        const updateCheck = this.resolveUpdate();
 
         await this.loadProfiles();
 
@@ -91,13 +91,75 @@ class Portus {
         this.announceRelease(await updateCheck);
     }
 
+    // The release check, answered from the last one when it is recent enough.
+    //
+    // It used to call GitHub on every launch. Nothing published between two
+    // launches an hour apart is worth a network round trip each time, and on a
+    // machine with no route out it is a request that can only fail. A day is
+    // long enough to stay useful and short enough that nobody is left behind.
+    async resolveUpdate() {
+        const cached = this.readUpdateCache();
+        if (cached) return cached;
+
+        try {
+            const result = await window.electronAPI.checkForUpdate();
+            this.writeUpdateCache(result);
+            return result || { available: false };
+        } catch (error) {
+            // A failed check is not cached: the next launch should try again
+            // rather than inherit a day of silence from one bad moment.
+            return { available: false };
+        }
+    }
+
+    readUpdateCache() {
+        try {
+            const raw = localStorage.getItem('portus.updateCheck');
+            if (!raw) return null;
+
+            const cached = JSON.parse(raw);
+            if (!cached || typeof cached.checkedAt !== 'number') return null;
+
+            const age = Date.now() - cached.checkedAt;
+            // A clock that moved backwards makes `age` negative, which would
+            // otherwise pass as fresh forever
+            if (age < 0 || age > 24 * 60 * 60 * 1000) return null;
+
+            return cached.result || { available: false };
+        } catch (error) {
+            return null;   // unreadable or not JSON: check again
+        }
+    }
+
+    writeUpdateCache(result) {
+        try {
+            localStorage.setItem('portus.updateCheck', JSON.stringify({
+                checkedAt: Date.now(),
+                result: result || { available: false }
+            }));
+        } catch (error) { /* no storage: check every launch, as before */ }
+    }
+
     // Shown until it is dismissed, then not again for that version. Nothing is
     // downloaded: the link goes to the releases page and the user installs it
     // however they installed Portus in the first place.
     announceRelease(update) {
         if (!update || !update.available || !update.version) return;
+
+        // Kept whether or not the dialog is shown, so the badge outlives the
+        // dismissal and the notes stay reachable from it.
+        this.pendingUpdate = update;
+        this.renderUpdateBadge();
+
         if (this.releaseAlreadySeen(update.version)) return;
 
+        this.showReleaseDialog(update);
+    }
+
+    // Split from announceRelease so the badge can bring it back after it has
+    // been dismissed. Reopening deliberately does not re-check anything: it is
+    // showing what the last check found, which is what the badge is about.
+    showReleaseDialog(update) {
         const overlay = document.createElement('div');
         overlay.className = 'overlay';
         overlay.id = 'releaseOverlay';
@@ -155,6 +217,74 @@ class Portus {
         });
 
         setTimeout(() => overlay.querySelector('#releaseOpen').focus(), 50);
+    }
+
+    // Marks the version chip when a newer release exists.
+    //
+    // Dismissing the dialog used to be the end of it: the update was invisible
+    // until a newer release came along, and there was nothing to click back to.
+    // The badge is what survives the dismissal, which also makes a "remind me
+    // later" button unnecessary — the reminder is simply still there.
+    renderUpdateBadge() {
+        const update = this.pendingUpdate;
+        // The cached answer can outlive the version it was about. Comparing it
+        // against what is actually running is what stops the badge surviving
+        // the update it was telling you to install.
+        const stale = !update
+            || !update.version
+            || !this.isNewerVersion(update.version, this.appVersion);
+
+        document.querySelectorAll('.js-app-version').forEach(chip => {
+            chip.classList.toggle('has-update', !stale);
+
+            if (stale) {
+                chip.removeAttribute('title');
+                chip.removeAttribute('role');
+                chip.removeAttribute('tabindex');
+                return;
+            }
+
+            chip.title = `Portus ${update.version} is available — click for what changed`;
+            chip.setAttribute('role', 'button');
+            chip.setAttribute('tabindex', '0');
+        });
+
+        if (stale || this.updateBadgeBound) return;
+
+        // Bound once. The chip is never replaced, so re-binding on every render
+        // would stack handlers and open a dialog per launch-check.
+        this.updateBadgeBound = true;
+        document.querySelectorAll('.js-app-version').forEach(chip => {
+            const reopen = () => {
+                if (!this.pendingUpdate) return;
+                if (document.querySelector('.overlay')) return;   // already open
+                this.showReleaseDialog(this.pendingUpdate);
+            };
+            chip.addEventListener('click', reopen);
+            chip.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); reopen(); }
+            });
+        });
+    }
+
+    // Numeric compare, so 2.7.10 is newer than 2.7.9 rather than alphabetically
+    // older. Anything unparseable is treated as not newer: a badge shown by
+    // accident is worse than one missed, since it cannot be dismissed.
+    isNewerVersion(latest, current) {
+        if (!latest || !current) return false;
+
+        const parts = (value) => String(value).replace(/^v/, '').split('.').map(Number);
+        const a = parts(latest);
+        const b = parts(current);
+
+        if (a.some(Number.isNaN) || b.some(Number.isNaN)) return false;
+
+        for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+            const left = a[i] || 0;
+            const right = b[i] || 0;
+            if (left !== right) return left > right;
+        }
+        return false;
     }
 
     releaseAlreadySeen(version) {
@@ -231,6 +361,9 @@ class Portus {
         try {
             const version = await window.electronAPI.getAppVersion();
             if (!version) return;
+            // Kept, so a cached update can be re-checked against what is
+            // actually running rather than trusted from storage
+            this.appVersion = version;
             document.querySelectorAll('.js-app-version').forEach(el => { el.textContent = `v${version}`; });
         } catch (error) { /* keep the placeholder in the markup */ }
     }

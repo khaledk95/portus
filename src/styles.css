@@ -138,6 +138,20 @@ button { cursor: pointer; }
   border: 1px solid var(--border); border-radius: 3px; padding: 1px 5px;
 }
 
+/* A newer release exists and the dialog has been dismissed. The chip already
+   says which version is running, so marking it says "that one is behind"
+   without adding any furniture to the top bar. */
+.brand-version.has-update {
+  color: var(--accent); border-color: var(--accent); cursor: pointer;
+}
+.brand-version.has-update::after {
+  content: ""; display: inline-block; vertical-align: middle;
+  width: 5px; height: 5px; margin-left: 5px; border-radius: 50%;
+  background: var(--accent);
+}
+.brand-version.has-update:hover { background: var(--accent-soft); }
+.brand-version.has-update:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 .search { flex: 1; max-width: 420px; position: relative; }
 .search > i {
   position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
