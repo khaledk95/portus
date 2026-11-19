@@ -2023,11 +2023,11 @@ class Portus {
             { label: 'SQL Server', port: 1433, service: 'sqlserver' },
             { label: 'PostgreSQL', port: 5432, service: 'postgresql' },
             { label: 'MySQL', port: 3306, service: 'mysql' },
-            { label: 'Redis', port: 6379, service: 'redis' },
-            // Labelled EKS because that is what it finds. The key stays
-            // 'kubernetes' — it is what endpoint discovery tags clusters with,
-            // and renaming it would mean renaming the engine mapping too.
-            { label: 'EKS', port: 443, service: 'kubernetes' }
+            { label: 'Redis', port: 6379, service: 'redis' }
+            // No EKS preset: clusters have their own view, which knows the
+            // cluster's VPC and so can pick the instance to reach it through.
+            // This dialog could only offer a tunnel, and a cluster reached
+            // without a kubeconfig is a tunnel with no kubectl behind it.
         ];
 
         const overlay = document.createElement('div');
@@ -2141,10 +2141,6 @@ class Portus {
         // cached on the instance so reopening the dialog does not re-query AWS.
         let loadState = 'idle';       // idle | loading | ready | error
         let loadError = '';
-        // Set when a discovered EKS cluster is picked, cleared the moment the host
-        // is edited by hand: a typed host is not the cluster we described.
-        let chosenKubernetes = null;
-
         // Set only when the thing being reached was found in a different account
         // or region from the instance opening the tunnel; null means this one,
         // and the single account case behaves exactly as before.
@@ -2197,14 +2193,9 @@ class Portus {
             loadState = 'loading';
             renderList();
 
-            // Another account is listed with that account's credentials. For a
-            // cluster that means EKS alone — asking for databases in an account
-            // someone picked to find a cluster in is a column of AccessDenied
-            // warnings about things they were not looking for.
+            // Another account is listed with that account's own credentials
             const result = clusterSource
-                ? (activeService() === 'kubernetes'
-                    ? await this.loadClusters(clusterSource.profileName, clusterSource.region)
-                    : await this.loadEndpoints(clusterSource.profileName, clusterSource.region))
+                ? await this.loadEndpoints(clusterSource.profileName, clusterSource.region)
                 : await this.loadEndpoints();
             if (!overlay.isConnected) return;   // dialog closed while in flight
 
@@ -2242,6 +2233,11 @@ class Portus {
             }
 
             matches = endpoints.filter(e => {
+                // Discovery still returns clusters; they belong to the EKS view,
+                // which can write a kubeconfig for one. Picking a cluster here
+                // would give a tunnel and no kubectl, which is the gap this
+                // dialog used to leave.
+                if (e.service === 'kubernetes') return false;
                 if (service && e.service !== service) return false;
                 if (!term) return true;
                 return e.name.toLowerCase().includes(term) || e.host.toLowerCase().includes(term);
@@ -2301,13 +2297,6 @@ class Portus {
 
         const selectEndpoint = (endpoint) => {
             host.value = endpoint.host;
-
-            // The cluster carries the account it was listed from, so the
-            // kubeconfig is written and tokened against that one rather than
-            // against whichever profile happens to own the instance.
-            chosenKubernetes = endpoint.kubernetes
-                ? { ...endpoint.kubernetes, ...(clusterSource || {}) }
-                : null;
 
             // The port the API reported wins over the service preset — a database
             // on a non-standard port is otherwise silently wrong.
@@ -2370,9 +2359,6 @@ class Portus {
 
         host.addEventListener('focus', () => openPanel());
         host.addEventListener('input', () => {
-            // Typing means the host is no longer the cluster that was picked, so
-            // no kubeconfig should be written for whatever it is now.
-            chosenKubernetes = null;
             if (!panelOpen) openPanel(); else renderList();
         });
         host.addEventListener('blur', () => closePanel());
@@ -2401,13 +2387,11 @@ class Portus {
         const clusterRegion = overlay.querySelector('#pfClusterRegion');
         const clusterNote = overlay.querySelector('#pfClusterNote');
 
-        // What the chosen account is actually used for is not the same for a
-        // cluster as for a database, and saying so is the difference between a
-        // field people understand and one they guess at.
+        // What the chosen account is for, which is not obvious: it finds the
+        // address and nothing else. Clusters, where the account outlives
+        // discovery, are the EKS view's business now.
         const renderAccountNote = () => {
-            clusterNote.textContent = activeService() === 'kubernetes'
-                ? 'The cluster can be in a different account from the instance reaching it. The tunnel stays on this instance; the kubeconfig and eks get-token use the account chosen here.'
-                : 'Lists endpoints from another account, for something this instance can reach over peering. Only used to find the address — the tunnel itself is unchanged.';
+            clusterNote.textContent = 'Lists endpoints from another account, for something this instance can reach over peering. Only used to find the address — the tunnel itself is unchanged.';
         };
 
         const syncClusterSource = () => {
@@ -2422,7 +2406,6 @@ class Portus {
 
             // The list came from somewhere else, so it has to be fetched again
             endpoints = [];
-            chosenKubernetes = null;
             loadState = 'idle';
             ensureEndpoints();
         };
@@ -2451,17 +2434,6 @@ class Portus {
 
                 renderAccountNote();
 
-                // Clusters and databases are listed by different calls, so a
-                // list fetched from another account for one service cannot be
-                // filtered into the other. Switching service refetches.
-                if (clusterSource) {
-                    endpoints = [];
-                    chosenKubernetes = null;
-                    loadState = 'idle';
-                    ensureEndpoints();
-                    return;
-                }
-
                 renderList();   // the chip is also the endpoint filter
             });
         });
@@ -2482,8 +2454,7 @@ class Portus {
 
             const result = await this.startPortForward(instanceId, name, {
                 remoteHost, remotePort: remote.value.trim(), localPort: local.value.trim(),
-                region: this.currentRegion,
-                ...(chosenKubernetes ? { kubernetes: chosenKubernetes } : {})
+                region: this.currentRegion
             });
 
             if (result && result.success) {
