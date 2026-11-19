@@ -21,7 +21,12 @@ const {
   DescribeReplicationGroupsCommand,
   DescribeCacheClustersCommand
 } = require('@aws-sdk/client-elasticache');
-const { EKSClient, ListClustersCommand, DescribeClusterCommand } = require('@aws-sdk/client-eks');
+const {
+  EKSClient,
+  ListClustersCommand,
+  DescribeClusterCommand,
+  DescribeClusterVersionsCommand
+} = require('@aws-sdk/client-eks');
 const { STSClient, AssumeRoleWithSAMLCommand, AssumeRoleCommand } = require('@aws-sdk/client-sts');
 const { fromIni } = require('@aws-sdk/credential-providers');
 const azureSaml = require('./azure-saml');
@@ -1985,6 +1990,50 @@ const REGION_NAMES = {
 // DescribeCluster per cluster is the only way to get an endpoint, and the list
 // is normally short. One that fails is skipped rather than losing the rest; a
 // cluster being deleted mid-listing should not empty the dialog.
+// How long each Kubernetes version is supported, keyed by version.
+//
+// One call for the whole region rather than one per cluster: the answer is
+// about the version, not the cluster. AWS reports where a version stands —
+// standard support, extended support, or past both — and the dates each window
+// ends, which is the part worth knowing before an upgrade is urgent.
+//
+// Optional. Without `eks:DescribeClusterVersions` the clusters still list; they
+// simply do not say how long their version has left.
+async function eksVersionSupport(eks, onWarning) {
+  const support = new Map();
+
+  try {
+    let nextToken;
+    let page = 0;
+
+    do {
+      const response = await eks.send(new DescribeClusterVersionsCommand({ nextToken }));
+
+      for (const version of response.clusterVersions || []) {
+        if (!version.clusterVersion) continue;
+        support.set(version.clusterVersion, {
+          // `status` is the deprecated spelling of the same thing
+          status: version.versionStatus || version.status || null,
+          standardSupportEnds: version.endOfStandardSupportDate
+            ? new Date(version.endOfStandardSupportDate).toISOString()
+            : null,
+          extendedSupportEnds: version.endOfExtendedSupportDate
+            ? new Date(version.endOfExtendedSupportDate).toISOString()
+            : null
+        });
+      }
+
+      nextToken = response.nextToken;
+      page += 1;
+    } while (nextToken && page < MAX_PAGES);
+  } catch (error) {
+    if (isCredentialsError(error) && !isAuthorizationError(error)) throw error;
+    onWarning(`EKS version support: ${describeDeniedAction(error)}`);
+  }
+
+  return support;
+}
+
 async function listEksClusters(eks, onWarning) {
   const listed = [];
   const clusters = [];
@@ -1997,6 +2046,9 @@ async function listEksClusters(eks, onWarning) {
     nextToken = response.nextToken;
     page += 1;
   } while (nextToken && page < MAX_PAGES);
+
+  // Asked once for the region, and only when there is a cluster to describe
+  const support = listed.length ? await eksVersionSupport(eks, onWarning) : new Map();
 
   for (const name of listed) {
     try {
@@ -2025,6 +2077,13 @@ async function listEksClusters(eks, onWarning) {
         // is a worse answer than saying so.
         endpointPublicAccess: vpcConfig.endpointPublicAccess !== false,
         endpointPrivateAccess: vpcConfig.endpointPrivateAccess === true,
+        // Where this version stands and when each support window closes. Null
+        // when the permission to ask is missing — the cluster still lists.
+        support: support.get(cluster.version) || null,
+        // What happens at the end of standard support: EXTENDED to carry on
+        // paying for it, STANDARD to be upgraded automatically. A choice, not
+        // a state, so it is kept apart from the support window above.
+        supportPolicy: (cluster.upgradePolicy || {}).supportType || null,
         // Marks it as more than a host: the renderer offers the kubectl flow for
         // these, and the tunnel writes a kubeconfig. The CA stays here — it is
         // re-read when the file is written, so nothing large crosses to the

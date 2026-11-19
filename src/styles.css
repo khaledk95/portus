@@ -520,7 +520,11 @@ td.actions { text-align: left; }
 }
 .kv:last-child { border-bottom: none; }
 .kv dt { color: var(--text-dim); flex: none; }
-.kv dd { text-align: right; word-break: break-all; }
+/* Values here are either an unbreakable token — an instance id, an endpoint
+   host — or a few words of prose. break-all suited the first and mangled the
+   second, splitting "support" across lines. `anywhere` breaks inside a word
+   only when the word cannot fit, so prose still wraps at its spaces. */
+.kv dd { text-align: right; overflow-wrap: anywhere; }
 .tag {
   display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 3px;
   border: 1px solid var(--border); color: var(--text-muted); margin: 2px 3px 0 0;
@@ -682,6 +686,20 @@ td.actions { text-align: left; }
 /* The hop picker sits inside a table row, so it has to be the height of the
    text beside it rather than of a form field. */
 .input-sm { font-size: 11.5px; padding: 2px 6px; max-width: 220px; }
+
+/* A cluster's nodes, in the detail panel. Not a table: the panel is narrow and
+   each node is a name with a verdict and two buttons, which reads better
+   stacked than squeezed into columns. */
+.node-list { display: flex; flex-direction: column; gap: 6px; }
+.node {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--surface-2);
+}
+.node-main { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.node-name { font-weight: 600; font-size: 12.5px; }
+.node-meta { font-size: 11px; color: var(--text-dim); }
+.node-side { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 
 .chips { display: flex; flex-wrap: wrap; gap: 5px; }
 .chip {

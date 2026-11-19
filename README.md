@@ -132,9 +132,10 @@ is installed on the target.
 **7. EKS** — every cluster the selected account can see, with what can be done
 about each. **Connect** picks the instance to reach it through, tunnels, writes
 the kubeconfig and leaves a **kubectl** button on the row. A public cluster is
-told it needs no tunnel; one mid-update is unavailable.
+told it needs no tunnel; one mid-update is unavailable. Selecting a cluster
+shows its support dates and the instances tagged as its nodes.
 
-![The EKS view listing clusters with their version, status, endpoint access and the instance each would be reached through](screenshots/07-eks.png)
+![The EKS view listing clusters with version, support window, status and endpoint access, with a cluster selected showing its support dates and nodes](screenshots/07-eks.png)
 
 ---
 
@@ -199,9 +200,15 @@ exits.
 ### Private EKS clusters
 
 Clusters have their own **EKS** view in the sidebar, listing what the selected
-account can see in the chosen region: name, version, status, and whether the API
-endpoint is private, public, or both. Each row says what can be done with that
-cluster rather than offering the same button regardless.
+account can see in the chosen region: name, version, how long that version is
+supported, status, and whether the API endpoint is private, public, or both.
+Each row says what can be done with that cluster rather than offering the same
+button regardless.
+
+Selecting a cluster opens a panel with the rest: both support dates, what
+happens when standard support ends, and the instances tagged as its nodes. A
+node offers the same actions it would in the instance list — a shell, a port
+forward — because it is the same instance, filtered to this cluster.
 
 **Connect** does the whole thing in one click — picks an instance to reach the
 cluster through, opens the tunnel, writes the kubeconfig — and the row then
@@ -218,6 +225,21 @@ on the row changes the choice.
 Rows that cannot usefully be connected say why: a cluster answering on the public
 internet needs no tunnel, one mid-update is unavailable, and one with no managed
 instance anywhere has no route.
+
+**Support period** is the window the cluster's Kubernetes version is in, read
+from AWS rather than from a calendar kept here: standard support, extended
+support, or past both, with the date the current window closes. A version
+already in extended support counts down to the end of *that*, since the
+standard date is behind it. It needs `eks:DescribeClusterVersions`; without it
+the clusters still list and the column reads `—` rather than guessing.
+
+**Nodes** are matched on the `eks:cluster-name` tag, which is what EKS puts on
+managed node groups. It is the only signal available without talking to the
+Kubernetes API, and it undercounts: self-managed nodes often carry nothing, and
+some provisioners use their own tags. The panel says "tagged" rather than
+claiming a node count, and a cluster with no matches says nothing was tagged
+rather than that it has no nodes. Nodes of a cluster in another account are not
+listed at all — they are in that account, and the instance list is this one's.
 
 The account and region at the top of the view are independent of the sidebar, so
 a cluster in another account is listed with that account's credentials while the
@@ -331,7 +353,8 @@ since most people never do.
 | `ssm:TerminateSession` / `ssm:ResumeSession` | Closing your own sessions cleanly |
 | `rds:DescribeDBInstances` / `rds:DescribeDBClusters` | Suggesting database endpoints in **Forward a port** |
 | `elasticache:DescribeReplicationGroups` / `elasticache:DescribeCacheClusters` | Suggesting Redis endpoints in **Forward a port** |
-| `eks:ListClusters` / `eks:DescribeCluster` | Listing EKS clusters in **Forward a port**, and writing the kubeconfig. Optional — without them, no clusters are suggested. For a cluster in another account, these are needed on the profile that owns it, not on the one opening the tunnel |
+| `eks:DescribeClusterVersions` | The **Support** column: how long the cluster's version is supported. Optional — without it the clusters list and the column is empty |
+| `eks:ListClusters` / `eks:DescribeCluster` | Listing EKS clusters in the **EKS** view and in **Forward a port**, and writing the kubeconfig. Optional — without them, no clusters are suggested. For a cluster in another account, these are needed on the profile that owns it, not on the one opening the tunnel |
 | `sts:AssumeRole` | Only for `role_arn` profiles — the target role's trust policy has to allow the profile it chains from |
 
 If your policy restricts `ssm:StartSession` by resource, it must also allow the
@@ -715,6 +738,8 @@ ie4uinit.exe -show
 | `kubectl` reports `connection refused` on localhost | The tunnel is gone. Reopen it from the port dialog — the kubeconfig is rewritten and any terminal you left open picks it up |
 | The **EKS** view lists nothing | Those credentials lack `eks:ListClusters` / `eks:DescribeCluster`, or the account and region at the top of the view are not where the cluster lives. They are independent of the sidebar |
 | A cluster shows **No route** | No running SSM-managed instance in the listed account at all. The tunnel has to run on something |
+| The **Support** column is empty | Those credentials lack `eks:DescribeClusterVersions`. It is a separate permission from listing clusters, and only the column depends on it |
+| A cluster's node list looks short | Nodes are found by the `eks:cluster-name` tag that EKS puts on managed node groups. Self-managed nodes and some provisioners do not carry it, so the panel says "tagged" rather than claiming a count |
 | A hop is marked **unverified** | Nothing you can see sits in that cluster's VPC, which is normal for a cluster in another account reached over peering. Portus cannot confirm the instance reaches it, so it offers rather than promises. If Connect times out, pick a different hop |
 | No clusters listed under **EKS** | Your credentials lack `eks:ListClusters` / `eks:DescribeCluster`, or the cluster is in another region or another account. For another account, pick it in the **Look in account** row rather than typing the endpoint — a typed host gets a tunnel but no kubeconfig, so no kubectl button |
 | Tunnel opens but no **kubectl** button | The host was typed rather than picked. Portus only knows a tunnel is a cluster when the cluster was chosen from the list, because that is where the name, CA and real endpoint come from |

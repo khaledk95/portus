@@ -21,6 +21,7 @@ class Portus {
         // Which instance to tunnel through, when the automatic choice was
         // overridden for a particular cluster
         this.hopOverrides = new Map();
+        this.selectedClusterName = null;
 
         // Managed endpoints suggested in the port forwarding dialog, keyed by
         // profile and region — the same account holds different databases in
@@ -428,8 +429,9 @@ class Portus {
                 if (overlay) { overlay.remove(); return; }
                 if (this.comboOpen) { this.closeCombo(); return; }
                 // Last, so Escape closes whatever is most on top: a dialog, then
-                // an open combo, then the detail panel underneath both.
+                // an open combo, then whichever detail panel is open underneath.
                 this.clearInstanceSelection();
+                this.clearClusterSelection();
             }
         });
 
@@ -451,6 +453,16 @@ class Portus {
             if (e.target.closest('.overlay')) return;
 
             this.clearInstanceSelection();
+        }, true);
+
+        // The cluster panel closes the same way, for the same reasons
+        document.addEventListener('click', (e) => {
+            if (!this.selectedClusterName) return;
+            if (e.target.closest('#clusterDetail')) return;
+            if (e.target.closest('#clusterTableWrap tbody tr')) return;
+            if (e.target.closest('.overlay')) return;
+
+            this.clearClusterSelection();
         }, true);
     }
 
@@ -2672,6 +2684,29 @@ class Portus {
         return candidates.find(candidate => candidate.instanceId === chosen) || candidates[0];
     }
 
+    // The instances that are nodes of this cluster.
+    //
+    // Matched on the tag EKS puts on managed node groups. It is the only signal
+    // available without talking to the Kubernetes API, and it is not complete:
+    // self-managed nodes often carry nothing, and other provisioners use their
+    // own tags. So this is "nodes Portus can see", never a count to rely on.
+    nodesForCluster(cluster) {
+        if (!cluster) return [];
+
+        return this.instances
+            .filter(item => (item.tags || []).some(tag =>
+                tag.key === 'eks:cluster-name' && tag.value === cluster.name))
+            .sort((a, b) => String(a.instanceName || a.instanceId)
+                .localeCompare(String(b.instanceName || b.instanceId)));
+    }
+
+    // Nodes live in the cluster's account. When the tab is pointed somewhere
+    // other than the sidebar, the instance list is the wrong account's and
+    // there is nothing honest to show.
+    nodesAreVisible() {
+        return this.clusterSource().profileName === this.currentProfile;
+    }
+
     // An open tunnel to this cluster, if there is one
     tunnelForCluster(cluster) {
         return (this.tunnels || []).find(tunnel =>
@@ -2688,6 +2723,8 @@ class Portus {
         this.clusterError = null;
         this.clusterRegion = null;
         this.hopOverrides.clear();
+        this.selectedClusterName = null;
+        this.renderClusterDetail(null);
 
         const picker = document.getElementById('eksProfile');
         const region = document.getElementById('eksRegion');
@@ -2768,7 +2805,7 @@ class Portus {
         const table = document.createElement('table');
         table.innerHTML = `
             <thead><tr>
-                <th>Name</th><th>Version</th><th>Status</th>
+                <th>Name</th><th>Version</th><th>Support</th><th>Status</th>
                 <th>Endpoint</th><th>Through</th><th>Actions</th>
             </tr></thead>
         `;
@@ -2839,25 +2876,39 @@ class Portus {
         row.innerHTML = `
             <td class="name-cell">${this.copyableCell(cluster.name)}</td>
             <td class="muted">${this.escapeHtml(cluster.engineVersion || '—')}</td>
+            <td>${this.clusterSupportCell(cluster)}</td>
             <td>${this.clusterStateCell(cluster.status)}</td>
             <td>${endpoint}</td>
             <td>${through}</td>
             <td class="actions"><div class="row-actions">${actions}</div></td>
         `;
 
+        if (cluster.name === this.selectedClusterName) row.classList.add('selected');
+        row.addEventListener('click', () => this.selectCluster(cluster.name));
+
         const hopPicker = row.querySelector('[data-hop]');
         if (hopPicker) {
             hopPicker.addEventListener('change', () => {
                 this.hopOverrides.set(cluster.name, hopPicker.value);
             });
+            // Choosing a hop is not choosing the row; without this the panel
+            // opens underneath every time the dropdown is touched.
+            hopPicker.addEventListener('click', (e) => e.stopPropagation());
         }
 
+        // Acting on a row is not selecting it, the same as the instance list
         const connect = row.querySelector('[data-connect]');
-        if (connect) connect.addEventListener('click', () => this.connectCluster(cluster, connect));
+        if (connect) {
+            connect.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.connectCluster(cluster, connect);
+            });
+        }
 
         const kubectl = row.querySelector('[data-kubectl]');
         if (kubectl) {
-            kubectl.addEventListener('click', async () => {
+            kubectl.addEventListener('click', async (e) => {
+                e.stopPropagation();
                 const open = this.tunnelForCluster(cluster);
                 if (open) await this.openKubectl(open.id);
             });
@@ -2865,9 +2916,10 @@ class Portus {
 
         const disconnect = row.querySelector('[data-disconnect]');
         if (disconnect) {
-            disconnect.addEventListener('click', async () => {
+            disconnect.addEventListener('click', async (e) => {
+                e.stopPropagation();
                 const open = this.tunnelForCluster(cluster);
-                if (open) await this.closeTunnel(open.id);
+                if (open) await this.closeTunnel(open.id, cluster.name);
             });
         }
 
@@ -2879,6 +2931,188 @@ class Portus {
         });
 
         return row;
+    }
+
+    selectCluster(name) {
+        this.selectedClusterName = name;
+        this.renderClusters();
+        this.renderClusterDetail(this.clusters.find(cluster => cluster.name === name) || null);
+    }
+
+    clearClusterSelection() {
+        if (!this.selectedClusterName) return;
+        this.selectedClusterName = null;
+        this.renderClusters();
+        this.renderClusterDetail(null);
+    }
+
+    renderClusterDetail(cluster) {
+        const panel = document.getElementById('clusterDetail');
+        const split = document.getElementById('clustersSplit');
+        if (!panel || !split) return;
+
+        if (!cluster) {
+            panel.style.display = 'none';
+            split.classList.add('no-detail');
+            return;
+        }
+
+        panel.style.display = 'flex';
+        split.classList.remove('no-detail');
+
+        document.getElementById('clusterDetailTitle').textContent = cluster.name;
+        document.getElementById('clusterDetailHost').textContent = cluster.host || '';
+
+        const rows = (pairs) => pairs.map(([k, v]) =>
+            `<div class="kv"><dt>${k}</dt><dd>${v}</dd></div>`).join('');
+
+        const access = cluster.endpointPublicAccess && cluster.endpointPrivateAccess
+            ? 'Public and private'
+            : (cluster.endpointPublicAccess ? 'Public' : 'Private');
+
+        const nodes = this.nodesForCluster(cluster);
+        const visible = this.nodesAreVisible();
+
+        let nodeSection;
+        if (!visible) {
+            nodeSection = `<p class="dialog-note">Nodes live in ${this.escapeHtml(this.clusterSource().profileName)},
+                and the instance list belongs to ${this.escapeHtml(this.currentProfile || 'this account')}.
+                Switch the account in the sidebar to see them.</p>`;
+        } else if (!nodes.length) {
+            // Saying "none" here would be a claim Portus cannot make
+            nodeSection = `<p class="dialog-note">No instance carries this cluster's
+                <span class="mono">eks:cluster-name</span> tag. Managed node groups are tagged;
+                self-managed nodes and some provisioners are not, so the cluster may still have nodes.</p>`;
+        } else {
+            nodeSection = `<div class="node-list">${nodes.map(node => `
+                <div class="node" data-node="${this.escapeHtml(node.instanceId)}">
+                    <div class="node-main">
+                        <span class="node-name">${this.escapeHtml(node.instanceName || node.instanceId)}</span>
+                        <span class="node-meta mono">${this.escapeHtml(node.privateIp || '—')}</span>
+                    </div>
+                    <div class="node-side">
+                        ${this.ssmCell(node)}
+                        <div class="row-actions">${this.nodeActions(node)}</div>
+                    </div>
+                </div>`).join('')}</div>`;
+        }
+
+        document.getElementById('clusterDetailBody').innerHTML = `
+            <div class="detail-group">Cluster</div>
+            <dl>${rows([
+                ['Status', this.clusterStateCell(cluster.status)],
+                ['Version', this.escapeHtml(cluster.engineVersion || '—')],
+                ['Support', this.clusterSupportCell(cluster)],
+                ['Endpoint', this.escapeHtml(access)],
+                ['VPC', `<span class="mono">${this.escapeHtml(cluster.vpcId || '—')}</span>`],
+                ['Port', `<span class="mono">${this.escapeHtml(String(cluster.port || 443))}</span>`]
+            ])}</dl>
+
+            ${this.supportDetail(cluster)}
+
+            <div class="detail-group">Nodes${visible && nodes.length ? ` · ${nodes.length} tagged` : ''}</div>
+            ${nodeSection}
+        `;
+
+        // The node rows offer the same actions an instance row does, against
+        // the same instance — it is in the list, just filtered to this cluster.
+        document.getElementById('clusterDetailBody')
+            .querySelectorAll('button[data-action]').forEach(button => {
+                button.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const node = this.instances.find(item => item.instanceId === button.dataset.node);
+                    if (node) this.runAction(button.dataset.action, node);
+                });
+            });
+    }
+
+    // The same rules the instance row uses, so a node offers what that instance
+    // would offer anywhere else.
+    nodeActions(node) {
+        const running = node.state === 'running';
+        const isWindows = (node.platform || '').toLowerCase().includes('windows');
+        const connectable = running && (node.ssmStatus === 'online' || node.ssmStatus === 'unknown');
+        const id = this.escapeHtml(node.instanceId);
+
+        if (!running) return '<button class="act" disabled title="Instance is not running">Stopped</button>';
+
+        if (connectable) {
+            return `
+                <button class="act primary" data-action="ssm" data-node="${id}">SSM</button>
+                ${isWindows ? `<button class="act" data-action="rdp" data-node="${id}">RDP</button>` : ''}
+                <button class="act" data-action="port" data-node="${id}">Port</button>`;
+        }
+
+        const blocked = this.escapeHtml(this.ssmBlockReason(node.ssmStatus));
+        return node.privateIp && this.hopCandidatesFor(node).length
+            ? `<button class="act" data-action="via" data-node="${id}" title="${blocked}">Access via…</button>`
+            : `<button class="act" disabled title="${blocked}">No SSM</button>`;
+    }
+
+    // Where this cluster's version stands, and how long that lasts.
+    //
+    // The window that matters is the one it is in: a version in standard
+    // support is counted down to the end of standard support, one already in
+    // extended support to the end of that. Past both, there is nothing to count.
+    clusterSupportCell(cluster) {
+        const support = cluster.support;
+        if (!support || !support.status) return '<span class="dim">—</span>';
+
+        const status = String(support.status).toUpperCase();
+
+        if (status === 'UNSUPPORTED') {
+            return '<span class="state"><span class="dot bad"></span>Unsupported</span>';
+        }
+
+        const extended = status === 'EXTENDED_SUPPORT';
+        const ends = extended ? support.extendedSupportEnds : support.standardSupportEnds;
+        const label = extended ? 'Extended' : 'Standard';
+        const dot = extended ? 'warn' : 'ok';
+
+        const until = ends
+            ? `<span class="muted"> · ${this.escapeHtml(this.supportDate(ends))}</span>`
+            : '';
+
+        return `<span class="state"><span class="dot ${dot}"></span>${label}</span>${until}`;
+    }
+
+    // The panel has room for both dates and for what happens at the end of
+    // standard support, which the column does not.
+    supportDetail(cluster) {
+        const support = cluster.support;
+        if (!support || !support.status) {
+            return `<p class="dialog-note">How long this version is supported could not be read.
+                It needs <span class="mono">eks:DescribeClusterVersions</span>.</p>`;
+        }
+
+        const rows = [];
+        if (support.standardSupportEnds) {
+            rows.push(['Standard support ends', this.escapeHtml(this.supportDate(support.standardSupportEnds))]);
+        }
+        if (support.extendedSupportEnds) {
+            rows.push(['Extended support ends', this.escapeHtml(this.supportDate(support.extendedSupportEnds))]);
+        }
+
+        // A choice the cluster carries, not a state it is in: EXTENDED keeps it
+        // on the old version and charges for it, STANDARD lets AWS upgrade it.
+        if (cluster.supportPolicy) {
+            rows.push(['At end of standard', cluster.supportPolicy === 'EXTENDED'
+                ? 'Enters extended support'
+                : 'Upgraded automatically']);
+        }
+
+        if (!rows.length) return '';
+
+        return `
+            <div class="detail-group">Support period</div>
+            <dl>${rows.map(([k, v]) => `<div class="kv"><dt>${k}</dt><dd>${v}</dd></div>`).join('')}</dl>`;
+    }
+
+    // Short and unambiguous across locales: a day, a short month, a year.
+    supportDate(value) {
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return '';
+        return date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
     }
 
     clusterStateCell(status) {

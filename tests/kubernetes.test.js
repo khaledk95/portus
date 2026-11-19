@@ -49,6 +49,8 @@ const CA = 'LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUMrRkFLRQotLS0tLUVORA==';
 // Two clusters, one of which cannot be described — a cluster being deleted
 // mid-listing must not empty the dialog for the others.
 let describeFailsFor = null;
+// Set by the test that checks clusters still list without the version permission
+let versionsDenied = false;
 
 // Which credentials and region each EKS call was made with. A cluster in
 // another account is described with that account's profile, and asserting it
@@ -77,6 +79,25 @@ const eksStub = {
         return { clusters: ['platform-prod', 'platform-sandbox'] };
       }
 
+      // One answer for the whole region: support is a property of the
+      // Kubernetes version, not of a cluster.
+      if (command.constructor.name === 'DescribeClusterVersionsCommand') {
+        if (versionsDenied) {
+          throw Object.assign(new Error('User is not authorized to perform: eks:DescribeClusterVersions'),
+            { name: 'AccessDeniedException' });
+        }
+        return {
+          clusterVersions: [
+            { clusterVersion: '1.31', versionStatus: 'STANDARD_SUPPORT',
+              endOfStandardSupportDate: new Date('2027-03-23T00:00:00Z'),
+              endOfExtendedSupportDate: new Date('2028-03-23T00:00:00Z') },
+            { clusterVersion: '1.28', versionStatus: 'EXTENDED_SUPPORT',
+              endOfStandardSupportDate: new Date('2025-11-26T00:00:00Z'),
+              endOfExtendedSupportDate: new Date('2026-11-26T00:00:00Z') }
+          ]
+        };
+      }
+
       if (input.name === describeFailsFor) {
         throw Object.assign(new Error('User is not authorized to perform: eks:DescribeCluster'),
           { name: 'AccessDeniedException' });
@@ -103,7 +124,8 @@ const eksStub = {
     }
   },
   ListClustersCommand: class { constructor(input) { this.input = input; } },
-  DescribeClusterCommand: class { constructor(input) { this.input = input; } }
+  DescribeClusterCommand: class { constructor(input) { this.input = input; } },
+  DescribeClusterVersionsCommand: class { constructor(input) { this.input = input; } }
 };
 
 const { handlers, state, ready } = loadMain({
@@ -477,6 +499,40 @@ const { handlers, state, ready } = loadMain({
   suite.check('the endpoint host still comes through for the tunnel',
     prod.host === 'ABCD1234P.gr7.eu-west-1.eks.amazonaws.com' && prod.port === 443,
     { host: prod.host, port: prod.port });
+
+  // -------------------------------------------------------------------------
+  suite.section('how long the version is supported comes with the cluster');
+  // Support belongs to the Kubernetes version, so it is one call for the region
+  // joined onto each cluster — not a call per cluster.
+
+  suite.check('the support window is attached',
+    prod.support && prod.support.status === 'STANDARD_SUPPORT', prod.support);
+  suite.check('with the date standard support ends',
+    prod.support.standardSupportEnds.startsWith('2027-03-23'), prod.support.standardSupportEnds);
+  suite.check('and the date extended support ends',
+    prod.support.extendedSupportEnds.startsWith('2028-03-23'), prod.support.extendedSupportEnds);
+  suite.check('joined by version, not guessed',
+    prod.engineVersion === '1.31', prod.engineVersion);
+
+  // -------------------------------------------------------------------------
+  suite.section('clusters still list without permission to read support');
+  // It is an extra permission, and losing it should cost the support column
+  // rather than the whole tab.
+
+  versionsDenied = true;
+  const withoutVersions = await handlers.get('list-clusters')({}, 'keys-only', 'eu-west-1');
+  versionsDenied = false;
+
+  suite.check('the listing still succeeds', withoutVersions.success === true, withoutVersions.error);
+  suite.check('the clusters are all there',
+    (withoutVersions.data || []).length === (listed.data || []).length,
+    (withoutVersions.data || []).length);
+  suite.check('they simply carry no support window',
+    (withoutVersions.data || []).every(cluster => cluster.support === null),
+    (withoutVersions.data || []).map(c => c.support));
+  suite.check('and the gap is reported rather than swallowed',
+    (withoutVersions.warnings || []).some(warning => /version support/i.test(warning)),
+    withoutVersions.warnings);
 
   suite.done();
 })();

@@ -217,11 +217,22 @@
                     </button>
                     <span class="count" id="clusterCount"></span>
                 </div>
-                <div class="table-wrap" id="clusterTableWrap">
-                    <div class="empty">
-                        <i class="fas fa-dharmachakra"></i>
-                        <p>Choose a profile to list clusters.</p>
+                <!-- no-detail until a cluster is selected, as with the instances -->
+                <div class="split no-detail" id="clustersSplit">
+                    <div class="table-wrap" id="clusterTableWrap">
+                        <div class="empty">
+                            <i class="fas fa-dharmachakra"></i>
+                            <p>Choose a profile to list clusters.</p>
+                        </div>
                     </div>
+
+                    <aside class="detail" id="clusterDetail" style="display:none;">
+                        <div class="detail-head">
+                            <div class="detail-title" id="clusterDetailTitle"></div>
+                            <div class="detail-sub mono" id="clusterDetailHost"></div>
+                        </div>
+                        <div class="detail-body" id="clusterDetailBody"></div>
+                    </aside>
                 </div>
             </div>
 

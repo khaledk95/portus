@@ -1211,6 +1211,10 @@ const openPortDialog = async (app, remote = true) => {
     const sent = app.calls.forwardTargets[app.calls.forwardTargets.length - 1];
     suite.check('connecting runs the tunnel on the chosen hop',
       sent && sent.instanceId === 'i-0node0000000001', sent);
+    // Acting on a row is not selecting it — otherwise the detail panel opens
+    // behind every Connect
+    suite.check('and does not open the detail panel behind it',
+      app.portus.selectedClusterName === null, app.portus.selectedClusterName);
     suite.check('pointed at the cluster endpoint on 443',
       sent.options.remoteHost === 'ABCD1234P.gr7.eu-central-1.eks.amazonaws.com'
         && String(sent.options.remotePort) === '443',
@@ -1351,6 +1355,223 @@ const openPortDialog = async (app, remote = true) => {
 
     suite.check('switching account re-asks for that account\'s regions',
       app.calls.regionLookups.includes('other'), app.calls.regionLookups);
+
+    app.window.close();
+  }
+
+  {
+    // Selecting a cluster shows what is behind it: the facts, and the instances
+    // tagged as its nodes, each offering what that instance offers anywhere.
+    const app = await boot({
+      profiles: [profile('keys'), profile('other', { region: 'eu-west-1' })],
+      instances: [
+        instance({ instanceName: 'node-a', instanceId: 'i-0node0000000001',
+          privateIp: '10.0.2.11', tags: [{ key: 'eks:cluster-name', value: 'platform-prod' }] }),
+        instance({ instanceName: 'node-b', instanceId: 'i-0node0000000002',
+          privateIp: '10.0.2.12', ssmStatus: 'unmanaged',
+          tags: [{ key: 'eks:cluster-name', value: 'platform-prod' }] }),
+        // Tagged for a different cluster, so not this one's business
+        instance({ instanceName: 'other-node', instanceId: 'i-0node0000000003',
+          tags: [{ key: 'eks:cluster-name', value: 'data-prod' }] }),
+        instance({ instanceName: 'plain-box', instanceId: 'i-0plain000000001' })
+      ],
+      clusters: [CLUSTER(), CLUSTER({ id: 'eks:bare', name: 'bare',
+        kubernetes: { clusterName: 'bare' } })]
+    });
+    await pick(app, 'keys');
+
+    app.document.querySelector('.nav-item[data-view="eks"]').click();
+    await settle(app.window, 250);
+
+    const panel = () => app.document.getElementById('clusterDetail');
+    const body = () => app.document.getElementById('clusterDetailBody');
+    const rowFor = (name) => [...app.document.querySelectorAll('#clusterTableWrap tbody tr')]
+      .find(tr => tr.textContent.includes(name));
+
+    suite.check('no panel until a cluster is picked',
+      panel().style.display === 'none', panel().style.display);
+
+    rowFor('platform-prod').click();
+    await settle(app.window, 120);
+
+    suite.check('selecting one opens it',
+      panel().style.display !== 'none', panel().style.display);
+    suite.check('headed by the cluster and its endpoint',
+      app.document.getElementById('clusterDetailTitle').textContent === 'platform-prod'
+        && /eks\.amazonaws\.com/.test(app.document.getElementById('clusterDetailHost').textContent),
+      app.document.getElementById('clusterDetailHost').textContent);
+    suite.check('carrying the facts the table has no room for',
+      /vpc-123/.test(body().textContent) && /1\.31/.test(body().textContent),
+      body().textContent.replace(/\s+/g, ' ').slice(0, 120));
+
+    const nodeNames = [...body().querySelectorAll('.node .node-name')].map(el => el.textContent.trim());
+    suite.check('its own nodes are listed', nodeNames.join(',') === 'node-a,node-b', nodeNames);
+    suite.check('another cluster\'s node is not', !nodeNames.includes('other-node'), nodeNames);
+    suite.check('nor an instance that is no cluster\'s node',
+      !nodeNames.includes('plain-box'), nodeNames);
+    suite.check('and the count says what it counted',
+      /2 tagged/.test(body().textContent),
+      (body().textContent.match(/Nodes[^\n]*/) || [])[0]);
+
+    // A node offers exactly what that instance offers in the instance list
+    const first = [...body().querySelectorAll('.node')][0];
+    suite.check('a reachable node offers a shell',
+      !!first.querySelector('[data-action="ssm"]'), first.textContent.trim());
+
+    const second = [...body().querySelectorAll('.node')][1];
+    suite.check('an unmanaged node offers the way in it has',
+      !!second.querySelector('[data-action="via"]'), second.textContent.trim());
+
+    first.querySelector('[data-action="ssm"]').click();
+    await settle(app.window, 80);
+    suite.check('and the action runs against that instance',
+      app.calls.ssm[app.calls.ssm.length - 1].id === 'i-0node0000000001', app.calls.ssm);
+
+    // Nothing tagged is not the same as no nodes, and saying "none" would be a
+    // claim Portus cannot make
+    rowFor('bare').click();
+    await settle(app.window, 120);
+    suite.check('a cluster with nothing tagged explains itself',
+      /eks:cluster-name/.test(body().textContent)
+        && !body().querySelector('.node'),
+      body().textContent.replace(/\s+/g, ' ').slice(0, 140));
+
+    // Closing, the same two ways the instance panel closes
+    app.document.getElementById('clusterCount').click();
+    await settle(app.window, 80);
+    suite.check('clicking away closes it',
+      panel().style.display === 'none' && app.portus.selectedClusterName === null,
+      app.portus.selectedClusterName);
+
+    rowFor('platform-prod').click();
+    await settle(app.window, 100);
+    app.document.dispatchEvent(new app.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await settle(app.window, 80);
+    suite.check('Escape closes it too',
+      app.portus.selectedClusterName === null, app.portus.selectedClusterName);
+
+    app.window.close();
+  }
+
+  {
+    // How long the version is supported, in the table and in the panel. The
+    // window that counts is the one the version is in.
+    const app = await boot({
+      instances: [instance({ instanceName: 'bastion-01', instanceId: 'i-0hop00000000001' })],
+      clusters: [
+        CLUSTER({ engineVersion: '1.31', support: {
+          status: 'STANDARD_SUPPORT',
+          standardSupportEnds: '2027-03-23T00:00:00.000Z',
+          extendedSupportEnds: '2028-03-23T00:00:00.000Z'
+        }, supportPolicy: 'EXTENDED' }),
+        CLUSTER({ id: 'eks:old', name: 'old-cluster', kubernetes: { clusterName: 'old-cluster' },
+          engineVersion: '1.28', support: {
+            status: 'EXTENDED_SUPPORT',
+            standardSupportEnds: '2025-11-26T00:00:00.000Z',
+            extendedSupportEnds: '2026-11-26T00:00:00.000Z'
+          }, supportPolicy: 'STANDARD' }),
+        CLUSTER({ id: 'eks:dead', name: 'past-it', kubernetes: { clusterName: 'past-it' },
+          engineVersion: '1.24', support: { status: 'UNSUPPORTED',
+            standardSupportEnds: null, extendedSupportEnds: null } }),
+        CLUSTER({ id: 'eks:unknown', name: 'no-permission', kubernetes: { clusterName: 'no-permission' },
+          engineVersion: '1.31', support: null })
+      ]
+    });
+    await pick(app, 'keys');
+
+    app.document.querySelector('.nav-item[data-view="eks"]').click();
+    await settle(app.window, 250);
+
+    const header = [...app.document.querySelectorAll('#clusterTableWrap thead th')]
+      .map(th => th.textContent.trim());
+    suite.check('Support sits right after Version',
+      header[1] === 'Version' && header[2] === 'Support', header);
+
+    const rowFor = (name) => [...app.document.querySelectorAll('#clusterTableWrap tbody tr')]
+      .find(tr => tr.textContent.includes(name));
+    const supportCell = (name) => rowFor(name).children[2].textContent.replace(/\s+/g, ' ').trim();
+
+    suite.check('a supported version counts down to the end of standard support',
+      /Standard/.test(supportCell('platform-prod')) && /23 Mar 2027/.test(supportCell('platform-prod')),
+      supportCell('platform-prod'));
+    // Already in extended support, so the standard date is behind it and the
+    // extended one is what is left
+    suite.check('one in extended support counts down to the end of that',
+      /Extended/.test(supportCell('old-cluster')) && /26 Nov 2026/.test(supportCell('old-cluster')),
+      supportCell('old-cluster'));
+    suite.check('a version past both says so, with no date to count to',
+      /Unsupported/.test(supportCell('past-it')) && !/\d{4}/.test(supportCell('past-it')),
+      supportCell('past-it'));
+    suite.check('and one that could not be read shows nothing rather than guessing',
+      supportCell('no-permission') === '—', supportCell('no-permission'));
+
+    // The panel has room for both dates and for what happens at the end
+    rowFor('platform-prod').click();
+    await settle(app.window, 120);
+    const body = app.document.getElementById('clusterDetailBody').textContent.replace(/\s+/g, ' ');
+
+    suite.check('the panel gives both dates',
+      /Standard support ends\s*23 Mar 2027/.test(body) && /Extended support ends\s*23 Mar 2028/.test(body),
+      body.slice(0, 220));
+    suite.check('and says this cluster will enter extended support',
+      /At end of standard\s*Enters extended support/.test(body), body.slice(0, 260));
+
+    rowFor('old-cluster').click();
+    await settle(app.window, 120);
+    suite.check('while one set to upgrade says that instead',
+      /At end of standard\s*Upgraded automatically/.test(
+        app.document.getElementById('clusterDetailBody').textContent.replace(/\s+/g, ' ')));
+
+    rowFor('no-permission').click();
+    await settle(app.window, 120);
+    suite.check('a cluster with no support data names the permission it needs',
+      /eks:DescribeClusterVersions/.test(app.document.getElementById('clusterDetailBody').textContent));
+
+    // Detail values are either an unbreakable token — an instance id, an
+    // endpoint host — or a few words of prose. break-all suited the first and
+    // split the second mid-word ("Enters extended su / pport"), which only
+    // showed once the panel narrowed to 250px below 1180px wide.
+    //
+    // Checked against the stylesheet source, not the rendered page: jsdom does
+    // no layout and does not fetch the stylesheet, so there is nothing to
+    // measure. It guards the rule from being changed back, not the pixels.
+    const css = require('fs').readFileSync(
+      require('path').join(__dirname, '..', 'src', 'styles.css'), 'utf8');
+    const valueRule = (css.match(/\.kv dd \{[^}]*\}/) || [''])[0];
+
+    suite.check('a detail value breaks inside a word only when it has to',
+      /overflow-wrap:\s*anywhere/.test(valueRule) && !/word-break:\s*break-all/.test(valueRule),
+      valueRule);
+
+    app.window.close();
+  }
+
+  {
+    // Nodes belong to the cluster's account. Pointed elsewhere, the instance
+    // list is the wrong account's and there is nothing honest to show.
+    const app = await boot({
+      profiles: [profile('keys'), profile('other', { region: 'eu-west-1' })],
+      instances: [instance({ instanceName: 'node-a', instanceId: 'i-0node0000000001',
+        tags: [{ key: 'eks:cluster-name', value: 'platform-prod' }] })],
+      clusters: [CLUSTER()]
+    });
+    await pick(app, 'keys');
+
+    app.document.querySelector('.nav-item[data-view="eks"]').click();
+    await settle(app.window, 250);
+
+    const picker = app.document.getElementById('eksProfile');
+    picker.value = 'other';
+    picker.dispatchEvent(new app.window.Event('change', { bubbles: true }));
+    await settle(app.window, 300);
+
+    app.document.querySelector('#clusterTableWrap tbody tr').click();
+    await settle(app.window, 120);
+
+    const body = app.document.getElementById('clusterDetailBody');
+    suite.check('a cluster in another account says why its nodes are missing',
+      /Nodes live in other/.test(body.textContent) && !body.querySelector('.node'),
+      body.textContent.replace(/\s+/g, ' ').slice(0, 160));
 
     app.window.close();
   }
