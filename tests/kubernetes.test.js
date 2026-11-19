@@ -89,7 +89,15 @@ const eksStub = {
           endpoint: `https://ABCD1234${input.name === 'platform-prod' ? 'P' : 'S'}.gr7.eu-west-1.eks.amazonaws.com`,
           version: '1.31',
           status: 'ACTIVE',
-          certificateAuthority: { data: CA }
+          certificateAuthority: { data: CA },
+          // What the EKS tab needs to offer a hop: an instance has to be in
+          // this VPC to reach a private endpoint at all. platform-prod is
+          // private, platform-sandbox answers publicly too.
+          resourcesVpcConfig: {
+            vpcId: 'vpc-0a1b2c3d',
+            endpointPublicAccess: input.name === 'platform-sandbox',
+            endpointPrivateAccess: true
+          }
         }
       };
     }
@@ -444,6 +452,31 @@ const { handlers, state, ready } = loadMain({
   }
 
   closeAll();
+
+  // -------------------------------------------------------------------------
+  suite.section('listing clusters carries what the EKS tab decides with');
+  // Without the VPC there is no way to work out which instance could reach the
+  // cluster, and the tab falls back to asking. Without the endpoint flags it
+  // offers a tunnel to a cluster that answers on the public internet.
+
+  const listed = await handlers.get('list-clusters')({}, 'keys-only', 'eu-west-1');
+  suite.check('the listing succeeds', listed.success === true, listed.error);
+
+  const prod = (listed.data || []).find(cluster => cluster.name === 'platform-prod');
+  suite.check('the cluster is there', !!prod, (listed.data || []).map(c => c.name));
+  suite.check('with the VPC its API server answers inside',
+    prod.vpcId === 'vpc-0a1b2c3d', prod && prod.vpcId);
+  suite.check('and a private endpoint is reported as private',
+    prod.endpointPublicAccess === false && prod.endpointPrivateAccess === true,
+    { public: prod.endpointPublicAccess, private: prod.endpointPrivateAccess });
+
+  const sandbox = (listed.data || []).find(cluster => cluster.name === 'platform-sandbox');
+  suite.check('a publicly reachable cluster is reported as such',
+    sandbox && sandbox.endpointPublicAccess === true, sandbox && sandbox.endpointPublicAccess);
+
+  suite.check('the endpoint host still comes through for the tunnel',
+    prod.host === 'ABCD1234P.gr7.eu-west-1.eks.amazonaws.com' && prod.port === 443,
+    { host: prod.host, port: prod.port });
 
   suite.done();
 })();

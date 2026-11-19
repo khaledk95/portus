@@ -1123,6 +1123,276 @@ const openPortDialog = async (app, remote = true) => {
       sent.kubernetes);
   }
 
+  // ---------------------------------------------------------------------------
+  suite.section('the EKS tab lists clusters and connects to one');
+  // Reaching a cluster used to mean knowing which instance sat in its VPC and
+  // going through the port dialog. The tab knows the VPC, so it can work the
+  // hop out — that is the whole point of it.
+
+  const CLUSTER = (over = {}) => ({
+    id: 'eks:platform-prod', name: 'platform-prod',
+    host: 'ABCD1234P.gr7.eu-central-1.eks.amazonaws.com',
+    port: 443, service: 'kubernetes', kind: 'EKS cluster',
+    engineVersion: '1.31', status: 'ACTIVE', tls: true,
+    vpcId: 'vpc-123', endpointPublicAccess: false, endpointPrivateAccess: true,
+    kubernetes: { clusterName: 'platform-prod' }, ...over
+  });
+
+  {
+    const app = await boot({
+      instances: [
+        instance({ instanceName: 'bastion-01', instanceId: 'i-0hop00000000001' }),
+        instance({ instanceName: 'eks-node-01', instanceId: 'i-0node0000000001',
+          tags: [{ key: 'eks:cluster-name', value: 'platform-prod' }] }),
+        // Right account, wrong VPC: it cannot reach the endpoint
+        instance({ instanceName: 'other-vpc', instanceId: 'i-0other000000001', vpcId: 'vpc-999' })
+      ],
+      clusters: [
+        CLUSTER(),
+        CLUSTER({ id: 'eks:sandbox', name: 'sandbox', kubernetes: { clusterName: 'sandbox' },
+          endpointPublicAccess: true, endpointPrivateAccess: false }),
+        CLUSTER({ id: 'eks:legacy', name: 'legacy', kubernetes: { clusterName: 'legacy' },
+          status: 'UPDATING' }),
+        CLUSTER({ id: 'eks:lonely', name: 'lonely', kubernetes: { clusterName: 'lonely' },
+          vpcId: 'vpc-nothing-here' })
+      ]
+    });
+    await pick(app, 'keys');
+
+    suite.check('nothing is listed before the tab is opened',
+      app.calls.clusterLookups.length === 0, app.calls.clusterLookups);
+
+    app.document.querySelector('.nav-item[data-view="eks"]').click();
+    await settle(app.window, 250);
+
+    suite.check('opening it lists them, from the selected account',
+      app.calls.clusterLookups.length === 1
+        && app.calls.clusterLookups[0].profileName === 'keys',
+      app.calls.clusterLookups);
+    suite.check('and the sidebar counts them',
+      app.document.getElementById('navClusterCount').textContent === '4',
+      app.document.getElementById('navClusterCount').textContent);
+
+    const rowFor = (name) => [...app.document.querySelectorAll('#clusterTableWrap tbody tr')]
+      .find(tr => tr.textContent.includes(name));
+
+    // A node of the cluster is the safest hop: right VPC by definition, and
+    // already talking to the API server
+    const hops = [...rowFor('platform-prod').querySelectorAll('[data-hop] option')]
+      .map(option => option.textContent.trim());
+    suite.check('a node of the cluster is offered first',
+      /eks-node-01/.test(hops[0]) && /node/.test(hops[0]), hops);
+    suite.check('an instance in another VPC is not offered at all',
+      !hops.some(label => /other-vpc/.test(label)), hops);
+
+    suite.check('a public cluster is not offered a tunnel it does not need',
+      /No tunnel needed/.test(rowFor('sandbox').textContent), rowFor('sandbox').textContent.trim());
+    suite.check('a cluster mid-update cannot be connected to',
+      /Unavailable/.test(rowFor('legacy').textContent), rowFor('legacy').textContent.trim());
+    // Nothing is in that cluster's VPC. That is not "no route" — a cluster in
+    // another account is reached over peering, so the instance carrying it is
+    // in a different VPC by definition, and that is the case this tab exists
+    // to make easy. Candidates are offered, marked as unchecked.
+    suite.check('a cluster in no known VPC still offers the managed instances',
+      !!rowFor('lonely').querySelector('[data-hop]')
+        && !!rowFor('lonely').querySelector('[data-connect]'),
+      rowFor('lonely').textContent.replace(/\s+/g, ' ').trim());
+    suite.check('and says the route could not be checked',
+      /unverified/.test(rowFor('lonely').textContent),
+      rowFor('lonely').textContent.replace(/\s+/g, ' ').trim());
+    suite.check('while a cluster with instances in its own VPC says nothing of the sort',
+      !/unverified/.test(rowFor('platform-prod').textContent),
+      rowFor('platform-prod').textContent.replace(/\s+/g, ' ').trim());
+
+    // Connect: one click, no dialog
+    rowFor('platform-prod').querySelector('[data-connect]').click();
+    await settle(app.window, 150);
+
+    const sent = app.calls.forwardTargets[app.calls.forwardTargets.length - 1];
+    suite.check('connecting runs the tunnel on the chosen hop',
+      sent && sent.instanceId === 'i-0node0000000001', sent);
+    suite.check('pointed at the cluster endpoint on 443',
+      sent.options.remoteHost === 'ABCD1234P.gr7.eu-central-1.eks.amazonaws.com'
+        && String(sent.options.remotePort) === '443',
+      sent.options);
+    suite.check('and marked as the cluster, so a kubeconfig is written',
+      sent.options.kubernetes && sent.options.kubernetes.clusterName === 'platform-prod'
+        && sent.options.kubernetes.profileName === 'keys',
+      sent.options.kubernetes);
+
+    // Overriding the hop is the escape hatch for a wrong guess
+    const picker = rowFor('platform-prod').querySelector('[data-hop]');
+    picker.value = 'i-0hop00000000001';
+    picker.dispatchEvent(new app.window.Event('change', { bubbles: true }));
+    await settle(app.window, 60);
+
+    rowFor('platform-prod').querySelector('[data-connect]').click();
+    await settle(app.window, 150);
+
+    const overridden = app.calls.forwardTargets[app.calls.forwardTargets.length - 1];
+    suite.check('a hop chosen by hand is the one used',
+      overridden.instanceId === 'i-0hop00000000001', overridden.instanceId);
+
+    app.window.close();
+  }
+
+  {
+    // Switching account in the sidebar replaces the instance list, and the hop
+    // offered for a cluster comes from that list. If the cluster table was
+    // drawn while the previous account's instances were still loaded, it went
+    // on offering them — a hop from the account you just left.
+    const app = await boot({
+      profiles: [profile('keys'), profile('other', { region: 'eu-west-1' })],
+      instances: [instance({ instanceName: 'account-x-box', instanceId: 'i-0xxx00000000001' })],
+      clusters: [CLUSTER({ vpcId: 'vpc-123' })]
+    });
+    await pick(app, 'keys');
+
+    app.document.querySelector('.nav-item[data-view="eks"]').click();
+    await settle(app.window, 250);
+
+    const hopLabels = () => [...app.document.querySelectorAll('#clusterTableWrap tbody tr [data-hop] option')]
+      .map(option => option.textContent.trim());
+
+    suite.check('the first account\'s instance is offered',
+      hopLabels().some(label => /account-x-box/.test(label)), hopLabels());
+
+    // The instance list arriving after the cluster table was drawn is the real
+    // sequence: listing clusters is one call, listing instances is that plus
+    // the SSM inventory, so the slower one lands second and the table was
+    // already on screen offering whatever was loaded before it.
+    app.state.instances = [instance({ instanceName: 'account-y-box', instanceId: 'i-0yyy00000000001' })];
+    await app.portus.loadInstances();
+    await settle(app.window, 200);
+
+    app.document.querySelector('.nav-item[data-view="eks"]').click();
+    await settle(app.window, 200);
+
+    suite.check('after switching account, its own instances are offered',
+      hopLabels().some(label => /account-y-box/.test(label)), hopLabels());
+    suite.check('and the account that was left is gone from the list',
+      !hopLabels().some(label => /account-x-box/.test(label)), hopLabels());
+
+    app.window.close();
+  }
+
+  {
+    // Changing account reloads the instance list, but that is not a request to
+    // go and look at it. Being thrown back to Instances from wherever you were,
+    // every time the account changed, is the opposite of helpful.
+    const app = await boot({
+      profiles: [profile('keys'), profile('other', { region: 'eu-west-1' })],
+      clusters: [CLUSTER()]
+    });
+    await pick(app, 'keys');
+
+    app.document.querySelector('.nav-item[data-view="eks"]').click();
+    await settle(app.window, 250);
+    suite.check('the EKS tab is open', app.portus.view === 'eks', app.portus.view);
+
+    await pick(app, 'other');
+    await settle(app.window, 400);
+    suite.check('changing account leaves you where you were',
+      app.portus.view === 'eks', app.portus.view);
+
+    app.document.querySelector('.nav-item[data-view="tunnels"]').click();
+    await settle(app.window, 80);
+    await pick(app, 'keys');
+    await settle(app.window, 400);
+    suite.check('from Tunnels too', app.portus.view === 'tunnels', app.portus.view);
+
+    app.window.close();
+  }
+
+  {
+    // The region is per account, so it is picked from what that account has
+    // enabled rather than typed, and starts on the one its profile names.
+    // us-east-1 is deliberately not the first option, so landing on it proves
+    // the profile's own region is used rather than whatever heads the list.
+    const app = await boot({
+      profiles: [profile('keys', { region: 'us-east-1' }), profile('other', { region: 'eu-west-1' })],
+      clusters: [CLUSTER()],
+      regions: [
+        { name: 'eu-central-1', label: 'Frankfurt' },
+        { name: 'eu-west-1', label: 'Ireland' },
+        { name: 'us-east-1', label: 'N. Virginia' }
+      ]
+    });
+    await pick(app, 'keys');
+
+    app.document.querySelector('.nav-item[data-view="eks"]').click();
+    await settle(app.window, 300);
+
+    const region = () => app.document.getElementById('eksRegion');
+    suite.check('the region is a picker, not a text box',
+      region().tagName === 'SELECT', region().tagName);
+    suite.check('listing every region the account has enabled',
+      [...region().options].map(o => o.value).join(',') === 'eu-central-1,eu-west-1,us-east-1',
+      [...region().options].map(o => o.value));
+    suite.check('named by city as well as code',
+      /Frankfurt/.test(region().options[0].textContent), region().options[0].textContent);
+    suite.check('and starting on the profile\'s own region',
+      region().value === 'us-east-1', region().value);
+
+    // Choosing one re-lists against it
+    region().value = 'eu-west-1';
+    region().dispatchEvent(new app.window.Event('change', { bubbles: true }));
+    await settle(app.window, 250);
+
+    const lookup = app.calls.clusterLookups[app.calls.clusterLookups.length - 1];
+    suite.check('a chosen region is what the clusters are listed in',
+      lookup && lookup.region === 'eu-west-1', lookup);
+
+    // Pointing the tab at another account rebuilds the list for that account
+    const picker = app.document.getElementById('eksProfile');
+    picker.value = 'other';
+    picker.dispatchEvent(new app.window.Event('change', { bubbles: true }));
+    await settle(app.window, 300);
+
+    suite.check('switching account re-asks for that account\'s regions',
+      app.calls.regionLookups.includes('other'), app.calls.regionLookups);
+
+    app.window.close();
+  }
+
+  {
+    // Once a tunnel exists the row offers what you do with it, not Connect again
+    const app = await boot({
+      instances: [instance({ instanceName: 'bastion-01', instanceId: 'i-0hop00000000001' })],
+      clusters: [CLUSTER()],
+      tunnels: [{
+        id: 't1', kind: 'port', instanceId: 'i-0hop00000000001', instanceName: 'bastion-01',
+        profileName: 'keys', port: 6443,
+        remoteHost: 'ABCD1234P.gr7.eu-central-1.eks.amazonaws.com', remotePort: 443,
+        startedAt: Date.now(), target: null,
+        kubernetes: { clusterName: 'platform-prod', kubeconfig: '/k/platform-prod.yaml' }
+      }]
+    });
+    await pick(app, 'keys');
+
+    app.document.querySelector('.nav-item[data-view="eks"]').click();
+    await settle(app.window, 250);
+
+    const row = app.document.querySelector('#clusterTableWrap tbody tr');
+    suite.check('an open tunnel turns Connect into kubectl',
+      !!row.querySelector('[data-kubectl]') && !row.querySelector('[data-connect]'),
+      row.textContent.trim());
+
+    row.querySelector('[data-kubectl]').click();
+    await settle(app.window, 80);
+    suite.check('which opens a terminal for that tunnel',
+      app.calls.kubectlTerminals[app.calls.kubectlTerminals.length - 1] === 't1',
+      app.calls.kubectlTerminals);
+
+    row.querySelector('[data-disconnect]').click();
+    await settle(app.window, 80);
+    suite.check('and Disconnect closes it',
+      app.calls.closedTunnels[app.calls.closedTunnels.length - 1] === 't1',
+      app.calls.closedTunnels);
+
+    app.window.close();
+  }
+
   suite.done();
 })().catch(error => {
   console.error('\n  the suite threw:', error && error.stack);

@@ -84,6 +84,7 @@ async function bootRenderer(options = {}) {
     ssm: [],
     rdp: [],
     closedTunnels: [],
+    kubectlTerminals: [],
     regionLookups: [],
     // Every cross-account cluster listing, so a test can assert which account
     // was asked and in which region
@@ -194,6 +195,13 @@ async function bootRenderer(options = {}) {
       calls.forwards.push(opts);
       calls.forwardTargets.push({ instanceId: id, name, options: opts });
       return { success: true, port: 50001, tunnelId: 't1' };
+    },
+
+    // Which tunnel a kubectl terminal was asked for. Both the tunnel row and
+    // the cluster row offer it, against the same tunnel.
+    openKubectlTerminal: async (tunnelId) => {
+      calls.kubectlTerminals.push(tunnelId);
+      return { success: true, message: 'kubectl is pointed at the cluster' };
     },
 
     listTunnels: async () => state.tunnels,

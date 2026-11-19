@@ -128,6 +128,11 @@
                     <span class="nav-text">Instances</span>
                     <span class="badge" id="navInstanceCount">0</span>
                 </button>
+                <button type="button" class="nav-item" data-view="eks" data-label="EKS">
+                    <i class="fas fa-dharmachakra"></i>
+                    <span class="nav-text">EKS</span>
+                    <span class="badge" id="navClusterCount">0</span>
+                </button>
                 <button type="button" class="nav-item" data-view="tunnels" data-label="Tunnels">
                     <i class="fas fa-plug"></i>
                     <span class="nav-text">Tunnels</span>
@@ -196,6 +201,27 @@
                         <div class="detail-body" id="detailBody"></div>
                         <div class="detail-actions" id="detailActions"></div>
                     </aside>
+                </div>
+            </div>
+
+            <!-- ===== EKS VIEW ===== -->
+            <div class="view" id="viewEks" style="display:none;">
+                <div class="toolbar">
+                    <span class="view-title">Clusters</span>
+                    <div class="cluster-source">
+                        <select class="input" id="eksProfile" aria-label="Account to list clusters from"></select>
+                        <select class="input" id="eksRegion" aria-label="Region to list clusters in"></select>
+                    </div>
+                    <button type="button" class="btn btn-sm" id="eksRefresh">
+                        <i class="fas fa-rotate"></i> Refresh
+                    </button>
+                    <span class="count" id="clusterCount"></span>
+                </div>
+                <div class="table-wrap" id="clusterTableWrap">
+                    <div class="empty">
+                        <i class="fas fa-dharmachakra"></i>
+                        <p>Choose a profile to list clusters.</p>
+                    </div>
                 </div>
             </div>
 

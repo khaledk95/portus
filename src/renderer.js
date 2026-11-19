@@ -13,6 +13,15 @@ class Portus {
         this.selectedInstanceId = null;
         this.tunnels = [];
 
+        // EKS view. Listed on first visit rather than with the instances: it is
+        // two AWS calls per cluster, and most sessions never open the tab.
+        this.clusters = [];
+        this.clustersLoaded = false;
+        this.clusterError = null;
+        // Which instance to tunnel through, when the automatic choice was
+        // overridden for a particular cluster
+        this.hopOverrides = new Map();
+
         // Managed endpoints suggested in the port forwarding dialog, keyed by
         // profile and region — the same account holds different databases in
         // different regions, so the key has to carry both.
@@ -379,6 +388,16 @@ class Portus {
         document.getElementById('brandHome').addEventListener('click', () => this.showView('instances'));
         document.getElementById('refreshBtn').addEventListener('click', () => this.loadInstances());
 
+        document.getElementById('eksRefresh').addEventListener('click', () => this.loadClusterView());
+        document.getElementById('eksProfile').addEventListener('change', async () => {
+            // Regions belong to the account. Carrying the last one over would
+            // ask for clusters in a region those credentials may not even have
+            // enabled, so the picker is rebuilt and lands on that profile's own.
+            await this.renderEksRegions(document.getElementById('eksProfile').value);
+            this.loadClusterView();
+        });
+        document.getElementById('eksRegion').addEventListener('change', () => this.loadClusterView());
+
         const search = document.getElementById('searchInput');
         search.addEventListener('input', () => {
             this.filters.text = search.value.trim().toLowerCase();
@@ -464,10 +483,16 @@ class Portus {
     showView(view) {
         this.view = view;
         document.getElementById('viewInstances').style.display = view === 'instances' ? 'flex' : 'none';
+        document.getElementById('viewEks').style.display = view === 'eks' ? 'flex' : 'none';
         document.getElementById('viewTunnels').style.display = view === 'tunnels' ? 'flex' : 'none';
         document.querySelectorAll('.nav-item[data-view]').forEach(item => {
             item.classList.toggle('active', item.dataset.view === view);
         });
+
+        // Fetched when the tab is opened rather than on profile load: listing
+        // clusters is two AWS calls per cluster, and most sessions never come
+        // here at all.
+        if (view === 'eks' && !this.clustersLoaded) this.loadClusterView();
 
         // the uptime column only needs redrawing while it is on screen
         this.syncUptimeTicker();
@@ -590,6 +615,78 @@ class Portus {
         btn.title = available
             ? 'Sign in to a profile that supports it'
             : 'No profile in ~/.aws has a sign-in Portus can run';
+
+        this.renderClusterSourceControls();
+    }
+
+    // The EKS tab lists clusters from whichever account is chosen here, which
+    // defaults to the one in the sidebar. A cluster can live in a different
+    // account from the instances that reach it.
+    renderClusterSourceControls() {
+        const picker = document.getElementById('eksProfile');
+        if (!picker) return;
+
+        const chosen = picker.value || this.currentProfile;
+
+        picker.innerHTML = (this.profiles || []).map(profile => `
+            <option value="${this.escapeHtml(profile.name)}"${profile.name === chosen ? ' selected' : ''}>${this.escapeHtml(profile.name)}</option>`).join('');
+    }
+
+    // Every region that account has enabled, starting on the one its profile
+    // names. Cached per profile, and shared with the sidebar picker — the
+    // answer is the same question asked of the same credentials.
+    async regionsFor(profileName) {
+        if (!profileName) return { regions: [], configured: null };
+
+        const cached = this.regionCache.get(profileName);
+        if (cached) return { regions: cached.data || [], configured: cached.configured || null };
+
+        try {
+            const result = await window.electronAPI.getRegions(profileName);
+            const entry = {
+                data: (result && result.data) || [],
+                limited: !!(result && result.limited),
+                configured: (result && result.configured) || null
+            };
+            this.regionCache.set(profileName, entry);
+            return { regions: entry.data, configured: entry.configured };
+        } catch (error) {
+            // A region list that could not be read still leaves the tab usable
+            return { regions: [], configured: null };
+        }
+    }
+
+    // Fills the EKS region picker for the account it is pointed at.
+    //
+    // `preferred` keeps a region the user chose, but only if that account has
+    // it: regions are per account, and carrying one across would ask for
+    // clusters in a region the credentials may not have enabled.
+    async renderEksRegions(profileName, preferred) {
+        const select = document.getElementById('eksRegion');
+        if (!select) return null;
+
+        const { regions, configured } = await this.regionsFor(profileName);
+
+        // The profile's own region is the default. Falling back to whatever the
+        // account has, rather than to nothing, keeps the picker usable when a
+        // profile names no region at all.
+        const fallback = configured || (regions[0] && regions[0].name) || null;
+        const keep = preferred && regions.some(region => region.name === preferred) ? preferred : null;
+        const selected = keep || fallback;
+
+        select.innerHTML = regions.length
+            ? regions.map(region => `
+                <option value="${this.escapeHtml(region.name)}"${region.name === selected ? ' selected' : ''}>${this.escapeHtml(this.regionLabel(region))}</option>`).join('')
+            : '<option value="">no regions available</option>';
+
+        return selected;
+    }
+
+    // "Frankfurt · eu-central-1" where the city is known, the code alone where
+    // it is not — the same shape the sidebar picker uses.
+    regionLabel(region) {
+        if (!region || !region.name) return '';
+        return region.label ? `${region.label} · ${region.name}` : region.name;
     }
 
     // ==========================================================================
@@ -743,6 +840,7 @@ class Portus {
         // be wrong here — and pointing a tunnel at a database in another region
         // is a failure that looks like a network problem.
         this.endpointCache.clear();
+        this.forgetClusters();
 
         this.loadInstances();
     }
@@ -774,7 +872,14 @@ class Portus {
 
             this.regions = (result && result.data) || [];
             this.regionsLimited = !!(result && result.limited);
-            this.regionCache.set(profileName, { data: this.regions, limited: this.regionsLimited });
+            // `configured` is the region the profile itself names. The EKS tab
+            // starts there for whichever account it is pointed at, which is not
+            // always the one in the sidebar.
+            this.regionCache.set(profileName, {
+                data: this.regions,
+                limited: this.regionsLimited,
+                configured: (result && result.configured) || null
+            });
         } catch (error) {
             this.regions = this.currentRegion ? [{ name: this.currentRegion, label: null }] : [];
             this.regionsLimited = true;
@@ -943,6 +1048,7 @@ class Portus {
         this.regions = this.currentRegion ? [{ name: this.currentRegion, label: null }] : [];
         this.regionsLimited = false;
         this.endpointCache.clear();
+        this.forgetClusters();
         this.updateRegionControls();
 
         // Not awaited: the instance list is what the user is waiting for, and the
@@ -1317,7 +1423,10 @@ class Portus {
     async loadInstances() {
         if (!this.currentProfile) return;
 
-        this.showView('instances');
+        // Deliberately not switching view. Choosing a profile reloads the
+        // instance list, but it is not a request to go and look at it — being
+        // thrown back to Instances from EKS or Tunnels every time the account
+        // changed was the opposite of helpful.
         this.renderDetail(null);
         this.renderSkeleton();
         this.setBusy(true);
@@ -1381,6 +1490,13 @@ class Portus {
     renderInstances() {
         const wrap = document.getElementById('instanceTableWrap');
         const visible = this.instances.filter(item => this.matchesFilters(item));
+
+        // The hop a cluster is reached through comes from this list, and the
+        // two are loaded by separate calls — listing instances also waits on
+        // the SSM inventory, so it lands second. Without this the cluster table
+        // keeps offering whatever was loaded when it was drawn, which after a
+        // profile switch means an instance in the account you just left.
+        if (this.clustersLoaded) this.renderClusters();
 
         const reachable = this.instances.filter(i => i.state === 'running' &&
             (i.ssmStatus === 'online' || i.ssmStatus === 'unknown')).length;
@@ -2499,9 +2615,349 @@ class Portus {
         });
     }
 
+    // ==========================================================================
+    // EKS
+    // ==========================================================================
+
+    // Which instances could carry traffic to this cluster.
+    //
+    // The same rule the Access via… picker uses, pointed at a cluster's VPC
+    // instead of an instance's: an instance has to be in that VPC to reach a
+    // private API endpoint at all, and one in the same subnet needs nothing
+    // routed between them.
+    hopsForCluster(cluster) {
+        if (!cluster) return [];
+
+        const managed = this.instances.filter(candidate =>
+            candidate.state === 'running' &&
+            (candidate.ssmStatus === 'online' || candidate.ssmStatus === 'unknown'));
+
+        const inVpc = cluster.vpcId
+            ? managed.filter(candidate => candidate.vpcId === cluster.vpcId)
+            : [];
+
+        // Being in the cluster's VPC is proof of reachability, so when anything
+        // is, those are the only candidates worth offering.
+        //
+        // When nothing is, that is not the same as no route. A cluster in
+        // another account is reached over peering or a transit gateway, so the
+        // instance carrying it is in a different VPC by definition — and that
+        // is the case this tab exists to make easy. Every managed instance is
+        // offered instead: Portus cannot prove any of them reach it, and
+        // refusing to try would be wrong more often than guessing.
+        const candidates = inVpc.length ? inVpc : managed;
+        const verified = inVpc.length > 0;
+
+        return candidates
+            .map(candidate => ({
+                ...candidate,
+                verified,
+                // A node of this cluster is the safest hop there is: in the
+                // right VPC by definition, and already talking to the API.
+                isClusterNode: (candidate.tags || []).some(tag =>
+                    tag.key === 'eks:cluster-name' && tag.value === cluster.name)
+            }))
+            .sort((a, b) => (Number(b.isClusterNode) - Number(a.isClusterNode))
+                || String(a.instanceName || a.instanceId)
+                    .localeCompare(String(b.instanceName || b.instanceId)));
+    }
+
+    // The hop a Connect would use: whatever was chosen for this cluster, or the
+    // best candidate.
+    hopForCluster(cluster) {
+        const candidates = this.hopsForCluster(cluster);
+        if (!candidates.length) return null;
+
+        const chosen = this.hopOverrides.get(cluster.name);
+        return candidates.find(candidate => candidate.instanceId === chosen) || candidates[0];
+    }
+
+    // An open tunnel to this cluster, if there is one
+    tunnelForCluster(cluster) {
+        return (this.tunnels || []).find(tunnel =>
+            tunnel.kubernetes && tunnel.kubernetes.clusterName === cluster.name) || null;
+    }
+
+    // A different account or region means a different set of clusters, and the
+    // hop candidates are drawn from an instance list that is also about to be
+    // replaced. Listed again when the tab is next opened rather than eagerly —
+    // most sessions never go there.
+    forgetClusters() {
+        this.clusters = [];
+        this.clustersLoaded = false;
+        this.clusterError = null;
+        this.clusterRegion = null;
+        this.hopOverrides.clear();
+
+        const picker = document.getElementById('eksProfile');
+        const region = document.getElementById('eksRegion');
+        if (picker) picker.value = this.currentProfile || '';
+        // Emptied rather than refilled: the account just changed, and the
+        // regions are fetched again when the tab is next drawn. Leaving the old
+        // account's list in place would offer regions these credentials may not
+        // have enabled.
+        if (region) region.innerHTML = '';
+
+        this.renderClusters();
+        if (this.view === 'eks') this.loadClusterView();
+    }
+
+    clusterSource() {
+        const profileName = (document.getElementById('eksProfile') || {}).value || this.currentProfile;
+        const region = ((document.getElementById('eksRegion') || {}).value || '').trim();
+        return { profileName, region: region || null };
+    }
+
+    async loadClusterView() {
+        if (!this.currentProfile) return;
+
+        const select = document.getElementById('eksRegion');
+        // Filled on the first visit, and whenever the account changed while the
+        // tab was not on screen. Keeps whatever region is already chosen.
+        if (select && !select.options.length) {
+            await this.renderEksRegions(this.clusterSource().profileName, select.value || null);
+        }
+
+        const { profileName, region } = this.clusterSource();
+        this.clustersLoaded = true;
+        this.clusterError = null;
+        this.renderClusters('loading');
+
+        const result = await this.loadClusters(profileName, region);
+
+        if (result.success) {
+            this.clusters = result.data || [];
+            // Pin what the listing actually used, so Connect writes the
+            // kubeconfig against the same region the cluster was found in
+            this.clusterRegion = result.region || region || null;
+        } else {
+            this.clusters = [];
+            this.clusterError = result.error;
+        }
+
+        this.renderClusters();
+    }
+
+    renderClusters(state) {
+        const wrap = document.getElementById('clusterTableWrap');
+        const count = document.getElementById('clusterCount');
+        if (!wrap) return;
+
+        document.getElementById('navClusterCount').textContent = this.clusters.length;
+        count.textContent = this.clusters.length ? `${this.clusters.length} clusters` : '';
+
+        if (state === 'loading') {
+            wrap.innerHTML = '<div class="empty"><i class="fas fa-spinner fa-spin"></i><p>Listing clusters…</p></div>';
+            return;
+        }
+
+        if (this.clusterError) {
+            wrap.innerHTML = `<div class="empty"><i class="fas fa-triangle-exclamation"></i><p>${this.escapeHtml(this.clusterError)}</p></div>`;
+            return;
+        }
+
+        if (!this.clusters.length) {
+            wrap.innerHTML = `
+                <div class="empty">
+                    <i class="fas fa-dharmachakra"></i>
+                    <p>No clusters in this account and region.</p>
+                </div>`;
+            return;
+        }
+
+        const table = document.createElement('table');
+        table.innerHTML = `
+            <thead><tr>
+                <th>Name</th><th>Version</th><th>Status</th>
+                <th>Endpoint</th><th>Through</th><th>Actions</th>
+            </tr></thead>
+        `;
+        const tbody = document.createElement('tbody');
+
+        this.clusters.forEach(cluster => tbody.appendChild(this.buildClusterRow(cluster)));
+        table.appendChild(tbody);
+
+        wrap.innerHTML = '';
+        wrap.appendChild(table);
+    }
+
+    buildClusterRow(cluster) {
+        const row = document.createElement('tr');
+        const tunnel = this.tunnelForCluster(cluster);
+        const hops = this.hopsForCluster(cluster);
+        const hop = this.hopForCluster(cluster);
+        const active = (cluster.status || '').toUpperCase() === 'ACTIVE';
+
+        // A cluster reachable from the internet does not need any of this, and
+        // offering a tunnel anyway would be answering a question nobody asked.
+        const publicOnly = cluster.endpointPublicAccess && !cluster.endpointPrivateAccess;
+
+        let endpoint;
+        if (publicOnly) endpoint = '<span class="muted">Public</span>';
+        else if (cluster.endpointPublicAccess) endpoint = '<span class="muted">Public + private</span>';
+        else endpoint = '<span class="mono">Private</span>';
+
+        let through;
+        if (publicOnly) {
+            through = '<span class="dim">not needed</span>';
+        } else if (!cluster.vpcId) {
+            through = '<span class="dim">unknown VPC</span>';
+        } else if (!hops.length) {
+            through = '<span class="dim">no managed instance to reach it</span>';
+        } else {
+            // Unverified means nothing sits in the cluster's VPC, so these are
+            // candidates rather than known routes — true of a cluster reached
+            // across an account boundary. Saying so beats a confident-looking
+            // pick that times out.
+            const note = hop.verified ? '' :
+                '<span class="dim" title="Nothing is in the cluster\'s VPC, so reachability cannot be checked — this is usually right for a peered or cross-account cluster"> · unverified</span>';
+
+            through = `
+                <select class="input input-sm" data-hop>
+                    ${hops.map(candidate => `
+                        <option value="${this.escapeHtml(candidate.instanceId)}"${candidate.instanceId === hop.instanceId ? ' selected' : ''}>
+                            ${this.escapeHtml(candidate.instanceName || candidate.instanceId)}${candidate.isClusterNode ? ' · node' : ''}
+                        </option>`).join('')}
+                </select>${note}`;
+        }
+
+        let actions;
+        if (tunnel) {
+            actions = `
+                <button class="act primary" data-kubectl>kubectl</button>
+                <button class="act" data-disconnect>Disconnect</button>`;
+        } else if (publicOnly) {
+            actions = '<button class="act" disabled title="This cluster answers on the public internet — point kubectl at it directly">No tunnel needed</button>';
+        } else if (!hops.length) {
+            actions = '<button class="act" disabled title="No running SSM-managed instance to reach it through">No route</button>';
+        } else if (!active) {
+            actions = `<button class="act" disabled title="The cluster is ${this.escapeHtml(cluster.status || 'not active')}">Unavailable</button>`;
+        } else {
+            actions = '<button class="act primary" data-connect>Connect</button>';
+        }
+
+        row.innerHTML = `
+            <td class="name-cell">${this.copyableCell(cluster.name)}</td>
+            <td class="muted">${this.escapeHtml(cluster.engineVersion || '—')}</td>
+            <td>${this.clusterStateCell(cluster.status)}</td>
+            <td>${endpoint}</td>
+            <td>${through}</td>
+            <td class="actions"><div class="row-actions">${actions}</div></td>
+        `;
+
+        const hopPicker = row.querySelector('[data-hop]');
+        if (hopPicker) {
+            hopPicker.addEventListener('change', () => {
+                this.hopOverrides.set(cluster.name, hopPicker.value);
+            });
+        }
+
+        const connect = row.querySelector('[data-connect]');
+        if (connect) connect.addEventListener('click', () => this.connectCluster(cluster, connect));
+
+        const kubectl = row.querySelector('[data-kubectl]');
+        if (kubectl) {
+            kubectl.addEventListener('click', async () => {
+                const open = this.tunnelForCluster(cluster);
+                if (open) await this.openKubectl(open.id);
+            });
+        }
+
+        const disconnect = row.querySelector('[data-disconnect]');
+        if (disconnect) {
+            disconnect.addEventListener('click', async () => {
+                const open = this.tunnelForCluster(cluster);
+                if (open) await this.closeTunnel(open.id);
+            });
+        }
+
+        row.querySelectorAll('button[data-copy]').forEach(button => {
+            button.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.copy(button.dataset.copy);
+            });
+        });
+
+        return row;
+    }
+
+    clusterStateCell(status) {
+        const value = (status || '').toUpperCase();
+        const dot = value === 'ACTIVE' ? 'ok' : (value === 'FAILED' ? 'bad' : 'warn');
+        const label = value ? value.charAt(0) + value.slice(1).toLowerCase() : '—';
+        return `<span class="state"><span class="dot ${dot}"></span>${this.escapeHtml(label)}</span>`;
+    }
+
+    // One click: pick the hop, open the tunnel, write the kubeconfig.
+    //
+    // The same call the port dialog makes — the cluster's account and region
+    // travel with it, so a cluster in another account is described and tokened
+    // with its own profile while the tunnel runs on the instance's.
+    async connectCluster(cluster, button) {
+        const hop = this.hopForCluster(cluster);
+        if (!hop) {
+            this.toast(`Nothing managed is running in ${cluster.vpcId || "the cluster's VPC"} to reach ${cluster.name} through`, 'warning');
+            return;
+        }
+
+        const hopName = hop.instanceName || hop.instanceId;
+
+        button.disabled = true;
+        button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Connecting…';
+
+        const source = this.clusterSource();
+        const result = await this.startPortForward(hop.instanceId, hopName, {
+            remoteHost: cluster.host,
+            remotePort: String(cluster.port || 443),
+            localPort: '',
+            region: this.currentRegion,
+            kubernetes: {
+                clusterName: cluster.name,
+                profileName: source.profileName,
+                region: this.clusterRegion || source.region || undefined
+            }
+        });
+
+        if (result && result.success) {
+            this.toast(`${cluster.name} is reachable on localhost:${result.port}, through ${hopName}`, 'success');
+        } else {
+            button.disabled = false;
+            button.innerHTML = 'Connect';
+        }
+
+        await this.refreshTunnels();
+        this.renderClusters();
+    }
+
+    // Shared by the tunnel row and the cluster row, which offer the same two
+    // actions against the same tunnel.
+    async openKubectl(tunnelId) {
+        const result = await window.electronAPI.openKubectlTerminal(tunnelId);
+        this.toast(result && result.success
+            ? result.message
+            : (result && result.error) || 'Could not open a kubectl terminal',
+            result && result.success ? 'success' : 'error');
+        return result;
+    }
+
+    async closeTunnel(tunnelId, label) {
+        await window.electronAPI.closeTunnel(tunnelId);
+        this.toast(`Disconnected ${label || 'the tunnel'}`, 'info');
+    }
+
+    async refreshTunnels() {
+        try {
+            this.renderTunnels(await window.electronAPI.listTunnels());
+        } catch (error) { /* the push from the main process will correct it */ }
+    }
+
     renderTunnels(tunnels) {
         this.tunnels = tunnels || [];
         const wrap = document.getElementById('tunnelTableWrap');
+
+        // A tunnel opening or closing changes what the cluster rows offer —
+        // Connect becomes kubectl, and back again when it is torn down.
+        if (this.clustersLoaded) this.renderClusters();
 
         document.getElementById('navTunnelCount').textContent = this.tunnels.length;
         document.getElementById('statusTunnels').textContent = this.tunnels.length;
@@ -2566,17 +3022,12 @@ class Portus {
             if (kubectl) {
                 kubectl.addEventListener('click', async (e) => {
                     e.stopPropagation();
-                    const result = await window.electronAPI.openKubectlTerminal(tunnel.id);
-                    this.toast(result && result.success
-                        ? result.message
-                        : (result && result.error) || 'Could not open a kubectl terminal',
-                        result && result.success ? 'success' : 'error');
+                    await this.openKubectl(tunnel.id);
                 });
             }
             row.querySelector('[data-close]').addEventListener('click', async (e) => {
                 e.stopPropagation();
-                await window.electronAPI.closeTunnel(tunnel.id);
-                this.toast(`Disconnected ${tunnel.instanceName || tunnel.instanceId}`, 'info');
+                await this.closeTunnel(tunnel.id, tunnel.instanceName || tunnel.instanceId);
             });
             tbody.appendChild(row);
         });

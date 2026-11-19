@@ -2003,6 +2003,8 @@ async function listEksClusters(eks, onWarning) {
       const { cluster } = await eks.send(new DescribeClusterCommand({ name }));
       if (!cluster || !cluster.endpoint) continue;
 
+      const vpcConfig = cluster.resourcesVpcConfig || {};
+
       clusters.push({
         id: `eks:${name}`,
         name,
@@ -2014,6 +2016,15 @@ async function listEksClusters(eks, onWarning) {
         engineVersion: cluster.version || null,
         status: cluster.status || null,
         tls: true,
+        // The VPC the API server answers inside. It is what lets a hop be
+        // chosen for you: an instance has to be in this VPC to reach the
+        // endpoint at all.
+        vpcId: vpcConfig.vpcId || null,
+        // Whether a tunnel is needed in the first place. A cluster reachable
+        // from the public internet does not need one, and offering it anyway
+        // is a worse answer than saying so.
+        endpointPublicAccess: vpcConfig.endpointPublicAccess !== false,
+        endpointPrivateAccess: vpcConfig.endpointPrivateAccess === true,
         // Marks it as more than a host: the renderer offers the kubectl flow for
         // these, and the tunnel writes a kubeconfig. The CA stays here — it is
         // re-read when the file is written, so nothing large crosses to the
